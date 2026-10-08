@@ -24,11 +24,18 @@ jobs:
         target: [esp32, esp32c3]
     steps:
       - uses: actions/checkout@v4
-      - uses: espressif/esp-idf-ci-action@v1
+      - name: Build example
+        uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: ${{ matrix.idf }}
           target: ${{ matrix.target }}
           path: examples/idf/reliable_echo
+      - name: Build on-target test
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: test/hardware
 
   arduino:
     runs-on: ubuntu-latest

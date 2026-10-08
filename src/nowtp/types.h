@@ -102,8 +102,9 @@ struct Config {
     uint32_t ackTimeoutMs = 100;
     /// Retries for a single frame the radio reports as failed.
     uint8_t frameRetries = 2;
-    /// Fallback if the radio never reports a sent frame.
-    uint32_t frameSentTimeoutMs = 100;
+    /// Fallback if the radio never reports a sent frame. Must exceed the driver's
+    /// own retry time: an unacknowledged unicast frame takes ~100 ms to be reported.
+    uint32_t frameSentTimeoutMs = 500;
     /// Delay before retrying when the radio's own queue is full.
     uint32_t linkBusyBackoffMs = 2;
     /// Completed messages remembered for duplicate suppression.

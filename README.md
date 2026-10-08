@@ -114,6 +114,16 @@ Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work
 
 All boards must be on the same Wi-Fi channel. If a board is connected to an access point, its channel follows the AP's.
 
+### Throughput and latency
+
+ESP-NOW sends at 1 Mbps by default, and that rate, not NowTP, sets the ceiling. Measured on an ESP32-S3 sending 8 KB broadcast messages:
+- about 68 KB/s with 250-byte frames
+- about 104 KB/s with 1470-byte frames
+
+To go faster, raise the PHY rate with `esp_now_set_peer_rate_config()` (ESP-IDF ≥ 5.4) or `esp_wifi_config_espnow_rate()`, at the cost of range.
+
+A unicast frame to a peer that is off or out of range takes the driver about 100 ms to report as failed. With the default 2 retries, a send to an unreachable peer fails with `SendFailed` after about 300 ms.
+
 ### Configuration
 
 `nowtp::EspNowConfig` holds the platform settings and a `protocol` member (`nowtp::Config`) with the protocol limits:
@@ -172,6 +182,12 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 ```
 
 The tests use a simulated network with configurable loss in three places: on air, in the receiver's queue, and in lost MAC acks. They cover fragmentation edge cases, loss recovery, duplicate suppression, latest-only ordering, malformed and random frames, and memory limits.
+
+[test/hardware](test/hardware) is an ESP-IDF test firmware that needs only one board. It runs the engine on the chip and checks the ESP-NOW adapter: start and stop, frame counts, throughput, failure reporting, queue limits, cancellation, poll mode, and leaks across restarts. It prints `PASS`/`FAIL` lines on the serial console:
+
+```sh
+cd test/hardware && idf.py set-target esp32s3 && idf.py -p PORT flash monitor
+```
 
 ## Roadmap
 

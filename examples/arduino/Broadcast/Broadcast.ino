@@ -30,7 +30,9 @@ void loop() {
     int n = snprintf(text, sizeof(text), "uptime %lu ms, padding:", millis());
     memset(text + n, '.', sizeof(text) - n);
 
-    nowtp::Status st = transport.send(nowtp::Mac::broadcast(), kPort, text, sizeof(text));
+    // send() returns at once; the optional callback reports when the last frame went out.
+    nowtp::Status st = transport.send(nowtp::Mac::broadcast(), kPort, text, sizeof(text), nowtp::SendOptions(),
+                                      [](nowtp::Status s) { Serial.printf("broadcast: %s\n", nowtp::toString(s)); });
     if (st != nowtp::Status::Ok) Serial.printf("send: %s\n", nowtp::toString(st));
     delay(1000);
 }
