@@ -75,10 +75,11 @@ std::string macStr(const Mac& m) {
                m.bytes[5]);
 }
 
-// This S3 board cannot transmit at full power (its supply sags); limit it.
+// This S3 board loses its frames above ~17 dBm (its supply sags); cap it.
+constexpr float kS3MaxDbm = 17;
 void boardTxPowerFix() {
 #if CONFIG_IDF_TARGET_ESP32S3
-    esp_wifi_set_max_tx_power(34);
+    esp_wifi_set_max_tx_power(static_cast<int8_t>(kS3MaxDbm * 4));
 #endif
 }
 
@@ -91,6 +92,8 @@ nowtp::PeerInfo g_peer;
 std::atomic<int> g_peerLostCount{0};
 
 void onPeer(nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
+    // Other NowTP nodes may be on the air; only follow the other test board.
+    if (p.name != "driver" && p.name != "board") return;
     std::lock_guard<std::mutex> lock(g_peerMutex);
     if (e == nowtp::PeerEvent::Lost) {
         g_peerPresent = false;
@@ -129,9 +132,12 @@ struct Counters {
     uint32_t latestReceived;
     uint32_t latestOutOfOrder;
     int32_t latestLastSeq;
+    int32_t rssiSum;
+    uint32_t rssiCount;
 };
 std::mutex g_countersMutex;
-Counters g_counters = {0, 0, 0, 0, -1};
+const Counters kZeroCounters = {0, 0, 0, 0, -1, 0, 0};
+Counters g_counters = kZeroCounters;
 
 void listenResponder() {
     transport.listen(kEcho, [](const nowtp::Message& m) {
@@ -143,6 +149,10 @@ void listenResponder() {
         std::lock_guard<std::mutex> lock(g_countersMutex);
         g_counters.bulkMessages++;
         g_counters.bulkBytes += m.len;
+        if (m.rssi) {
+            g_counters.rssiSum += m.rssi;
+            g_counters.rssiCount++;
+        }
     });
     transport.listen(kLatest, [](const nowtp::Message& m) {
         if (m.len < 4) return;
@@ -158,7 +168,7 @@ void listenResponder() {
         {
             std::lock_guard<std::mutex> lock(g_countersMutex);
             c = g_counters;
-            g_counters = Counters{0, 0, 0, 0, -1};
+            g_counters = kZeroCounters;
         }
         nowtp::SendOptions o;
         o.reliable = true;
@@ -322,7 +332,7 @@ nowtp::EspNowConfig baseConfig(const std::string& phase) {
     cfg.discovery.announceIntervalMs = 300;
     cfg.discovery.peerTimeoutMs = 2000;
 #if CONFIG_IDF_TARGET_ESP32S3
-    cfg.maxTxPower = 34;
+    cfg.radio.txPowerDbm = kS3MaxDbm;
 #endif
     return cfg;
 }
@@ -338,6 +348,7 @@ bool startPhase(const std::string& phase, nowtp::EspNowConfig cfg) {
     report((phase + "_peer_discovered").c_str(), synced,
            fmt("(%s \"%s\", rssi %d, max frame %u)", macStr(p.mac).c_str(), p.name.c_str(), p.rssi,
                p.maxFrameSize));
+    if (!synced) transport.end();
     return synced;
 }
 
@@ -442,7 +453,7 @@ void phaseAppStation() {
     ESP_ERROR_CHECK(esp_wifi_set_channel(3, WIFI_SECOND_CHAN_NONE));
 
     nowtp::EspNowConfig cfg = baseConfig("p2");
-    cfg.channel = 0;  // keep the application's channel
+    cfg.radio.channel = 0;  // keep the application's channel
     listenAll();
     if (startPhase("p2", cfg)) {
         nowtp::RadioInfo r = transport.radioInfo();
@@ -496,6 +507,102 @@ void phaseSoftApAndConnectedStation() {
         finishPhase("p3");
     }
     esp_wifi_stop();
+    esp_wifi_deinit();  // phases 4 and 5 let NowTP own Wi-Fi again
+}
+
+Mac bulkTarget;
+int bulkOk;
+
+// Sends `count` unreliable messages of `len` bytes to the responder's counter and
+// returns how many it counted, with the average RSSI it saw.
+int64_t measuredBulk(const Mac& peer, const Mac& dst, size_t len, int count, Counters& c) {
+    queryStats(peer, c);  // reset
+    int64_t ms = pipelined(dst, kBulk, len, count, false, &bulkOk);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!queryStats(peer, c)) c = kZeroCounters;
+    return ms;
+}
+
+// Phase 4: both boards in Long Range mode. Rates, broadcast rate and power.
+void phaseRadioSettings() {
+    nowtp::EspNowConfig cfg = baseConfig("p4");
+    cfg.radio.longRange = true;
+    listenAll();
+    if (!startPhase("p4", cfg)) return;
+    nowtp::RadioInfo r = transport.radioInfo();
+    report("p4_long_range_enabled", r.longRange && r.wifiStartedByNowTP);
+
+    if (g_driver) {
+        Mac peer = peerInfo().mac;
+        // 10 dBm: the test S3 cannot sustain OFDM rates above ~15 dBm.
+        transport.setTxPower(10);
+        using nowtp::PhyRate;
+        const PhyRate rates[] = {PhyRate::B1M,  PhyRate::B2M,  PhyRate::B5_5M, PhyRate::B11M, PhyRate::G6M,
+                                 PhyRate::G12M, PhyRate::G24M, PhyRate::G54M,  PhyRate::MCS0, PhyRate::MCS3,
+                                 PhyRate::MCS7, PhyRate::LR500K, PhyRate::LR250K};
+        for (PhyRate rate : rates) {
+            bool lr = rate == PhyRate::LR250K || rate == PhyRate::LR500K;
+            int count = lr ? 2 : 5;
+            Counters c;
+            queryStats(peer, c);
+            Status st = transport.setUnicastRate(rate);
+            int64_t ms = measuredBulk(peer, peer, 16000, count, c);
+            std::string name = std::string("unicast_rate ") + nowtp::toString(rate);
+            report(name.c_str(), st == Status::Ok && ms > 0 && (int)c.bulkMessages == count,
+                   fmt("(%d x 16000 B in %lld ms = %.1f KB/s, peer got %lu, rssi %ld)", count, (long long)ms,
+                       ms > 0 ? count * 16000.0 / 1024 / (ms / 1000.0) : 0.0, (unsigned long)c.bulkMessages,
+                       (long)(c.rssiCount ? c.rssiSum / (int32_t)c.rssiCount : 0)));
+        }
+        transport.setUnicastRate(PhyRate::Default);
+
+        Counters c;
+        // Broadcast has no MAC-level retries: single frames, and only require that
+        // frames at the configured rate get through, not a perfect link.
+        Status st = transport.setBroadcastRate(PhyRate::B11M);
+        int64_t ms = measuredBulk(peer, Mac::broadcast(), 200, 20, c);
+        report("broadcast_rate 11 Mbps", st == Status::Ok && c.bulkMessages >= 10,
+               fmt("(20 x 200 B in %lld ms, peer got %lu)", (long long)ms, (unsigned long)c.bulkMessages));
+        transport.setBroadcastRate(PhyRate::Default);
+
+        const float powers[] = {2, 5, 8, 11, 14, 17};
+        long rssiFirst = 0, rssiLast = 0;
+        for (size_t i = 0; i < sizeof(powers) / sizeof(powers[0]); ++i) {
+            Status ps = transport.setTxPower(powers[i]);
+            float actual = transport.radioInfo().txPowerDbm;  // the driver quantizes on some chips
+            measuredBulk(peer, peer, 200, 20, c);
+            long rssi = c.rssiCount ? c.rssiSum / (int32_t)c.rssiCount : 0;
+            if (i == 0) rssiFirst = rssi;
+            rssiLast = rssi;
+            std::string name = fmt("tx_power %.0f dBm", powers[i]);
+            report(name.c_str(), ps == Status::Ok && actual > powers[i] - 1.1f && actual < powers[i] + 0.3f &&
+                                     c.bulkMessages >= 18,
+                   fmt("(driver reports %.2f dBm, peer got %lu/20 at %ld dBm)", actual,
+                       (unsigned long)c.bulkMessages, rssi));
+        }
+        report("tx_power_moves_rssi", rssiLast - rssiFirst >= 6,
+               fmt("(rssi %ld dBm at 2 dBm, %ld dBm at 17 dBm)", rssiFirst, rssiLast));
+        report("tx_power_out_of_range_rejected", transport.setTxPower(30) == Status::InvalidArgument);
+        transport.setTxPower(17);
+    }
+    finishPhase("p4");
+}
+
+// Phase 5: the driver runs Long Range, the responder does not.
+void phaseLongRangeInterop() {
+    nowtp::EspNowConfig cfg = baseConfig("p5");
+    cfg.radio.longRange = g_driver;
+    listenAll();
+    if (!startPhase("p5", cfg)) return;
+    report("p5_long_range_only_on_driver", transport.radioInfo().longRange == g_driver);
+    if (g_driver) {
+        Mac peer = peerInfo().mac;
+        echoTest(peer, "lr_node_and_plain_node_interoperate", 3000, true);
+        transport.setUnicastRate(nowtp::PhyRate::LR250K);
+        Status st = transport.sendAndWait(peer, kBulk, "x", 1);
+        report("lr_frames_not_heard_by_plain_node", st == Status::SendFailed, nowtp::toString(st));
+        transport.setUnicastRate(nowtp::PhyRate::Default);
+    }
+    finishPhase("p5");
 }
 
 }  // namespace
@@ -510,6 +617,8 @@ extern "C" void app_main() {
     if (g_pass > 0 && g_fail == 0) {
         phaseAppStation();
         phaseSoftApAndConnectedStation();
+        phaseRadioSettings();
+        phaseLongRangeInterop();
     }
     printf("DONE pass=%d fail=%d\n", g_pass, g_fail);
     for (;;) vTaskDelay(portMAX_DELAY);

@@ -28,11 +28,68 @@
 #define NOWTP_ARDUINO_WIFI 1
 #endif
 
+// Per-peer ESP-NOW rates arrived in ESP-IDF 5.1; before that one global rate.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+#define NOWTP_PER_PEER_RATE 1
+#endif
+
 namespace nowtp {
 
 namespace {
 
 const char* const kTag = "nowtp";
+
+struct RateInfo {
+    wifi_phy_rate_t rate;
+    uint8_t mode;  // 0 = 11b, 1 = 11g, 2 = HT20, 3 = LR
+    const char* name;
+};
+
+// Indexed by PhyRate.
+const RateInfo kRates[] = {
+    {WIFI_PHY_RATE_1M_L, 0, "default (1 Mbps)"},
+    {WIFI_PHY_RATE_1M_L, 0, "1 Mbps"},
+    {WIFI_PHY_RATE_2M_L, 0, "2 Mbps"},
+    {WIFI_PHY_RATE_5M_L, 0, "5.5 Mbps"},
+    {WIFI_PHY_RATE_11M_L, 0, "11 Mbps"},
+    {WIFI_PHY_RATE_6M, 1, "6 Mbps"},
+    {WIFI_PHY_RATE_9M, 1, "9 Mbps"},
+    {WIFI_PHY_RATE_12M, 1, "12 Mbps"},
+    {WIFI_PHY_RATE_18M, 1, "18 Mbps"},
+    {WIFI_PHY_RATE_24M, 1, "24 Mbps"},
+    {WIFI_PHY_RATE_36M, 1, "36 Mbps"},
+    {WIFI_PHY_RATE_48M, 1, "48 Mbps"},
+    {WIFI_PHY_RATE_54M, 1, "54 Mbps"},
+    {WIFI_PHY_RATE_MCS0_LGI, 2, "MCS0 (6.5 Mbps)"},
+    {WIFI_PHY_RATE_MCS1_LGI, 2, "MCS1 (13 Mbps)"},
+    {WIFI_PHY_RATE_MCS2_LGI, 2, "MCS2 (19.5 Mbps)"},
+    {WIFI_PHY_RATE_MCS3_LGI, 2, "MCS3 (26 Mbps)"},
+    {WIFI_PHY_RATE_MCS4_LGI, 2, "MCS4 (39 Mbps)"},
+    {WIFI_PHY_RATE_MCS5_LGI, 2, "MCS5 (52 Mbps)"},
+    {WIFI_PHY_RATE_MCS6_LGI, 2, "MCS6 (58.5 Mbps)"},
+    {WIFI_PHY_RATE_MCS7_LGI, 2, "MCS7 (65 Mbps)"},
+    {WIFI_PHY_RATE_LORA_250K, 3, "LR 250 kbps"},
+    {WIFI_PHY_RATE_LORA_500K, 3, "LR 500 kbps"},
+};
+
+inline const RateInfo& rateInfo(PhyRate r) {
+    size_t i = static_cast<size_t>(r);
+    return kRates[i < sizeof(kRates) / sizeof(kRates[0]) ? i : 0];
+}
+
+inline bool isLongRange(PhyRate r) {
+    return r == PhyRate::LR250K || r == PhyRate::LR500K;
+}
+
+inline bool validRate(PhyRate r) {
+    return static_cast<size_t>(r) < sizeof(kRates) / sizeof(kRates[0]);
+}
+
+// dBm to the driver's 0.25 dBm units; 0 if out of range.
+inline int8_t quarterDbm(float dbm) {
+    if (!(dbm >= 2.0f && dbm <= 21.0f)) return 0;
+    return static_cast<int8_t>(dbm * 4.0f + 0.5f);
+}
 
 enum EventKind : uint8_t { kEventReceived = 1, kEventSent = 2 };
 
@@ -40,7 +97,7 @@ struct EventHeader {
     uint8_t kind;
     uint8_t delivered;  // kEventSent only
     int8_t rssi;        // kEventReceived only; 0 if unknown
-    uint8_t mac[6];     // kEventReceived only
+    uint8_t mac[6];     // source (received) or destination (sent); zero if unknown
 };
 
 // ESP-NOW callbacks carry no user pointer, so they reach the active
@@ -98,11 +155,12 @@ void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
 #endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-void onSent(const esp_now_send_info_t*, esp_now_send_status_t status) {
+void onSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+    const uint8_t* mac = info ? info->des_addr : nullptr;
 #else
-void onSent(const uint8_t*, esp_now_send_status_t status) {
+void onSent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
-    pushEvent(kEventSent, nullptr, status == ESP_NOW_SEND_SUCCESS, 0, nullptr, 0);
+    pushEvent(kEventSent, mac, status == ESP_NOW_SEND_SUCCESS, 0, nullptr, 0);
 }
 
 }  // namespace
@@ -110,12 +168,13 @@ void onSent(const uint8_t*, esp_now_send_status_t status) {
 // Link implementation over esp_now_send(), with per-peer frame sizes.
 class EspNowTransport::RadioLink : public Link {
 public:
-    RadioLink(uint16_t defaultSize, bool autoAddPeers, wifi_interface_t interface)
-        : defaultSize_(defaultSize), autoAddPeers_(autoAddPeers), interface_(interface) {}
+    RadioLink(uint16_t defaultSize, bool autoAddPeers, wifi_interface_t interface, std::function<void(const Mac&)> added)
+        : defaultSize_(defaultSize), autoAddPeers_(autoAddPeers), interface_(interface), added_(std::move(added)) {}
 
     Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override {
         esp_err_t err = esp_now_send(dst.bytes, data, len);
         if (err == ESP_ERR_ESPNOW_NOT_FOUND && autoAddPeers_ && addPlainPeer(dst, interface_) == ESP_OK) {
+            if (added_) added_(dst);  // apply the unicast rate to the new peer
             err = esp_now_send(dst.bytes, data, len);
         }
         if (err == ESP_OK) return Status::Ok;
@@ -149,6 +208,7 @@ private:
     uint16_t defaultSize_;
     bool autoAddPeers_;
     wifi_interface_t interface_;
+    std::function<void(const Mac&)> added_;
     std::vector<std::pair<Mac, uint16_t>> sizes_;
 };
 
@@ -185,7 +245,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     events_ = xRingbufferCreate(config_.eventBufferSize, RINGBUF_TYPE_NOSPLIT);
     mutex_ = xSemaphoreCreateRecursiveMutex();
     taskExited_ = xSemaphoreCreateBinary();
-    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, interface_));
+    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, interface_,
+                              [this](const Mac& mac) { applyPeerRate(mac); }));
     engine_.reset(new Engine(*link_, config_.protocol, static_cast<uint16_t>(esp_random())));
     if (!events_ || !mutex_ || !taskExited_) {
         cleanup();
@@ -207,6 +268,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     espNowInitialized_ = true;
 
     s_droppedEvents = 0;
+    stats_ = TransportStats();
+    linkHealth_.clear();
     s_events = events_;
     s_active = true;
     esp_now_register_recv_cb(onRecv);
@@ -220,6 +283,10 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
             cleanup();
             return Status::LinkError;
         }
+    }
+    if (applyPeerRate(bcast) != Status::Ok) {
+        cleanup();
+        return Status::LinkError;
     }
 
     stopping_ = false;
@@ -327,8 +394,11 @@ void EspNowTransport::processEvents(TickType_t wait) {
             const EventHeader* h = static_cast<const EventHeader*>(item);
             if (h->kind == kEventReceived) {
                 const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
-                engine_->onFrameReceived(Mac::from(h->mac), data, size - sizeof(EventHeader), nowMs(), h->rssi);
+                Mac src = Mac::from(h->mac);
+                notePeerHeard(src);
+                engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi);
             } else if (h->kind == kEventSent) {
+                notePeerSendResult(Mac::from(h->mac), h->delivered != 0);
                 engine_->onFrameSent(h->delivered != 0, nowMs());
             }
         }
@@ -345,7 +415,17 @@ void EspNowTransport::processEvents(TickType_t wait) {
 Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
     if (!started_) return Status::InvalidState;
     uint16_t size = options.maxFrameSize;
-    if (size > maxSupportedFrameSize()) return Status::InvalidArgument;
+    if (size > maxSupportedFrameSize() || !validRate(options.rate)) return Status::InvalidArgument;
+    if (options.rate != PhyRate::Default) {
+        if (mac.isBroadcast()) return Status::InvalidArgument;  // use setBroadcastRate()
+        if (isLongRange(options.rate) && !config_.radio.longRange) return Status::InvalidArgument;
+#if !defined(NOWTP_PER_PEER_RATE)
+        if (options.rate != config_.radio.unicastRate) {
+            ESP_LOGE(kTag, "per-peer rates need ESP-IDF 5.1 or later");
+            return Status::InvalidArgument;
+        }
+#endif
+    }
 
     if (!mac.isBroadcast()) {
         esp_now_peer_info_t peer;
@@ -367,8 +447,13 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
     explicitFrameSizes_.erase(std::remove(explicitFrameSizes_.begin(), explicitFrameSizes_.end(), mac),
                               explicitFrameSizes_.end());
     if (size) explicitFrameSizes_.push_back(mac);
+    for (size_t i = 0; i < peerRates_.size(); ++i) {
+        if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    if (options.rate != PhyRate::Default) peerRates_.push_back(std::make_pair(mac, options.rate));
+    Status st = mac.isBroadcast() ? Status::Ok : applyPeerRate(mac);
     unlock();
-    return Status::Ok;
+    return st;
 }
 
 Status EspNowTransport::removePeer(const Mac& mac) {
@@ -377,6 +462,9 @@ Status EspNowTransport::removePeer(const Mac& mac) {
     esp_err_t err = esp_now_del_peer(mac.bytes);
     lock();
     link_->setFrameSize(mac, 0);
+    for (size_t i = 0; i < peerRates_.size(); ++i) {
+        if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
     unlock();
     return err == ESP_OK || err == ESP_ERR_ESPNOW_NOT_FOUND ? Status::Ok : Status::LinkError;
 }
@@ -455,10 +543,13 @@ Mac EspNowTransport::localMac() const {
     return m;
 }
 
-Stats EspNowTransport::stats() const {
-    if (!started_) return Stats();
+EspNowTransport::TransportStats EspNowTransport::stats() const {
+    if (!started_) return TransportStats();
     lock();
-    Stats s = engine_->stats();
+    TransportStats s;
+    static_cast<Stats&>(s) = engine_->stats();
+    s.droppedEvents = s_droppedEvents;
+    s.oneWayLinks = stats_.oneWayLinks;
     unlock();
     return s;
 }
@@ -469,6 +560,26 @@ Stats EspNowTransport::stats() const {
 Status EspNowTransport::prepareRadio() {
     ownsWifiInit_ = ownsWifiStart_ = ownsEventLoop_ = false;
     radio_ = RadioInfo();
+    saved_ = SavedRadio();
+    ratesChanged_ = false;
+
+    const RadioConfig& rc = config_.radio;
+    if ((rc.txPowerDbm != 0 && quarterDbm(rc.txPowerDbm) == 0) || !validRate(rc.broadcastRate) ||
+        !validRate(rc.unicastRate)) {
+        ESP_LOGE(kTag, "invalid radio settings (power 2-21 dBm)");
+        return Status::InvalidArgument;
+    }
+    if (!rc.longRange && (isLongRange(rc.broadcastRate) || isLongRange(rc.unicastRate))) {
+        ESP_LOGE(kTag, "Long Range rates need RadioConfig::longRange");
+        return Status::InvalidArgument;
+    }
+#if !defined(NOWTP_PER_PEER_RATE)
+    if (rc.broadcastRate != PhyRate::Default && rc.unicastRate != PhyRate::Default &&
+        rc.broadcastRate != rc.unicastRate) {
+        ESP_LOGE(kTag, "different broadcast and unicast rates need ESP-IDF 5.1 or later");
+        return Status::InvalidArgument;
+    }
+#endif
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
@@ -479,7 +590,7 @@ Status EspNowTransport::prepareRadio() {
     }
 
     if (!initialized || mode == WIFI_MODE_NULL) {
-        if (!config_.initWifi) {
+        if (!config_.radio.initWifi) {
             ESP_LOGE(kTag, "Wi-Fi is not set up and EspNowConfig::initWifi is false");
             return Status::InvalidState;
         }
@@ -542,25 +653,41 @@ Status EspNowTransport::prepareRadio() {
     interface_ = mode == WIFI_MODE_AP ? WIFI_IF_AP : WIFI_IF_STA;
     radio_.interface = interface_;
 
+    // Country first: it decides which channels and powers are allowed.
+    if (config_.radio.countryCode[0]) {
+        if (!ownsWifiInit_ && esp_wifi_get_country_code(saved_.countryCode) == ESP_OK) {
+            saved_.countryCode[3] = 0;
+            saved_.country = true;
+        }
+        char cc[3] = {config_.radio.countryCode[0], config_.radio.countryCode[1], 0};
+        err = esp_wifi_set_country_code(cc, false);
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "esp_wifi_set_country_code(%s): %s", cc, esp_err_to_name(err));
+            releaseRadio();
+            return Status::InvalidArgument;
+        }
+    }
+
     uint8_t channel = 0;
     wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
     esp_wifi_get_channel(&channel, &second);
-    if (config_.channel && channel != config_.channel) {
+    const uint8_t wanted = config_.radio.channel;
+    if (wanted && channel != wanted) {
         if (radio_.stationConnected || radio_.softApActive) {
             ESP_LOGI(kTag, "staying on channel %u, set by the %s", channel,
                      radio_.stationConnected ? "access point" : "soft-AP");
         } else {
-            err = esp_wifi_set_channel(config_.channel, WIFI_SECOND_CHAN_NONE);
+            err = esp_wifi_set_channel(wanted, WIFI_SECOND_CHAN_NONE);
             if (err != ESP_OK) ESP_LOGW(kTag, "esp_wifi_set_channel: %s", esp_err_to_name(err));
             esp_wifi_get_channel(&channel, &second);
         }
     }
     radio_.channel = channel;
 
-    if (config_.disablePowerSave) esp_wifi_set_ps(WIFI_PS_NONE);
-    if (config_.maxTxPower) {
-        err = esp_wifi_set_max_tx_power(config_.maxTxPower);
-        if (err != ESP_OK) ESP_LOGW(kTag, "esp_wifi_set_max_tx_power: %s", esp_err_to_name(err));
+    Status settings = applyRadioSettings();
+    if (settings != Status::Ok) {
+        releaseRadio();
+        return settings;
     }
 
     ESP_LOGI(kTag, "radio ready: channel %u on %s%s%s%s", radio_.channel, interface_ == WIFI_IF_AP ? "AP" : "STA",
@@ -570,6 +697,14 @@ Status EspNowTransport::prepareRadio() {
 }
 
 void EspNowTransport::releaseRadio() {
+    // Hand the application's Wi-Fi back as it was.
+    if (!ownsWifiInit_) {
+        if (saved_.txPower) esp_wifi_set_max_tx_power(saved_.txPowerQuarterDbm);
+        if (saved_.protocol) esp_wifi_set_protocol(interface_, saved_.protocolBitmap);
+        if (saved_.powerSave) esp_wifi_set_ps(static_cast<wifi_ps_type_t>(saved_.powerSaveMode));
+        if (saved_.country) esp_wifi_set_country_code(saved_.countryCode, false);
+    }
+    saved_ = SavedRadio();
     if (ownsWifiInit_) {
 #if defined(NOWTP_ARDUINO_WIFI)
         WiFi.mode(WIFI_OFF);
@@ -584,6 +719,223 @@ void EspNowTransport::releaseRadio() {
     if (ownsEventLoop_) esp_event_loop_delete_default();
 #endif
     ownsWifiInit_ = ownsWifiStart_ = ownsEventLoop_ = false;
+}
+
+// Power save, transmit power, Long Range and (before ESP-IDF 5.1) the global
+// rate. What it changes on an application's Wi-Fi is restored by releaseRadio().
+Status EspNowTransport::applyRadioSettings() {
+    const RadioConfig& rc = config_.radio;
+    esp_err_t err;
+
+    if (rc.disablePowerSave) {
+        wifi_ps_type_t ps = WIFI_PS_NONE;
+        if (esp_wifi_get_ps(&ps) == ESP_OK && ps != WIFI_PS_NONE) {
+            if (!ownsWifiInit_) {
+                saved_.powerSave = true;
+                saved_.powerSaveMode = ps;
+            }
+            esp_wifi_set_ps(WIFI_PS_NONE);
+        }
+    }
+
+    if (rc.longRange) {
+        uint8_t bitmap = 0;
+        esp_wifi_get_protocol(interface_, &bitmap);
+        if (!(bitmap & WIFI_PROTOCOL_LR)) {
+            if (!ownsWifiInit_) {
+                saved_.protocol = true;
+                saved_.protocolBitmap = bitmap;
+            }
+            // Keep 802.11b/g/n so ordinary nodes are still heard.
+            err = esp_wifi_set_protocol(interface_,
+                                        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+            if (err != ESP_OK) {
+                ESP_LOGE(kTag, "enabling Long Range: %s", esp_err_to_name(err));
+                return Status::LinkError;
+            }
+        }
+    }
+
+    if (rc.txPowerDbm != 0) {
+        Status st = applyTxPower(rc.txPowerDbm);
+        if (st != Status::Ok) return st;
+    }
+
+#if !defined(NOWTP_PER_PEER_RATE)
+    PhyRate global = rc.unicastRate != PhyRate::Default ? rc.unicastRate : rc.broadcastRate;
+    if (global != PhyRate::Default) {
+        err = esp_wifi_config_espnow_rate(interface_, rateInfo(global).rate);
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "esp_wifi_config_espnow_rate: %s", esp_err_to_name(err));
+            return Status::LinkError;
+        }
+    }
+#endif
+    return Status::Ok;
+}
+
+PhyRate EspNowTransport::peerRate(const Mac& mac) const {
+    if (mac.isBroadcast()) return config_.radio.broadcastRate;
+    for (const auto& p : peerRates_) {
+        if (p.first == mac) return p.second;
+    }
+    return config_.radio.unicastRate;
+}
+
+Status EspNowTransport::applyPeerRate(const Mac& mac) {
+#if defined(NOWTP_PER_PEER_RATE)
+    PhyRate rate = peerRate(mac);
+    // Leave untouched peers on the driver default; once anything was changed,
+    // always set the rate so a switch back to Default takes effect.
+    if (rate == PhyRate::Default && !ratesChanged_) return Status::Ok;
+    ratesChanged_ = true;
+    const RateInfo& info = rateInfo(rate);
+    static const wifi_phy_mode_t kModes[] = {WIFI_PHY_MODE_11B, WIFI_PHY_MODE_11G, WIFI_PHY_MODE_HT20,
+                                             WIFI_PHY_MODE_LR};
+    esp_now_rate_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.phymode = kModes[info.mode];
+    cfg.rate = info.rate;
+    esp_err_t err = esp_now_set_peer_rate_config(mac.bytes, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "setting rate %s: %s", info.name, esp_err_to_name(err));
+        return Status::LinkError;
+    }
+#else
+    (void)mac;
+#endif
+    return Status::Ok;
+}
+
+RadioInfo EspNowTransport::radioInfo() const {
+    RadioInfo info = radio_;
+    if (!started_) return info;
+    int8_t power = 0;
+    if (esp_wifi_get_max_tx_power(&power) == ESP_OK) info.txPowerDbm = power / 4.0f;
+    uint8_t bitmap = 0;
+    if (esp_wifi_get_protocol(interface_, &bitmap) == ESP_OK) info.longRange = (bitmap & WIFI_PROTOCOL_LR) != 0;
+    return info;
+}
+
+Status EspNowTransport::setTxPower(float dbm) {
+    if (!started_) return Status::InvalidState;
+    return applyTxPower(dbm);
+}
+
+Status EspNowTransport::applyTxPower(float dbm) {
+    int8_t q = quarterDbm(dbm);
+    if (q == 0) return Status::InvalidArgument;
+    if (!ownsWifiInit_ && !saved_.txPower) {
+        int8_t previous = 0;
+        if (esp_wifi_get_max_tx_power(&previous) == ESP_OK) {
+            saved_.txPower = true;
+            saved_.txPowerQuarterDbm = previous;
+        }
+    }
+    esp_err_t err = esp_wifi_set_max_tx_power(q);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "esp_wifi_set_max_tx_power: %s", esp_err_to_name(err));
+        return Status::LinkError;
+    }
+    return Status::Ok;
+}
+
+Status EspNowTransport::setBroadcastRate(PhyRate rate) {
+    if (!started_) return Status::InvalidState;
+    if (!validRate(rate) || (isLongRange(rate) && !config_.radio.longRange)) return Status::InvalidArgument;
+#if defined(NOWTP_PER_PEER_RATE)
+    lock();
+    config_.radio.broadcastRate = rate;
+    Status st = applyPeerRate(Mac::broadcast());
+    unlock();
+    return st;
+#else
+    return rate == config_.radio.broadcastRate ? Status::Ok : Status::InvalidArgument;
+#endif
+}
+
+Status EspNowTransport::setUnicastRate(PhyRate rate) {
+    if (!started_) return Status::InvalidState;
+    if (!validRate(rate) || (isLongRange(rate) && !config_.radio.longRange)) return Status::InvalidArgument;
+#if defined(NOWTP_PER_PEER_RATE)
+    lock();
+    config_.radio.unicastRate = rate;
+    // Re-apply to every registered peer that has no rate of its own.
+    Status st = Status::Ok;
+    esp_now_peer_info_t peer;
+    for (bool first = true; esp_now_fetch_peer(first, &peer) == ESP_OK; first = false) {
+        Mac mac = Mac::from(peer.peer_addr);
+        if (!mac.isBroadcast() && applyPeerRate(mac) != Status::Ok) st = Status::LinkError;
+    }
+    unlock();
+    return st;
+#else
+    if (config_.radio.broadcastRate != PhyRate::Default && rate != config_.radio.broadcastRate) {
+        return Status::InvalidArgument;
+    }
+    config_.radio.unicastRate = rate;
+    return esp_wifi_config_espnow_rate(interface_, rateInfo(rate).rate) == ESP_OK ? Status::Ok : Status::LinkError;
+#endif
+}
+
+const char* toString(PhyRate rate) {
+    return validRate(rate) ? rateInfo(rate).name : "invalid";
+}
+
+// ---------------------------------------------------------------------------
+// One-way link detection
+//
+// Unicast frames that keep failing at the MAC level to a peer whose own frames
+// arrive fine point at this node's transmitter: commonly a board whose supply
+// cannot sustain the driver's default power, or a rate the peer cannot decode.
+
+namespace {
+constexpr uint16_t kOneWayFailures = 8;    // consecutive failed frames
+constexpr uint32_t kOneWayHeardMs = 3000;  // peer heard this recently
+constexpr size_t kMaxLinkEntries = 20;
+}  // namespace
+
+EspNowTransport::LinkHealth* EspNowTransport::linkHealth(const Mac& mac, bool create) {
+    for (auto& l : linkHealth_) {
+        if (l.mac == mac) return &l;
+    }
+    if (!create) return nullptr;
+    if (linkHealth_.size() >= kMaxLinkEntries) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < linkHealth_.size(); ++i) {
+            if (static_cast<int32_t>(linkHealth_[i].lastHeardMs - linkHealth_[oldest].lastHeardMs) < 0) oldest = i;
+        }
+        linkHealth_.erase(linkHealth_.begin() + static_cast<std::ptrdiff_t>(oldest));
+    }
+    LinkHealth fresh;
+    fresh.mac = mac;
+    linkHealth_.push_back(fresh);
+    return &linkHealth_.back();
+}
+
+void EspNowTransport::notePeerHeard(const Mac& mac) {
+    linkHealth(mac, true)->lastHeardMs = nowMs();
+}
+
+void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
+    if (mac.isBroadcast()) return;
+    LinkHealth* l = linkHealth(mac, false);
+    if (!l) return;  // never heard from it: an absent peer, not a one-way link
+    if (delivered) {
+        l->failures = 0;
+        return;
+    }
+    if (++l->failures < kOneWayFailures || l->warned) return;
+    if (static_cast<int32_t>(nowMs() - l->lastHeardMs) > static_cast<int32_t>(kOneWayHeardMs)) return;
+    l->warned = true;
+    stats_.oneWayLinks++;
+    int8_t power = 0;
+    esp_wifi_get_max_tx_power(&power);
+    ESP_LOGW(kTag,
+             "frames to %02x:%02x:%02x:%02x:%02x:%02x keep failing although its frames arrive: the link is one-way. "
+             "This board may not sustain %.1f dBm (try radio.txPowerDbm = 15) or the peer may not decode rate %s.",
+             mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5], power / 4.0,
+             toString(peerRate(mac)));
 }
 
 // ---------------------------------------------------------------------------

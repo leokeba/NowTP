@@ -8,9 +8,11 @@
 //
 // Results are printed as "PASS <name>" / "FAIL <name>: ..." lines followed by
 // "DONE pass=<n> fail=<n>".
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <string>
 #include <vector>
 
 #include "NowTP.h"
@@ -33,7 +35,12 @@ namespace {
 int g_pass = 0;
 int g_fail = 0;
 
-void report(const char* name, bool ok, const char* detail = "") {
+void report(const char* name, bool ok, const char* detail = "");
+void report(const char* name, bool ok, const std::string& detail) {
+    report(name, ok, detail.c_str());
+}
+
+void report(const char* name, bool ok, const char* detail) {
     if (ok) {
         g_pass++;
         printf("PASS %s %s\n", name, detail);
@@ -41,6 +48,16 @@ void report(const char* name, bool ok, const char* detail = "") {
         g_fail++;
         printf("FAIL %s: %s\n", name, detail);
     }
+}
+
+std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
+std::string fmt(const char* f, ...) {
+    char buf[160];
+    va_list ap;
+    va_start(ap, f);
+    vsnprintf(buf, sizeof(buf), f, ap);
+    va_end(ap);
+    return buf;
 }
 
 int64_t millis() {
@@ -362,7 +379,7 @@ void noLeakAcrossRestarts() {
 void radioSetupModes() {
     wifi_mode_t mode;
     nowtp::EspNowConfig noInit;
-    noInit.initWifi = false;
+    noInit.radio.initWifi = false;
     report("radio_init_disabled_rejected", transport.begin(noInit) == Status::InvalidState);
 
     // Nothing set up: NowTP initializes Wi-Fi and tears it down again.
@@ -378,7 +395,7 @@ void radioSetupModes() {
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     nowtp::EspNowConfig ch5;
-    ch5.channel = 5;
+    ch5.radio.channel = 5;
     st = transport.begin(ch5);
     r = transport.radioInfo();
     report("radio_started_for_app", st == Status::Ok && r.wifiStartedByNowTP && r.channel == 5, nowtp::toString(st));
@@ -386,6 +403,69 @@ void radioSetupModes() {
     uint16_t n;
     report("radio_start_undone", esp_wifi_get_mode(&mode) == ESP_OK &&
                                      esp_wifi_scan_get_ap_num(&n) == ESP_ERR_WIFI_NOT_STARTED);
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+}
+
+// Settings NowTP changes on an application's Wi-Fi come back on end().
+void radioSettingsRestored() {
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_wifi_set_max_tx_power(60);  // 15 dBm; some chips round it down
+    int8_t appPower = 0;
+    esp_wifi_get_max_tx_power(&appPower);
+    char appCountry[4] = {0, 0, 0, 0};
+    esp_wifi_get_country_code(appCountry);
+    uint8_t appProtocol = 0;
+    esp_wifi_get_protocol(WIFI_IF_STA, &appProtocol);
+
+    nowtp::EspNowConfig bad;
+    bad.radio.txPowerDbm = 30;
+    report("radio_bad_power_rejected", transport.begin(bad) == Status::InvalidArgument);
+    bad = nowtp::EspNowConfig();
+    bad.radio.unicastRate = nowtp::PhyRate::LR250K;  // without longRange
+    report("radio_lr_rate_needs_long_range", transport.begin(bad) == Status::InvalidArgument);
+    report("set_power_before_begin_rejected", transport.setTxPower(10) == Status::InvalidState);
+
+    nowtp::EspNowConfig cfg;
+    cfg.radio.txPowerDbm = 10;
+    cfg.radio.longRange = true;
+    cfg.radio.unicastRate = nowtp::PhyRate::B11M;
+    cfg.radio.broadcastRate = nowtp::PhyRate::B2M;
+    memcpy(cfg.radio.countryCode, "JP", 2);
+    Status st = transport.begin(cfg);
+    nowtp::RadioInfo r = transport.radioInfo();
+    char country[4] = {0, 0, 0, 0};
+    esp_wifi_get_country_code(country);
+    wifi_ps_type_t ps = WIFI_PS_MAX_MODEM;
+    esp_wifi_get_ps(&ps);
+    report("radio_settings_applied",
+           st == Status::Ok && r.txPowerDbm > 8.9f && r.txPowerDbm <= 10 && r.longRange && strncmp(country, "JP", 2) == 0 && ps == WIFI_PS_NONE,
+           fmt("(%s, power %.2f dBm, LR %d, country %s, ps %d)", nowtp::toString(st), r.txPowerDbm, r.longRange,
+               country, ps));
+
+    nowtp::PeerOptions po;
+    po.rate = nowtp::PhyRate::G54M;
+    report("broadcast_peer_rate_rejected", transport.addPeer(Mac::broadcast(), po) == Status::InvalidArgument);
+    report("peer_rate_set", transport.addPeer(kAbsent, po) == Status::Ok);
+    report("runtime_rate_changes", transport.setUnicastRate(nowtp::PhyRate::MCS7) == Status::Ok &&
+                                       transport.setBroadcastRate(nowtp::PhyRate::Default) == Status::Ok);
+    uint8_t x[300] = {};
+    report("send_with_custom_rates", transport.sendAndWait(Mac::broadcast(), 1, x, sizeof(x)) == Status::Ok);
+    transport.end();
+
+    int8_t power = 0;
+    esp_wifi_get_max_tx_power(&power);
+    uint8_t protocol = 0;
+    esp_wifi_get_protocol(WIFI_IF_STA, &protocol);
+    esp_wifi_get_country_code(country);
+    esp_wifi_get_ps(&ps);
+    report("radio_settings_restored",
+           power == appPower && protocol == appProtocol && strncmp(country, appCountry, 2) == 0 && ps == WIFI_PS_MIN_MODEM,
+           fmt("(power %.2f dBm, protocol 0x%x, country %s, ps %d)", power / 4.0, protocol, country, ps));
+    esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_deinit());
 }
 
@@ -399,6 +479,7 @@ extern "C" void app_main() {
     engineOnTarget();
 
     radioSetupModes();
+    radioSettingsRestored();
     startWifi();
     printf("INFO free heap after Wi-Fi start %lu\n", (unsigned long)esp_get_free_heap_size());
     rawDriverLatency();
