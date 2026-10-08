@@ -234,7 +234,7 @@ void Diagnostics::handle(const Message& m) {
             out.push_back(static_cast<uint8_t>(n));
             for (size_t i = 0; i < n; ++i) {
                 out.push_back(c->received[i]);
-                int8_t rssi = c->rssiCount[i] ? static_cast<int8_t>(c->rssiSum[i] / c->rssiCount[i]) : 0;
+                int8_t rssi = static_cast<int8_t>(c->rssiCount[i] ? c->rssiSum[i] / c->rssiCount[i] : 0);
                 out.push_back(static_cast<uint8_t>(rssi));
             }
             reply(m.src, attempt, out.data(), out.size());
@@ -581,7 +581,7 @@ Status Diagnostics::measure(const Mac& peer, const std::vector<ProbeStep>& steps
                 pr.sent = framesPerStep;
                 if (c && i < c->received.size()) {
                     pr.received = std::min(c->received[i], framesPerStep);
-                    pr.rssi = c->rssiCount[i] ? static_cast<int8_t>(c->rssiSum[i] / c->rssiCount[i]) : 0;
+                    pr.rssi = static_cast<int8_t>(c->rssiCount[i] ? c->rssiSum[i] / c->rssiCount[i] : 0);
                 }
                 reverse->push_back(pr);
             }
@@ -812,7 +812,7 @@ Status Diagnostics::optimize(const Mac& peer, const OptimizeOptions& opt, LinkPr
             if (r.ratio() < opt.minDeliveryRatio) continue;
             if (isOfdm(r.step.rate) && !opt.allowOfdm) continue;
             if (isLongRange(r.step.rate) && !opt.allowLongRange) continue;
-            float score = nominalKbps(r.step.rate) * r.ratio();
+            float score = static_cast<float>(nominalKbps(r.step.rate)) * r.ratio();
             if (score > bestScore) {
                 bestScore = score;
                 best = r.step.rate;
