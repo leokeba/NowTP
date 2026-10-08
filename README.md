@@ -14,12 +14,17 @@ ESP-NOW sends single frames of up to 250 bytes (1470 with ESP-NOW v2), with no o
 - **Paced by the radio.** The next frame goes out when the driver reports the previous one sent, instead of after a fixed delay.
 - **Peer discovery.** Nodes announce a name and app metadata, and report peers as they are found, change or are lost. Discovered peers get the largest frame size both sides support.
 - **Works with any Wi-Fi state.** `begin()` brings Wi-Fi up if nothing has, and otherwise adapts to the application's setup: a station (connected or not), a soft-AP, or both.
+- **Diagnostics and tuning built in.**
+  - Nodes measure each link in both directions and find each board's working transmit power, for 802.11b and OFDM separately.
+  - They report what limits a link, and pick and apply the fastest reliable rate and power on both ends.
+  - Deep discovery finds nodes that can't talk to us yet: another channel, network ID, protocol version, Long Range only, or a one-way link.
+  - A board whose supply can't sustain full transmit power is detected, and its power lowered, automatically.
 - **Radio settings with safe defaults.** Transmit power, PHY rate (1 Mbps up to 65 Mbps, plus Espressif Long Range), and the country code, all set per node or per peer. The defaults are what every ESP-NOW device understands. Settings changed on the application's Wi-Fi are restored on `end()`.
 - **Bounded memory.** Queue sizes, message size and reassembly memory are all configurable.
 - **Callbacks never run in the Wi-Fi driver task.** They run in a NowTP task, or inside `poll()` from your loop.
 - **Testable on your computer.** The protocol core has no platform dependencies and is tested on a desktop machine against a simulated lossy radio.
 
-> **Status:** early (0.3). The wire format and API may still change before 1.0.
+> **Status:** early (0.4). The wire format and API may still change before 1.0.
 
 ## Quick start (Arduino)
 
@@ -75,6 +80,7 @@ More sketches are in [examples/arduino](examples/arduino):
 - [ReliableUnicast](examples/arduino/ReliableUnicast/ReliableUnicast.ino): two boards that find each other and exchange reliable messages
 - [LatestOnly](examples/arduino/LatestOnly/LatestOnly.ino), which also shows `poll()` mode
 - [RadioSettings](examples/arduino/RadioSettings/RadioSettings.ino): a faster unicast rate, a power cap and Long Range
+- [Diagnostics](examples/arduino/Diagnostics/Diagnostics.ino): diagnose and tune a link, then look for incompatible nodes
 
 ## ESP-IDF
 
@@ -146,6 +152,64 @@ Measured between two boards about 1 m apart, with reliable unicast of 16 KB mess
 Faster rates need a stronger signal. Unicast hides marginal links behind MAC-level retries, which costs throughput, while broadcast simply loses frames. Keep `broadcastRate` at the default unless every node is close.
 
 ESP-IDF before 5.1 (Arduino-ESP32 2.x) has only one ESP-NOW rate for everything. On those versions, per-peer rates, and different broadcast and unicast rates, are rejected with `InvalidArgument`.
+
+### Diagnostics and tuning
+
+#### Automatic transmit power fallback
+
+Many cheap boards can't sustain the driver's default 20 dBm. Their frames are then lost, while they still receive normally.
+
+With `radio.autoPowerFallback` (on by default), NowTP notices when a peer it hears doesn't acknowledge its frames, and handles it like this:
+1. **Early check.** Every newly discovered peer gets a few pings, so the problem shows up before your first message.
+2. **Step down.** Transmit power drops one step at a time (17, 15, 13 … dBm) until the frames are acknowledged.
+3. **Confirm.** NowTP then re-tests the original power. If that works again, the peer was only briefly away (rebooting, or on another channel), and the original power is kept.
+4. **Remember.** A confirmed working power is kept for the rest of the boot, including across `end()`/`begin()`. `EspNowTransport::learnedTxPowerCeiling()` returns it, so you can apply it to Wi-Fi you start yourself. `stats().powerFallbacks` counts these events.
+
+#### Diagnostics service
+
+Every node answers diagnostic requests on reserved port 254 (`enableDiagnostics`, on by default), much like ping on a network. On request, a node counts probe frames, sends probe bursts back, and reports.
+
+Two settings control what other nodes may do:
+- `diagnostics.respond = false` stops answering altogether.
+- `diagnostics.acceptRemoteTuning = false` refuses a peer's request to change our transmit power and our rate toward it. That request is what `optimizeLink()` uses to tune both ends. ESP-NOW frames aren't authenticated, so keep remote tuning on only among trusted nodes.
+
+The procedures below block for a few seconds each:
+- Call them from your own task or `loop()`, never from a NowTP callback (they return `InvalidState` there).
+- While they run, they temporarily change this node's power and rates, and restore them afterwards.
+- When two nodes measure each other at once, the busy one answers "busy", and the other backs off and retries.
+
+| Call | What it does |
+|---|---|
+| `ping(peer)` | Round trip to the peer. If it goes unanswered, it retries at lower power on both ends, and reports the powers that worked. |
+| `measureLink(peer, steps, frames, &fwd, &rev)` | Delivery ratio and RSSI per (rate, power) step, each direction measured separately |
+| `diagnose(peer, out)` | Each side's highest working power for 802.11b and for OFDM, how much the received signal follows the power setting, rate tables in both directions, and a list of `Issue`s with explanations |
+| `optimizeLink(peer, out)` | Picks the fastest rate that delivers at least 95% in each direction, and the working power for that rate class. Applies both on both nodes and verifies with a reliable message. Falls back to 1 Mbps if verification fails. Pass a recent diagnosis to skip measuring twice. |
+| `optimizeAll(out)` | `optimizeLink()` for every discovered peer. Our power settles at the lowest power any of them needs. |
+| `deepDiscover(out, options)` | Scans channels (1–13 by default) and Long Range mode. Lists every node heard, including ones we can't talk to, and the reason. |
+
+`diagnose()` returns `QueueFull` if the peer stayed busy with its own measurements, and `Timeout` if it never answered (out of range, or away scanning channels). Retry later in both cases.
+
+Before ESP-IDF 5.1 (Arduino-ESP32 2.x), there are no per-peer rates, so `optimizeLink()` measures but can only apply power.
+
+Issues reported by `diagnose()` and `deepDiscover()`. Each one has `local` set when it concerns this node, plus a `detail` text with the suggested fix:
+
+| Issue | Meaning |
+|---|---|
+| `TxPowerLimited`, `OfdmPowerLimited` | A node's frames are lost above some power, for all rates or only OFDM (802.11g/n). This is the weak-supply signature. |
+| `PowerControlIneffective` | The received signal barely follows the power setting |
+| `RateFailsForward`, `RateFailsReverse` | A rate fails in one direction. When the other direction works, the cause is the sender's transmitter or the receiver's receiver. |
+| `LongRangeUnavailable` | LR frames don't get through: enable `radio.longRange` on both nodes |
+| `WeakSignal` | Low RSSI even at 1 Mbps: check antennas and distance |
+| `HearsUsOnlyAtLowerPower`, `DoesNotHearUs`, `PeerUnresponsive` | One-way and dead links |
+| `OtherChannel`, `OtherNetworkId`, `OtherProtocolVersion`, `LongRangeOnly` | Found by deep discovery: nodes we can't talk to as configured |
+| `SmallFramesOnly`, `ForeignTraffic`, `ChannelScanUnavailable` | Information: an ESP-NOW v1 peer, non-NowTP ESP-NOW traffic, and a scan limited by an access point |
+
+Example: `diagnose()` from the weak-supply board in our test set (ESP32-S3) to an ESP32 DevKit.
+- **Diagnosis:** it reported `TxPowerLimited` (this node: 17 dBm) and `OfdmPowerLimited` (this node: 13 dBm).
+- **Optimization:** `optimizeLink()` then chose MCS7 in both directions, with the S3 at 13 dBm.
+- **Result:** throughput went from 0.8 to 8.3 Mbit/s.
+
+On a board with a distorted transmitter at fast rates, the optimizer settled on 24–36 Mbps from that board instead.
 
 ### Discovery
 
@@ -237,7 +301,11 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 
 ### Troubleshooting
 
-- **One board hears the other, but not the reverse.** Many cheap boards can't sustain full-power transmission from their supply. Their frames then never arrive, while they still receive normally. NowTP detects this pattern and logs a warning: frames to a peer keep failing while that peer's own frames arrive (`stats().oneWayLinks` counts it). Set `radio.txPowerDbm = 15` on the board that can't be heard. One of our test boards lost every frame at 20 dBm, lost OFDM frames (6 Mbps and up, 802.11g/n) above about 14 dBm, and worked at 15 dBm with 802.11b rates.
+- **One board hears the other, but not the reverse.** Many cheap boards can't sustain full-power transmission from their supply. Their frames then never arrive, while they still receive normally.
+  - **Detection.** NowTP detects this (`stats().oneWayLinks`) and, by default, lowers its power until the frames get through.
+  - **Measuring.** `diagnose()` reports the exact limits. One of our test boards lost every frame at 20 dBm, and lost OFDM frames above 13 dBm.
+  - **Avoiding the search.** Set `radio.txPowerDbm` to the reported value.
+- **Two boards can't find each other.** Run `deepDiscover()` on one of them. It reports nodes on another channel, with another network ID, or only heard with Long Range.
 - **Fast rates fail but 1 Mbps works.** The signal is too weak, or one board's transmitter is too distorted at that rate. Step down to 11 Mbps (802.11b), which held up on every board we tested.
 - **Nothing arrives at all.** Check that both nodes are on the same channel with `radioInfo().channel`. A node connected to an AP follows the AP's channel.
 - **Large unicast frames are lost.** One side probably runs ESP-NOW v1 (ESP-IDF < 5.4 or Arduino-ESP32 2.x). Use discovery, which negotiates the frame size, or leave the frame size at 250.
@@ -285,11 +353,13 @@ cd test/hardware && idf.py set-target esp32s3 && idf.py -p PORT flash monitor
 - both boards in Long Range mode, sweeping every unicast rate from 1 Mbps to MCS7 and LR, a faster broadcast rate, and transmit power from 2 to 17 dBm (checking that the receiver's RSSI follows)
 - a Long Range node with a plain node (they must interoperate at normal rates, and LR frames must not get through)
 
-The first three phases check echo in both directions, reliable and unreliable throughput, latest-only ordering, rejection and goodbyes.
+The first three phases check echo in both directions, reliable and unreliable throughput, latest-only ordering, rejection and goodbyes. A sixth phase checks deep discovery: one board hides on channel 6, then on another network ID, and the other must find it.
+
+The tests contain no board-specific values. A board that can't sustain full power is handled by the library's own fallback and diagnosis, and that same code runs on every pair. Run the pair test with only the two boards under test running NowTP, and erase or power down the others: stray nodes running the same test firmware would confuse its sync.
 
 ## Roadmap
 
-- Automatic per-peer rate adaptation, stepping rates up and down from MAC-level acknowledgements
+- Continuous per-peer rate adaptation from MAC-level acknowledgements (today `optimizeLink()` tunes on demand)
 - Streaming API for very large transfers (e.g. OTA-sized payloads)
 - Following channel changes after `begin()` (e.g. a station that roams), and discovery across channels
 - Optional add-ons: authenticated pairing, persistent peers

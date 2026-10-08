@@ -8,8 +8,10 @@
 #include <utility>
 #include <vector>
 
+#include "diagnostics.h"
 #include "discovery.h"
 #include "engine.h"
+#include "radio.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -17,37 +19,6 @@
 #include "freertos/task.h"
 
 namespace nowtp {
-
-/// Over-the-air PHY rate for ESP-NOW frames. Faster rates shorten airtime but
-/// need a stronger signal; every receiver decodes any 802.11b/g/n rate, while
-/// the Long Range rates need RadioConfig::longRange on both sides.
-enum class PhyRate : uint8_t {
-    Default = 0,  ///< Not set: 1 Mbps 802.11b (driver default), or the transport's unicastRate for a peer.
-    B1M,          ///< 802.11b 1 Mbps: longest standard range, understood by everyone.
-    B2M,
-    B5_5M,
-    B11M,
-    G6M,  ///< 802.11g OFDM
-    G9M,
-    G12M,
-    G18M,
-    G24M,
-    G36M,
-    G48M,
-    G54M,
-    MCS0,  ///< 802.11n HT20, long guard interval: 6.5 Mbps
-    MCS1,
-    MCS2,
-    MCS3,
-    MCS4,
-    MCS5,
-    MCS6,
-    MCS7,    ///< 65 Mbps
-    LR250K,  ///< Espressif Long Range 250 kbps: longest range, Espressif chips only.
-    LR500K,
-};
-
-const char* toString(PhyRate rate);
 
 /// Radio settings applied by begin(). The defaults are what every ESP-NOW
 /// device understands: 1 Mbps, no Long Range, driver power and country.
@@ -78,6 +49,10 @@ struct RadioConfig {
     /// Two-letter country code ("US", "FR", "JP", ... or "01" for world-safe)
     /// selecting allowed channels and power limits; empty keeps the driver's.
     char countryCode[3] = {0, 0, 0};
+    /// When a peer we hear does not acknowledge our frames, step our transmit
+    /// power down until it does (many boards cannot sustain full power). The
+    /// working power is kept for the rest of the boot, also across end()/begin().
+    bool autoPowerFallback = true;
 };
 
 struct PeerOptions {
@@ -107,6 +82,11 @@ struct EspNowConfig {
     /// support (1470 between ESP-NOW v2 nodes), unless addPeer() set a size.
     bool negotiateFrameSize = true;
 
+    // --- Diagnostics -------------------------------------------------------
+    /// Answer diagnostic requests and allow the diagnose()/optimize() calls.
+    bool enableDiagnostics = true;
+    DiagnosticsConfig diagnostics;
+
     // --- Transport -----------------------------------------------------------
     /// Frame size for broadcast and for peers without their own setting.
     /// 250 is understood by every ESP-NOW version.
@@ -133,6 +113,8 @@ struct RadioInfo {
     uint8_t channel = 0;
     float txPowerDbm = 0;  ///< Maximum transmit power currently set in the driver.
     bool longRange = false;  ///< Long Range mode enabled on the interface.
+    float txPowerLimitDbm = 0;     ///< Highest power the driver accepts on this chip.
+    float learnedTxCeilingDbm = 0; ///< Power found to work by fallback or optimize() (0: none).
     wifi_interface_t interface = WIFI_IF_STA;  ///< Interface ESP-NOW peers are bound to.
     bool stationConnected = false;             ///< Connected to an AP (channel follows it).
     bool softApActive = false;                 ///< Running a soft-AP (channel follows it).
@@ -146,12 +128,13 @@ struct RadioInfo {
 /// active, since ESP-NOW has a single pair of driver callbacks. Receive and
 /// completion callbacks run in the NowTP task (or inside poll()), never in the
 /// Wi-Fi driver task; keep them short.
-class EspNowTransport {
+class EspNowTransport : public RadioControl {
 public:
     /// Engine counters plus radio-level ones.
     struct TransportStats : Stats {
         uint32_t droppedEvents = 0;  ///< Radio events lost because the event buffer was full.
         uint32_t oneWayLinks = 0;    ///< Peers we hear but whose MAC never acknowledges our frames.
+        uint32_t powerFallbacks = 0; ///< Times the transmit power was lowered automatically.
     };
 
     EspNowTransport();
@@ -197,12 +180,43 @@ public:
     /// The radio state found and set by begin(), with current power and LR state.
     RadioInfo radioInfo() const;
 
+    // --- Radio controls (RadioControl) ---------------------------------------
     /// Changes the maximum transmit power (dBm, 2-20) while running.
-    Status setTxPower(float dbm);
+    Status setTxPower(float dbm) override;
+    float txPower() const override;
+    float txPowerLimit() const override;
     /// Changes the rate of broadcast frames while running.
-    Status setBroadcastRate(PhyRate rate);
+    Status setBroadcastRate(PhyRate rate) override;
+    PhyRate broadcastRate() const override;
     /// Changes the rate for peers without their own PeerOptions::rate.
     Status setUnicastRate(PhyRate rate);
+    /// Rate used toward one peer; Default reverts it to the unicast rate.
+    Status setPeerRate(const Mac& peer, PhyRate rate) override;
+    PhyRate peerRate(const Mac& mac) const override;
+    bool rateUsable(PhyRate rate) const override;
+    uint8_t channel() const override;
+    /// Fails with InvalidState when a station connection or soft-AP fixes the channel.
+    Status setChannel(uint8_t channel) override;
+    bool longRange() const override;
+    Status setLongRange(bool enabled) override;
+
+    // --- Diagnostics (blocking; call from an application task) ---------------
+    /// Round trip to a peer's diagnostics, falling back to lower power if needed.
+    Status ping(const Mac& peer, float* requestPowerDbm = nullptr, float* replyPowerDbm = nullptr);
+    /// Delivery ratio and RSSI per step, us to peer and/or peer to us.
+    Status measureLink(const Mac& peer, const std::vector<ProbeStep>& steps, uint8_t framesPerStep,
+                       std::vector<ProbeResult>* forward, std::vector<ProbeResult>* reverse);
+    /// Power ceilings on both sides, rate tables in both directions, issues found.
+    Status diagnose(const Mac& peer, LinkDiagnosis& out);
+    /// Picks and applies the fastest reliable rates and working powers for a link.
+    /// Pass a recent diagnose() result as `known` to skip measuring the link again.
+    Status optimizeLink(const Mac& peer, LinkProfile& out, const OptimizeOptions& options = OptimizeOptions(),
+                        const LinkDiagnosis* known = nullptr);
+    /// optimizeLink() for every discovered peer; our power ends at the lowest chosen.
+    Status optimizeAll(std::vector<LinkProfile>& out, const OptimizeOptions& options = OptimizeOptions());
+    /// Scans channels and radio modes for nodes and incompatibilities. Takes about
+    /// options.dwellMs per channel; normal traffic pauses while off-channel.
+    Status deepDiscover(DeepDiscoveryReport& out, const DeepDiscoveryOptions& options = DeepDiscoveryOptions());
 
     /// Processes pending radio events and timers when runTask is false.
     void poll();
@@ -214,6 +228,9 @@ public:
 
     /// Largest frame the local ESP-NOW driver can send (250 or 1470).
     static uint16_t maxSupportedFrameSize();
+    /// Transmit power found to work by the automatic fallback or optimizeLink()
+    /// during this boot (0 if none). Useful to configure Wi-Fi before begin().
+    static float learnedTxPowerCeiling();
 
 private:
     class RadioLink;
@@ -223,9 +240,14 @@ private:
     Status applyRadioSettings();
     Status applyTxPower(float dbm);
     Status applyPeerRate(const Mac& mac);
-    PhyRate peerRate(const Mac& mac) const;
     void releaseRadio();
     void handlePeerEvent(PeerEvent event, const PeerInfo& peer);
+    class Host;
+    Status diagnosticsReady() const;
+    void startPowerFallback(const Mac& peer);
+    void sendFallbackPing();
+    void onFallbackPing(Status status);
+    void tickLinkChecks(uint32_t now);
     struct LinkHealth {
         Mac mac;
         uint32_t lastHeardMs = 0;
@@ -250,6 +272,28 @@ private:
     std::vector<Mac> explicitFrameSizes_;
     std::vector<std::pair<Mac, PhyRate>> peerRates_;
     std::vector<LinkHealth> linkHealth_;
+    std::unique_ptr<Host> host_;
+    std::unique_ptr<Diagnostics> diagnostics_;
+    int8_t limitQuarterDbm_ = 80;
+    struct PowerFallback {
+        bool active = false;
+        Mac peer;
+        float original = 0;
+        std::vector<float> ladder;
+        size_t index = 0;
+        uint8_t failures = 0;
+        bool pingInFlight = false;
+        bool confirming = false;  // re-testing the original power after a success
+        uint32_t nextPingAt = 0;
+        std::vector<Mac> tried;
+    } fallback_;
+    struct LinkCheck {
+        Mac peer;
+        uint8_t remaining;
+        bool inFlight;
+        uint32_t nextAt;
+    };
+    std::vector<LinkCheck> linkChecks_;
     TransportStats stats_;  // radio-level counters only
     struct SavedRadio {
         bool powerSave = false;

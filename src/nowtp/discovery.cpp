@@ -127,6 +127,17 @@ void Discovery::tick(uint32_t now) {
     }
 }
 
+bool Discovery::parseAnnouncement(const uint8_t* p, size_t len, std::string& name, uint16_t& maxFrameSize) {
+    if (len < kFixedSize || p[0] != kHello) return false;
+    size_t nameLen = p[4];
+    if (nameLen > kMaxName || 6 + nameLen > len) return false;
+    size_t metaLen = p[5 + nameLen];
+    if (metaLen > kMaxMetadata || 6 + nameLen + metaLen > len) return false;
+    name.assign(reinterpret_cast<const char*>(p + 5), nameLen);
+    maxFrameSize = wire::getU16(p + 2);
+    return true;
+}
+
 void Discovery::handle(const Message& m) {
     const uint8_t* p = m.data;
     size_t len = m.len;

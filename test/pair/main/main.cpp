@@ -75,12 +75,23 @@ std::string macStr(const Mac& m) {
                m.bytes[5]);
 }
 
-// This S3 board loses its frames above ~17 dBm (its supply sags); cap it.
-constexpr float kS3MaxDbm = 17;
-void boardTxPowerFix() {
-#if CONFIG_IDF_TARGET_ESP32S3
-    esp_wifi_set_max_tx_power(static_cast<int8_t>(kS3MaxDbm * 4));
-#endif
+// When the application brings Wi-Fi up itself (phases 2 and 3), reuse the
+// transmit power NowTP found to work earlier in this boot, if it had to lower
+// it. Nothing here is specific to a board.
+void applyLearnedPower() {
+    float ceiling = nowtp::EspNowTransport::learnedTxPowerCeiling();
+    if (ceiling > 0) esp_wifi_set_max_tx_power(static_cast<int8_t>(ceiling * 4));
+}
+
+Mac g_peerMac;  // the other board, as seen in phase 1
+bool g_peerLocked = false;
+
+// The partner, or its soft-AP interface (station MAC + 1) in phase 3.
+bool isPartner(const Mac& m) {
+    if (m == g_peerMac) return true;
+    Mac ap = g_peerMac;
+    ap.bytes[5] = static_cast<uint8_t>(ap.bytes[5] + 1);
+    return m == ap;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +105,7 @@ std::atomic<int> g_peerLostCount{0};
 void onPeer(nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
     // Other NowTP nodes may be on the air; only follow the other test board.
     if (p.name != "driver" && p.name != "board") return;
+    if (g_peerLocked && !isPartner(p.mac)) return;
     std::lock_guard<std::mutex> lock(g_peerMutex);
     if (e == nowtp::PeerEvent::Lost) {
         g_peerPresent = false;
@@ -331,10 +343,23 @@ nowtp::EspNowConfig baseConfig(const std::string& phase) {
     cfg.discovery.metadata.assign(phase.begin(), phase.end());
     cfg.discovery.announceIntervalMs = 300;
     cfg.discovery.peerTimeoutMs = 2000;
-#if CONFIG_IDF_TARGET_ESP32S3
-    cfg.radio.txPowerDbm = kS3MaxDbm;
-#endif
     return cfg;
+}
+
+// Hearing the partner does not mean it hears us yet (e.g. while the power
+// fallback is still searching): wait for a reliable round trip, as an
+// application would retry.
+bool waitLinkUp(const std::string& phase, const Mac& peer) {
+    nowtp::SendOptions rel;
+    rel.reliable = true;
+    int64_t t0 = millis();
+    bool up = false;
+    while (!up && millis() - t0 < 20000) {
+        up = transport.sendAndWait(peer, kBulk, "x", 1, rel) == Status::Ok;
+        if (!up) vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    report((phase + "_link_up").c_str(), up, fmt("(after %lld ms)", (long long)(millis() - t0)));
+    return up;
 }
 
 // Starts NowTP for a phase and waits for the peer to reach the same phase.
@@ -343,13 +368,20 @@ bool startPhase(const std::string& phase, nowtp::EspNowConfig cfg) {
     Status st = transport.begin(cfg);
     report((phase + "_begin").c_str(), st == Status::Ok, nowtp::toString(st));
     if (st != Status::Ok) return false;
-    bool synced = waitFor([&] { return peerMeta() == phase; }, 30000);
+    bool synced = waitFor([&] { return peerMeta() == phase; }, 15000);
     nowtp::PeerInfo p = peerInfo();
     report((phase + "_peer_discovered").c_str(), synced,
            fmt("(%s \"%s\", rssi %d, max frame %u)", macStr(p.mac).c_str(), p.name.c_str(), p.rssi,
                p.maxFrameSize));
-    if (!synced) transport.end();
-    return synced;
+    if (!synced) {
+        transport.end();
+        return false;
+    }
+    if (g_driver && !waitLinkUp(phase, p.mac)) {
+        transport.end();
+        return false;
+    }
+    return true;
 }
 
 // Driver announces "<phase>-done" and waits for the responder to say goodbye.
@@ -392,6 +424,8 @@ void phaseAutoInit() {
 
     Mac self = transport.localMac();
     Mac peer = peerInfo().mac;
+    g_peerMac = peer;
+    g_peerLocked = true;
     g_driver = memcmp(self.bytes, peer.bytes, 6) < 0;
     printf("ROLE %s (self %s, peer %s)\n", g_driver ? "driver" : "responder", macStr(self).c_str(),
            macStr(peer).c_str());
@@ -407,11 +441,13 @@ void phaseAutoInit() {
     }
 
     nowtp::RadioInfo r = transport.radioInfo();
+    printf("INFO power: limit %.2f dBm, now %.2f dBm, learned ceiling %.2f dBm, automatic fallbacks %lu\n",
+           r.txPowerLimitDbm, r.txPowerDbm, r.learnedTxCeilingDbm, (unsigned long)transport.stats().powerFallbacks);
     report("p1_radio_auto_started", r.wifiStartedByNowTP && r.channel == 1 && r.interface == WIFI_IF_STA &&
                                         !r.stationConnected && !r.softApActive,
            fmt("(channel %u)", r.channel));
 
-    if (g_driver) driverDataTests(peer, true);
+    if (g_driver && waitLinkUp("p1", peer)) driverDataTests(peer, true);
     finishPhase("p1");
     report("p1_wifi_released_after_end", esp_wifi_get_mode(&mode) == ESP_ERR_WIFI_NOT_INIT);
 }
@@ -449,7 +485,7 @@ void phaseAppStation() {
     appWifiInit();
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    boardTxPowerFix();
+    applyLearnedPower();
     ESP_ERROR_CHECK(esp_wifi_set_channel(3, WIFI_SECOND_CHAN_NONE));
 
     nowtp::EspNowConfig cfg = baseConfig("p2");
@@ -479,14 +515,14 @@ void phaseSoftApAndConnectedStation() {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
         ESP_ERROR_CHECK(esp_wifi_start());
-        boardTxPowerFix();
+        applyLearnedPower();
     } else {
         wifi_config_t sta = {};
         strcpy(reinterpret_cast<char*>(sta.sta.ssid), kApSsid);
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
         ESP_ERROR_CHECK(esp_wifi_start());
-        boardTxPowerFix();
+        applyLearnedPower();
         esp_wifi_connect();
         bool connected = xEventGroupWaitBits(g_wifiEvents, kConnected, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)) &
                          kConnected;
@@ -510,7 +546,6 @@ void phaseSoftApAndConnectedStation() {
     esp_wifi_deinit();  // phases 4 and 5 let NowTP own Wi-Fi again
 }
 
-Mac bulkTarget;
 int bulkOk;
 
 // Sends `count` unreliable messages of `len` bytes to the responder's counter and
@@ -523,7 +558,18 @@ int64_t measuredBulk(const Mac& peer, const Mac& dst, size_t len, int count, Cou
     return ms;
 }
 
-// Phase 4: both boards in Long Range mode. Rates, broadcast rate and power.
+double kbps(int64_t ms, int count, size_t len) {
+    return ms > 0 ? count * len * 8.0 / ms : 0.0;
+}
+
+bool hasIssue(const std::vector<nowtp::Issue>& issues, nowtp::IssueKind kind, const Mac& peer) {
+    for (const nowtp::Issue& i : issues) {
+        if (i.kind == kind && i.peer == peer) return true;
+    }
+    return false;
+}
+
+// Phase 4: both boards in Long Range mode; the library diagnoses and tunes the link.
 void phaseRadioSettings() {
     nowtp::EspNowConfig cfg = baseConfig("p4");
     cfg.radio.longRange = true;
@@ -534,55 +580,73 @@ void phaseRadioSettings() {
 
     if (g_driver) {
         Mac peer = peerInfo().mac;
-        // 10 dBm: the test S3 cannot sustain OFDM rates above ~15 dBm.
-        transport.setTxPower(10);
         using nowtp::PhyRate;
-        const PhyRate rates[] = {PhyRate::B1M,  PhyRate::B2M,  PhyRate::B5_5M, PhyRate::B11M, PhyRate::G6M,
-                                 PhyRate::G12M, PhyRate::G24M, PhyRate::G54M,  PhyRate::MCS0, PhyRate::MCS3,
-                                 PhyRate::MCS7, PhyRate::LR500K, PhyRate::LR250K};
-        for (PhyRate rate : rates) {
-            bool lr = rate == PhyRate::LR250K || rate == PhyRate::LR500K;
-            int count = lr ? 2 : 5;
-            Counters c;
-            queryStats(peer, c);
-            Status st = transport.setUnicastRate(rate);
-            int64_t ms = measuredBulk(peer, peer, 16000, count, c);
-            std::string name = std::string("unicast_rate ") + nowtp::toString(rate);
-            report(name.c_str(), st == Status::Ok && ms > 0 && (int)c.bulkMessages == count,
-                   fmt("(%d x 16000 B in %lld ms = %.1f KB/s, peer got %lu, rssi %ld)", count, (long long)ms,
-                       ms > 0 ? count * 16000.0 / 1024 / (ms / 1000.0) : 0.0, (unsigned long)c.bulkMessages,
-                       (long)(c.rssiCount ? c.rssiSum / (int32_t)c.rssiCount : 0)));
-        }
-        transport.setUnicastRate(PhyRate::Default);
 
+        nowtp::LinkDiagnosis d;
+        Status st = transport.diagnose(peer, d);
+        report("diagnose", st == Status::Ok && d.responds && d.ours.dsssDbm > 0 && d.theirs.dsssDbm > 0 &&
+                               d.forward.size() >= 14 && d.reverse.size() == d.forward.size(),
+               fmt("(us: limit %.1f, 11b %.1f, OFDM %.1f dBm; peer: limit %.1f, 11b %.1f, OFDM %.1f dBm)",
+                   d.ours.limitDbm, d.ours.dsssDbm, d.ours.ofdmDbm, d.theirs.limitDbm, d.theirs.dsssDbm,
+                   d.theirs.ofdmDbm));
+        for (size_t i = 0; i < d.forward.size() && i < d.reverse.size(); ++i) {
+            printf("INFO %-17s to peer %2u/%u (%4d dBm) at %4.1f dBm | from peer %2u/%u (%4d dBm) at %4.1f dBm\n",
+                   nowtp::toString(d.forward[i].step.rate), d.forward[i].received, d.forward[i].sent,
+                   d.forward[i].rssi, d.forward[i].step.txPowerDbm, d.reverse[i].received, d.reverse[i].sent,
+                   d.reverse[i].rssi, d.reverse[i].step.txPowerDbm);
+        }
+        for (const nowtp::Issue& i : d.issues) {
+            printf("INFO issue %s%s: %s\n", nowtp::toString(i.kind), i.local ? " (this node)" : "", i.detail.c_str());
+        }
+        report("diagnose_1mbps_works_both_ways",
+               !d.forward.empty() && d.forward[0].ratio() >= 0.9f && d.reverse[0].ratio() >= 0.9f);
+        bool lrFwd = false, lrRev = false;
+        for (size_t i = 0; i < d.forward.size(); ++i) {
+            if (d.forward[i].step.rate == PhyRate::LR250K) lrFwd = d.forward[i].ratio() >= 0.8f;
+            if (i < d.reverse.size() && d.reverse[i].step.rate == PhyRate::LR250K) lrRev = d.reverse[i].ratio() >= 0.8f;
+        }
+        report("diagnose_long_range_both_ways", lrFwd && lrRev);
+
+        // Throughput at 1 Mbps, then after the library tunes the link.
         Counters c;
-        // Broadcast has no MAC-level retries: single frames, and only require that
-        // frames at the configured rate get through, not a perfect link.
-        Status st = transport.setBroadcastRate(PhyRate::B11M);
-        int64_t ms = measuredBulk(peer, Mac::broadcast(), 200, 20, c);
-        report("broadcast_rate 11 Mbps", st == Status::Ok && c.bulkMessages >= 10,
-               fmt("(20 x 200 B in %lld ms, peer got %lu)", (long long)ms, (unsigned long)c.bulkMessages));
-        transport.setBroadcastRate(PhyRate::Default);
+        transport.setPeerRate(peer, PhyRate::B1M);
+        int64_t baseMs = measuredBulk(peer, peer, 16000, 3, c);
+        double base = kbps(baseMs, 3, 16000);
+        transport.setPeerRate(peer, PhyRate::Default);
 
-        const float powers[] = {2, 5, 8, 11, 14, 17};
-        long rssiFirst = 0, rssiLast = 0;
-        for (size_t i = 0; i < sizeof(powers) / sizeof(powers[0]); ++i) {
-            Status ps = transport.setTxPower(powers[i]);
-            float actual = transport.radioInfo().txPowerDbm;  // the driver quantizes on some chips
-            measuredBulk(peer, peer, 200, 20, c);
-            long rssi = c.rssiCount ? c.rssiSum / (int32_t)c.rssiCount : 0;
-            if (i == 0) rssiFirst = rssi;
-            rssiLast = rssi;
-            std::string name = fmt("tx_power %.0f dBm", powers[i]);
-            report(name.c_str(), ps == Status::Ok && actual > powers[i] - 1.1f && actual < powers[i] + 0.3f &&
-                                     c.bulkMessages >= 18,
-                   fmt("(driver reports %.2f dBm, peer got %lu/20 at %ld dBm)", actual,
-                       (unsigned long)c.bulkMessages, rssi));
+        nowtp::LinkProfile p;
+        st = transport.optimizeLink(peer, p, nowtp::OptimizeOptions(), &d);  // reuse the diagnosis
+        report("optimize_link", st == Status::Ok && p.applied && p.verified,
+               fmt("(to peer %s at %.1f dBm, from peer %s at %.1f dBm)", nowtp::toString(p.rateToPeer), p.txPowerDbm,
+                   nowtp::toString(p.rateFromPeer), p.peerTxPowerDbm));
+        int64_t optMs = measuredBulk(peer, peer, 16000, 3, c);
+        double opt = kbps(optMs, 3, 16000);
+        report("optimized_link_not_slower", c.bulkMessages == 3 && opt >= 0.9 * base,
+               fmt("(%.0f kbit/s at 1 Mbps, %.0f kbit/s optimized)", base, opt));
+        echoTest(peer, "echo_16k_reliable_optimized", 16000, true);
+
+        // Transmit power, measured by the library: RSSI at the peer follows it.
+        std::vector<nowtp::ProbeStep> steps;
+        const float powers[] = {2, 5, 8, 11, 14};
+        for (float pw : powers) {
+            if (pw < d.ours.dsssDbm) steps.push_back(nowtp::ProbeStep(PhyRate::B1M, pw));
         }
-        report("tx_power_moves_rssi", rssiLast - rssiFirst >= 6,
-               fmt("(rssi %ld dBm at 2 dBm, %ld dBm at 17 dBm)", rssiFirst, rssiLast));
+        steps.push_back(nowtp::ProbeStep(PhyRate::B1M, d.ours.dsssDbm));
+        std::vector<nowtp::ProbeResult> fwd;
+        st = transport.measureLink(peer, steps, 20, &fwd, nullptr);
+        bool allArrive = st == Status::Ok && fwd.size() == steps.size();
+        for (const nowtp::ProbeResult& x : fwd) allArrive = allArrive && x.ratio() >= 0.9f;
+        int rise = allArrive ? fwd.back().rssi - fwd.front().rssi : 0;
+        // RSSI follows the power setting, unless diagnose() found that this
+        // board's power control barely works (then it must have said so).
+        bool flagged = false;
+        for (const nowtp::Issue& i : d.issues) {
+            flagged = flagged || (i.kind == nowtp::IssueKind::PowerControlIneffective && i.local);
+        }
+        report("tx_power_moves_rssi", allArrive && (rise >= 6 || flagged),
+               fmt("(rssi %d dBm at %.0f dBm, %d dBm at %.1f dBm)", allArrive ? fwd.front().rssi : 0, steps.front().txPowerDbm,
+                   allArrive ? fwd.back().rssi : 0, steps.back().txPowerDbm));
         report("tx_power_out_of_range_rejected", transport.setTxPower(30) == Status::InvalidArgument);
-        transport.setTxPower(17);
     }
     finishPhase("p4");
 }
@@ -605,6 +669,73 @@ void phaseLongRangeInterop() {
     finishPhase("p5");
 }
 
+// Phase 6: deep discovery. The responder hides on channel 6, then uses
+// another network id; the driver must find it both times. No other sync is
+// possible, so both sides follow the same timeline.
+void phaseDeepDiscovery() {
+    const uint32_t kWindowMs = 8000;
+    int64_t start = millis();
+    if (!g_driver) {
+        nowtp::EspNowConfig a = baseConfig("p6");
+        a.radio.channel = 6;
+        report("p6_on_channel_6", transport.begin(a) == Status::Ok);
+        vTaskDelay(pdMS_TO_TICKS(kWindowMs));
+        transport.end();
+        nowtp::EspNowConfig b = baseConfig("p6");
+        b.protocol.networkId = 9;
+        report("p6_on_network_9", transport.begin(b) == Status::Ok);
+        vTaskDelay(pdMS_TO_TICKS(kWindowMs));
+        transport.end();
+        return;
+    }
+
+    nowtp::EspNowConfig cfg = baseConfig("p6");
+    if (transport.begin(cfg) != Status::Ok) return;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    auto show = [](const nowtp::DeepDiscoveryReport& r) {
+        for (const nowtp::DiscoveredNode& n : r.nodes) {
+            printf("INFO node %s \"%s\" channel %u network %u v%u rssi %d%s%s\n", macStr(n.mac).c_str(), n.name.c_str(),
+                   n.channel, n.networkId, n.protocolVersion, n.rssi, n.compatible ? " compatible" : "",
+                   n.hearsUs ? " hears-us" : "");
+        }
+        for (const nowtp::Issue& i : r.issues) printf("INFO issue %s: %s\n", nowtp::toString(i.kind), i.detail.c_str());
+    };
+    auto find = [](const nowtp::DeepDiscoveryReport& r, const Mac& mac) -> const nowtp::DiscoveredNode* {
+        for (const nowtp::DiscoveredNode& n : r.nodes) {
+            if (n.mac == mac) return &n;
+        }
+        return nullptr;
+    };
+
+    nowtp::DeepDiscoveryOptions o;
+    o.channels = {1, 6, 11};
+    o.dwellMs = 1200;
+    nowtp::DeepDiscoveryReport r1;
+    Status st = transport.deepDiscover(r1, o);
+    show(r1);
+    const nowtp::DiscoveredNode* n = find(r1, g_peerMac);
+    report("deep_discovery_finds_peer_on_other_channel",
+           st == Status::Ok && n && n->channel == 6 && hasIssue(r1.issues, nowtp::IssueKind::OtherChannel, g_peerMac),
+           fmt("(%s)", n ? fmt("seen on channel %u", n->channel).c_str() : "not seen"));
+    report("deep_discovery_restores_channel", transport.radioInfo().channel == 1);
+
+    int64_t wait = start + kWindowMs + 1500 - millis();
+    if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+    o.channels = {1};
+    o.checkLongRange = false;
+    nowtp::DeepDiscoveryReport r2;
+    st = transport.deepDiscover(r2, o);
+    show(r2);
+    n = find(r2, g_peerMac);
+    report("deep_discovery_finds_other_network_id",
+           st == Status::Ok && n && n->networkId == 9 && hasIssue(r2.issues, nowtp::IssueKind::OtherNetworkId, g_peerMac),
+           fmt("(%s)", n ? fmt("network id %u", n->networkId).c_str() : "not seen"));
+    transport.end();
+    wait = start + 2 * kWindowMs + 1000 - millis();
+    if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+}
+
 }  // namespace
 
 extern "C" void app_main() {
@@ -619,6 +750,7 @@ extern "C" void app_main() {
         phaseSoftApAndConnectedStation();
         phaseRadioSettings();
         phaseLongRangeInterop();
+        phaseDeepDiscovery();
     }
     printf("DONE pass=%d fail=%d\n", g_pass, g_fail);
     for (;;) vTaskDelay(portMAX_DELAY);

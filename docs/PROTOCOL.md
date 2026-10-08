@@ -101,6 +101,27 @@ Discovery messages are ordinary single-frame broadcast messages, unreliable and 
 - **Goodbye.** A goodbye removes the sender from the receiver's peer list right away.
 - **Frame size.** A sender uses `min(local maximum, peer's advertised maximum)` as the frame size for unicast to that peer.
 
+## Diagnostics (port 254)
+
+Diagnostics messages are single-frame unicast messages on port 254, except probe bursts, which are broadcast. The first payload byte is the type, and bytes 1–2 are a session id chosen by the initiator. In requests, byte 3 is the attempt number. In replies, byte 3 is the replying node's transmit power, in units of 0.25 dBm (signed).
+
+| Type | Name | Payload after type and session | Notes |
+|---|---|---|---|
+| 1 | Burst | step, sequence, padding | Probe frame (default 200-byte payload), broadcast at the step's rate and power |
+| 2 | Collect | attempt | "Report what you counted for this session" |
+| 3 | Report | power, n, n × (received, average RSSI) | |
+| 4 | BurstRequest | attempt, frames per step, n, n × (rate, power) | Power 0 means "keep yours". Steps the responder can't send (e.g. LR without Long Range) are skipped, never substituted. |
+| 5 | BurstAck | power, power limit, flags | Flag `0x1`: busy with its own measurement. The initiator backs off and retries. |
+| 6 | Apply | attempt, rate, power | Asks the peer to use `rate` toward us, and `power`. Refused if remote tuning is off. |
+| 7 | ApplyAck | power, flags | Flag `0x1`: busy |
+| 8 | Ping | attempt | |
+| 9 | Pong | power, power limit | |
+| 10 | BurstDone | power | End of the requested bursts |
+
+- **Power fallback on retries.** Attempt *k* > 0 of a request is sent with the sender's power capped at {15, 11, 8, 5} dBm, the *k*-th value. The reply to it is capped the same way. A node whose supply sags at full power can therefore still be reached, and can still answer.
+- **Rate for control traffic.** Control frames always go at 1 Mbps.
+- **Other payloads.** Payloads with type 0 are ignored. They serve as pings acknowledged only at the MAC level (for the power fallback and deep discovery's transmit check), and as the reliable verification message.
+
 ## Limits
 
 - **Message size.** Each side sets its own maximum message size. Receivers check the claimed size before allocating memory.

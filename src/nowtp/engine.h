@@ -21,6 +21,20 @@ namespace nowtp {
 /// tick() periodically (every 5-10 ms is plenty). Callbacks run synchronously
 /// from whichever entry point triggered them and may call back into the engine
 /// (e.g. send() from a receive handler).
+/// A received frame as seen before any filtering, for diagnostics.
+struct FrameInfo {
+    Mac src;
+    int8_t rssi;
+    bool nowtp;          ///< Header decodes as some NowTP version.
+    uint8_t version;     ///< Protocol version bits (valid when len >= 1).
+    bool sameNetwork;    ///< Decodes and carries our network id and version.
+    wire::Header header; ///< Valid when `nowtp`.
+    const uint8_t* payload;
+    size_t payloadLen;
+};
+
+using FrameObserver = std::function<void(const FrameInfo&)>;
+
 class Engine {
 public:
     /// `firstMessageId` should be random per boot so a restarted sender is not
@@ -49,6 +63,10 @@ public:
 
     /// Drives timeouts and retransmissions.
     void tick(uint32_t nowMs);
+
+    /// Sees every received frame before filtering (other network ids, other
+    /// protocol versions, non-NowTP ESP-NOW traffic). For diagnostics; one at a time.
+    void setFrameObserver(FrameObserver observer) { observer_ = std::move(observer); }
 
     /// Fails every outgoing message with `reason` and drops partial incoming ones.
     void cancelAll(Status reason = Status::Cancelled);
@@ -140,6 +158,7 @@ private:
     bool pumping_ = false;
     bool flushing_ = false;
     int8_t rxRssi_ = 0;  // RSSI of the frame being processed
+    FrameObserver observer_;
 };
 
 }  // namespace nowtp

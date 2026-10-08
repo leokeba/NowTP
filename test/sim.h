@@ -8,7 +8,9 @@
 #include <random>
 #include <vector>
 
+#include "nowtp/diagnostics.h"
 #include "nowtp/engine.h"
+#include "nowtp/radio.h"
 
 namespace sim {
 
@@ -22,6 +24,66 @@ struct Frame {
 };
 
 class Network;
+
+/// Simulated radio state; the delivery model in Network uses it.
+class SimRadio : public nowtp::RadioControl {
+public:
+    float power = 20;
+    float limit = 20;
+    uint8_t chan = 1;
+    bool lr = false;
+    bool channelLocked = false;  // like a station connected to an AP
+    nowtp::PhyRate bcast = nowtp::PhyRate::Default;
+    nowtp::PhyRate unicastDefault = nowtp::PhyRate::Default;
+    std::vector<std::pair<Mac, nowtp::PhyRate>> peers;
+
+    float txPower() const override { return power; }
+    float txPowerLimit() const override { return limit; }
+    Status setTxPower(float dbm) override {
+        if (dbm < 2) return Status::InvalidArgument;
+        power = dbm > limit ? limit : dbm;
+        return Status::Ok;
+    }
+    nowtp::PhyRate broadcastRate() const override { return bcast; }
+    Status setBroadcastRate(nowtp::PhyRate r) override {
+        if (!rateUsable(r)) return Status::InvalidArgument;
+        bcast = r;
+        return Status::Ok;
+    }
+    nowtp::PhyRate peerRate(const Mac& m) const override {
+        for (const auto& p : peers) {
+            if (p.first == m) return p.second;
+        }
+        return unicastDefault;
+    }
+    Status setPeerRate(const Mac& m, nowtp::PhyRate r) override {
+        if (!rateUsable(r)) return Status::InvalidArgument;
+        for (auto& p : peers) {
+            if (p.first == m) {
+                p.second = r;
+                return Status::Ok;
+            }
+        }
+        peers.push_back(std::make_pair(m, r));
+        return Status::Ok;
+    }
+    bool rateUsable(nowtp::PhyRate r) const override { return nowtp::isValid(r) && (!nowtp::isLongRange(r) || lr); }
+    uint8_t channel() const override { return chan; }
+    Status setChannel(uint8_t c) override {
+        if (channelLocked) return Status::InvalidState;
+        chan = c;
+        return Status::Ok;
+    }
+    bool longRange() const override { return lr; }
+    Status setLongRange(bool on) override {
+        lr = on;
+        return Status::Ok;
+    }
+    nowtp::PhyRate rateFor(const Mac& dst) const {
+        nowtp::PhyRate r = dst.isBroadcast() ? bcast : peerRate(dst);
+        return r == nowtp::PhyRate::Default ? nowtp::PhyRate::B1M : r;
+    }
+};
 
 class SimLink : public nowtp::Link {
 public:
@@ -44,8 +106,13 @@ struct Node {
     Mac mac;
     SimLink link;
     nowtp::Engine engine;
+    SimRadio radio;
     bool online = true;
 };
+
+/// Probability that a frame from node `from` reaches node `to`, given the
+/// sender's rate and power. Lets tests model weak boards and weak links.
+using LinkModel = std::function<double(size_t from, size_t to, nowtp::PhyRate rate, float powerDbm)>;
 
 class Network {
 public:
@@ -73,6 +140,12 @@ public:
     double macAckLoss = 0.0;
     /// Return true to drop a specific frame (applied before random loss).
     std::function<bool(const Frame&)> dropIf;
+    /// Rate/power-dependent delivery (default: always).
+    LinkModel linkModel;
+    /// RSSI seen by `to` for a frame from `from` (default: -60 dBm + power).
+    std::function<int(size_t from, size_t to, float powerDbm)> rssiModel;
+    /// Called every simulated millisecond after the engines tick (discovery, diagnostics...).
+    std::vector<std::function<void(uint32_t)>> tickers;
     /// Every frame handed to the radio, in order.
     std::vector<Frame> log;
 
@@ -99,25 +172,28 @@ public:
         bool forced = dropIf && dropIf(f);
 
         bool ok = true;
+        const SimRadio& tx = nodes_[from]->radio;
+        nowtp::PhyRate rate = tx.rateFor(dst);
         if (!nodes_[from]->online) {
             ok = dst.isBroadcast();  // a node that is off reaches nobody
         } else if (dst.isBroadcast()) {
             for (size_t i = 0; i < nodes_.size(); ++i) {
-                if (i == from || !nodes_[i]->online) continue;
+                if (i == from || !hears(from, i, rate)) continue;
                 if (forced || chance(airLoss) || chance(appLoss)) continue;
-                schedule(Event{now_ + 1, Event::Deliver, i, from, f.data, true});
+                schedule(Event{now_ + 1, Event::Deliver, i, from, f.data, true, rssi(from, i)});
             }
         } else {
             size_t to = find(dst);
-            bool reachable = to != SIZE_MAX && nodes_[to]->online;
+            bool reachable = to != SIZE_MAX && hears(from, to, rate);
             if (!reachable || chance(airLoss)) {
                 ok = false;
             } else {
-                if (!forced && !chance(appLoss)) schedule(Event{now_ + 1, Event::Deliver, to, from, f.data, true});
-                if (chance(macAckLoss)) ok = false;
+                if (!forced && !chance(appLoss)) schedule(Event{now_ + 1, Event::Deliver, to, from, f.data, true, rssi(from, to)});
+                // The receiver's MAC acknowledgement must make it back.
+                if (chance(macAckLoss) || !hears(to, from, nowtp::PhyRate::B1M)) ok = false;
             }
         }
-        schedule(Event{now_ + 1, Event::SendDone, from, from, std::vector<uint8_t>(), ok});
+        schedule(Event{now_ + 1, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
         return Status::Ok;
     }
 
@@ -136,10 +212,11 @@ public:
                 n.link.inFlight = false;
                 n.engine.onFrameSent(e.ok, now_);
             } else if (n.online) {
-                n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_);
+                n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi);
             }
         }
         for (auto& n : nodes_) n->engine.tick(now_);
+        for (auto& t : tickers) t(now_);
     }
 
     void run(uint32_t ms) {
@@ -162,9 +239,25 @@ private:
         size_t from;
         std::vector<uint8_t> data;
         bool ok;
+        int8_t rssi;
     };
 
-    void schedule(const Event& e) { events_.push_back(e); }  // all events use now+1, so FIFO == time order
+    int8_t rssi(size_t from, size_t to) const {
+        float p = nodes_[from]->radio.power;
+        int v = rssiModel ? rssiModel(from, to, p) : static_cast<int>(-60 + p);
+        return static_cast<int8_t>(v);
+    }
+
+    void schedule(const Event& e) { events_.push_back(e); }
+    // One frame from `from` decoded by `to` (random draw with the link model).
+    bool hears(size_t from, size_t to, nowtp::PhyRate rate) {
+        const Node& a = *nodes_[from];
+        const Node& b = *nodes_[to];
+        if (!a.online || !b.online || a.radio.chan != b.radio.chan) return false;
+        if (nowtp::isLongRange(rate) && !b.radio.lr) return false;
+        if (!linkModel) return true;
+        return chance(1.0 - linkModel(from, to, rate, a.radio.power));
+    }  // all events use now+1, so FIFO == time order
     bool chance(double p) { return p > 0 && std::uniform_real_distribution<double>(0, 1)(rng_) < p; }
     size_t find(const Mac& m) const {
         for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -173,6 +266,10 @@ private:
         return SIZE_MAX;
     }
 
+public:
+    std::mt19937& rng() { return rng_; }
+
+private:
     std::vector<std::unique_ptr<Node>> nodes_;
     std::deque<Event> events_;
     std::mt19937 rng_;
@@ -182,5 +279,19 @@ private:
 inline Status SimLink::sendFrame(const Mac& dst, const uint8_t* data, size_t len) {
     return net_.transmit(index_, dst, data, len);
 }
+
+/// Diagnostics host for the simulation: sleeping steps the whole network.
+class SimHost : public nowtp::DiagnosticsHost {
+public:
+    explicit SimHost(Network& net) : net_(net) {}
+    uint32_t now() override { return net_.now(); }
+    void sleep(uint32_t ms) override { net_.run(ms ? ms : 1); }
+    void lock() override {}
+    void unlock() override {}
+    uint32_t random() override { return static_cast<uint32_t>(net_.rng()()); }
+
+private:
+    Network& net_;
+};
 
 }  // namespace sim

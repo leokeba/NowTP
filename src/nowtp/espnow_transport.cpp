@@ -77,12 +77,8 @@ inline const RateInfo& rateInfo(PhyRate r) {
     return kRates[i < sizeof(kRates) / sizeof(kRates[0]) ? i : 0];
 }
 
-inline bool isLongRange(PhyRate r) {
-    return r == PhyRate::LR250K || r == PhyRate::LR500K;
-}
-
 inline bool validRate(PhyRate r) {
-    return static_cast<size_t>(r) < sizeof(kRates) / sizeof(kRates[0]);
+    return isValid(r);
 }
 
 // dBm to the driver's 0.25 dBm units; 0 if out of range.
@@ -103,6 +99,8 @@ struct EventHeader {
 // ESP-NOW callbacks carry no user pointer, so they reach the active
 // instance's event buffer through these.
 RingbufHandle_t volatile s_events = nullptr;
+// Power found to work by the automatic fallback or optimize(); kept for the boot.
+float s_learnedCeilingDbm = 0;
 volatile uint32_t s_droppedEvents = 0;
 bool s_active = false;
 
@@ -212,6 +210,31 @@ private:
     std::vector<std::pair<Mac, uint16_t>> sizes_;
 };
 
+// Lets the blocking diagnostic procedures run in the caller's task while the
+// NowTP task (or poll()) keeps the engine going.
+class EspNowTransport::Host : public DiagnosticsHost {
+public:
+    explicit Host(EspNowTransport& t) : t_(t) {}
+    uint32_t now() override { return nowMs(); }
+    void sleep(uint32_t ms) override {
+        if (t_.config_.runTask) {
+            TickType_t ticks = pdMS_TO_TICKS(ms);
+            vTaskDelay(ticks ? ticks : 1);
+            return;
+        }
+        uint32_t end = nowMs() + ms;
+        do {
+            t_.processEvents(1);
+        } while (static_cast<int32_t>(nowMs() - end) < 0);
+    }
+    void lock() override { t_.lock(); }
+    void unlock() override { t_.unlock(); }
+    uint32_t random() override { return esp_random(); }
+
+private:
+    EspNowTransport& t_;
+};
+
 EspNowTransport::EspNowTransport() {}
 
 EspNowTransport::~EspNowTransport() {
@@ -224,6 +247,10 @@ uint16_t EspNowTransport::maxSupportedFrameSize() {
 #else
     return ESP_NOW_MAX_DATA_LEN;
 #endif
+}
+
+float EspNowTransport::learnedTxPowerCeiling() {
+    return s_learnedCeilingDbm;
 }
 
 uint32_t EspNowTransport::droppedEvents() const {
@@ -258,6 +285,13 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
                                        [] { return static_cast<uint32_t>(esp_random()); }));
         discovery_->onPeerEvent([this](PeerEvent e, const PeerInfo& p) { handlePeerEvent(e, p); });
     }
+    if (config_.enableDiagnostics) {
+        host_.reset(new Host(*this));
+        diagnostics_.reset(new Diagnostics(*engine_, *this, *host_, config_.diagnostics));
+        diagnostics_->setDiscovery(discovery_.get());
+    }
+    fallback_ = PowerFallback();
+    linkChecks_.clear();
 
     esp_err_t err = esp_now_init();
     if (err != ESP_OK) {
@@ -270,6 +304,9 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     s_droppedEvents = 0;
     stats_ = TransportStats();
     linkHealth_.clear();
+    // Per-peer settings belong to a session: ESP-NOW forgets its peers on deinit.
+    peerRates_.clear();
+    explicitFrameSizes_.clear();
     s_events = events_;
     s_active = true;
     esp_now_register_recv_cb(onRecv);
@@ -291,6 +328,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
     stopping_ = false;
     started_ = true;
+    if (diagnostics_) diagnostics_->start();
     if (discovery_) discovery_->start(nowMs());
     if (config_.runTask) {
         BaseType_t ok = xTaskCreatePinnedToCore(taskEntry, "nowtp", config_.taskStackSize, this,
@@ -306,6 +344,11 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
 void EspNowTransport::end() {
     if (!started_) return;
+    if (diagnostics_) {
+        lock();
+        diagnostics_->stop();
+        unlock();
+    }
     if (discovery_) {
         // Say goodbye so peers drop us at once, and give the frame time to go out.
         lock();
@@ -343,6 +386,8 @@ void EspNowTransport::cleanup() {
     }
     s_events = nullptr;
     s_active = false;
+    diagnostics_.reset();
+    host_.reset();
     discovery_.reset();
     engine_.reset();
     link_.reset();
@@ -409,6 +454,8 @@ void EspNowTransport::processEvents(TickType_t wait) {
     uint32_t now = nowMs();
     engine_->tick(now);
     if (discovery_) discovery_->tick(now);
+    if (diagnostics_) diagnostics_->tick(now);
+    tickLinkChecks(now);
     unlock();
 }
 
@@ -418,7 +465,7 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
     if (size > maxSupportedFrameSize() || !validRate(options.rate)) return Status::InvalidArgument;
     if (options.rate != PhyRate::Default) {
         if (mac.isBroadcast()) return Status::InvalidArgument;  // use setBroadcastRate()
-        if (isLongRange(options.rate) && !config_.radio.longRange) return Status::InvalidArgument;
+        if (!rateUsable(options.rate)) return Status::InvalidArgument;
 #if !defined(NOWTP_PER_PEER_RATE)
         if (options.rate != config_.radio.unicastRate) {
             ESP_LOGE(kTag, "per-peer rates need ESP-IDF 5.1 or later");
@@ -684,10 +731,23 @@ Status EspNowTransport::prepareRadio() {
     }
     radio_.channel = channel;
 
+    // The chip's power ceiling: ask for the maximum, read back, restore.
+    int8_t before = 0, limit = 80;
+    if (esp_wifi_get_max_tx_power(&before) == ESP_OK) {
+        esp_wifi_set_max_tx_power(84);
+        esp_wifi_get_max_tx_power(&limit);
+        esp_wifi_set_max_tx_power(before);
+    }
+    limitQuarterDbm_ = limit;
+
     Status settings = applyRadioSettings();
     if (settings != Status::Ok) {
         releaseRadio();
         return settings;
+    }
+    if (config_.radio.autoPowerFallback && s_learnedCeilingDbm > 0 && txPower() > s_learnedCeilingDbm + 0.01f) {
+        ESP_LOGI(kTag, "using the %.1f dBm transmit power found to work earlier", s_learnedCeilingDbm);
+        applyTxPower(s_learnedCeilingDbm);
     }
 
     ESP_LOGI(kTag, "radio ready: channel %u on %s%s%s%s", radio_.channel, interface_ == WIFI_IF_AP ? "AP" : "STA",
@@ -814,6 +874,11 @@ RadioInfo EspNowTransport::radioInfo() const {
     if (esp_wifi_get_max_tx_power(&power) == ESP_OK) info.txPowerDbm = power / 4.0f;
     uint8_t bitmap = 0;
     if (esp_wifi_get_protocol(interface_, &bitmap) == ESP_OK) info.longRange = (bitmap & WIFI_PROTOCOL_LR) != 0;
+    info.txPowerLimitDbm = limitQuarterDbm_ / 4.0f;
+    info.learnedTxCeilingDbm = s_learnedCeilingDbm;
+    uint8_t ch = 0;
+    wifi_second_chan_t second;
+    if (esp_wifi_get_channel(&ch, &second) == ESP_OK) info.channel = ch;
     return info;
 }
 
@@ -842,7 +907,7 @@ Status EspNowTransport::applyTxPower(float dbm) {
 
 Status EspNowTransport::setBroadcastRate(PhyRate rate) {
     if (!started_) return Status::InvalidState;
-    if (!validRate(rate) || (isLongRange(rate) && !config_.radio.longRange)) return Status::InvalidArgument;
+    if (!rateUsable(rate)) return Status::InvalidArgument;
 #if defined(NOWTP_PER_PEER_RATE)
     lock();
     config_.radio.broadcastRate = rate;
@@ -850,13 +915,18 @@ Status EspNowTransport::setBroadcastRate(PhyRate rate) {
     unlock();
     return st;
 #else
-    return rate == config_.radio.broadcastRate ? Status::Ok : Status::InvalidArgument;
+    // One ESP-NOW rate for everything before ESP-IDF 5.1.
+    lock();
+    config_.radio.broadcastRate = config_.radio.unicastRate = rate;
+    esp_err_t err = esp_wifi_config_espnow_rate(interface_, rateInfo(rate).rate);
+    unlock();
+    return err == ESP_OK ? Status::Ok : Status::LinkError;
 #endif
 }
 
 Status EspNowTransport::setUnicastRate(PhyRate rate) {
     if (!started_) return Status::InvalidState;
-    if (!validRate(rate) || (isLongRange(rate) && !config_.radio.longRange)) return Status::InvalidArgument;
+    if (!rateUsable(rate)) return Status::InvalidArgument;
 #if defined(NOWTP_PER_PEER_RATE)
     lock();
     config_.radio.unicastRate = rate;
@@ -870,16 +940,8 @@ Status EspNowTransport::setUnicastRate(PhyRate rate) {
     unlock();
     return st;
 #else
-    if (config_.radio.broadcastRate != PhyRate::Default && rate != config_.radio.broadcastRate) {
-        return Status::InvalidArgument;
-    }
-    config_.radio.unicastRate = rate;
-    return esp_wifi_config_espnow_rate(interface_, rateInfo(rate).rate) == ESP_OK ? Status::Ok : Status::LinkError;
+    return setBroadcastRate(rate);  // one rate for everything before ESP-IDF 5.1
 #endif
-}
-
-const char* toString(PhyRate rate) {
-    return validRate(rate) ? rateInfo(rate).name : "invalid";
 }
 
 // ---------------------------------------------------------------------------
@@ -925,17 +987,20 @@ void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
         l->failures = 0;
         return;
     }
-    if (++l->failures < kOneWayFailures || l->warned) return;
+    if (++l->failures < kOneWayFailures) return;
     if (static_cast<int32_t>(nowMs() - l->lastHeardMs) > static_cast<int32_t>(kOneWayHeardMs)) return;
-    l->warned = true;
-    stats_.oneWayLinks++;
-    int8_t power = 0;
-    esp_wifi_get_max_tx_power(&power);
-    ESP_LOGW(kTag,
-             "frames to %02x:%02x:%02x:%02x:%02x:%02x keep failing although its frames arrive: the link is one-way. "
-             "This board may not sustain %.1f dBm (try radio.txPowerDbm = 15) or the peer may not decode rate %s.",
-             mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5], power / 4.0,
-             toString(peerRate(mac)));
+    if (!l->warned) {
+        l->warned = true;
+        stats_.oneWayLinks++;
+        int8_t power = 0;
+        esp_wifi_get_max_tx_power(&power);
+        ESP_LOGW(kTag,
+                 "frames to %02x:%02x:%02x:%02x:%02x:%02x keep failing although its frames arrive: the link is one-way. "
+                 "This board may not sustain %.1f dBm (try radio.txPowerDbm = 15) or the peer may not decode rate %s.",
+                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5], power / 4.0,
+                 toString(peerRate(mac)));
+    }
+    if (config_.radio.autoPowerFallback) startPowerFallback(mac);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1008,11 @@ void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
 
 void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     // Runs in the NowTP task with the lock held.
+    // Check new peers hear us; failures feed the one-way detection and fallback.
+    if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < 8) {
+        LinkCheck c = {peer.mac, 3, false, nowMs()};
+        linkChecks_.push_back(c);
+    }
     if (config_.negotiateFrameSize && !hasExplicitFrameSize(peer.mac)) {
         uint16_t size = 0;  // default
         if (event != PeerEvent::Lost) {
@@ -990,6 +1060,271 @@ Status EspNowTransport::setDiscoveryMetadata(const void* data, size_t len) {
     discovery_->setMetadata(static_cast<const uint8_t*>(data), len, nowMs());
     unlock();
     return Status::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// Radio controls
+
+float EspNowTransport::txPower() const {
+    int8_t q = 0;
+    return esp_wifi_get_max_tx_power(&q) == ESP_OK ? q / 4.0f : 0.0f;
+}
+
+float EspNowTransport::txPowerLimit() const {
+    return limitQuarterDbm_ / 4.0f;
+}
+
+PhyRate EspNowTransport::broadcastRate() const {
+    return config_.radio.broadcastRate;
+}
+
+Status EspNowTransport::setPeerRate(const Mac& mac, PhyRate rate) {
+    if (!started_) return Status::InvalidState;
+    if (mac.isBroadcast()) return setBroadcastRate(rate);
+    if (!rateUsable(rate)) return Status::InvalidArgument;
+#if defined(NOWTP_PER_PEER_RATE)
+    lock();
+    for (size_t i = 0; i < peerRates_.size(); ++i) {
+        if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    if (rate != PhyRate::Default) peerRates_.push_back(std::make_pair(mac, rate));
+    Status st = Status::Ok;
+    if (!esp_now_is_peer_exist(mac.bytes)) {
+        st = config_.autoAddPeers && addPlainPeer(mac, interface_) == ESP_OK ? Status::Ok : Status::LinkError;
+    }
+    if (st == Status::Ok) st = applyPeerRate(mac);
+    unlock();
+    return st;
+#else
+    return rate == PhyRate::Default ? Status::Ok : Status::InvalidArgument;
+#endif
+}
+
+bool EspNowTransport::rateUsable(PhyRate rate) const {
+    if (!validRate(rate)) return false;
+    if (isLongRange(rate) && !longRange()) return false;
+    return true;
+}
+
+uint8_t EspNowTransport::channel() const {
+    uint8_t ch = 0;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&ch, &second);
+    return ch;
+}
+
+Status EspNowTransport::setChannel(uint8_t ch) {
+    if (!started_) return Status::InvalidState;
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    wifi_ap_record_t ap;
+    esp_wifi_get_mode(&mode);
+    bool fixed = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA ||
+                 ((mode == WIFI_MODE_STA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+    if (fixed) return Status::InvalidState;
+    esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) return err == ESP_ERR_INVALID_ARG ? Status::InvalidArgument : Status::LinkError;
+    radio_.channel = ch;
+    return Status::Ok;
+}
+
+bool EspNowTransport::longRange() const {
+    uint8_t bitmap = 0;
+    return esp_wifi_get_protocol(interface_, &bitmap) == ESP_OK && (bitmap & WIFI_PROTOCOL_LR) != 0;
+}
+
+Status EspNowTransport::setLongRange(bool enabled) {
+    if (!started_) return Status::InvalidState;
+    uint8_t bitmap = 0;
+    esp_wifi_get_protocol(interface_, &bitmap);
+    if (!ownsWifiInit_ && !saved_.protocol) {
+        saved_.protocol = true;
+        saved_.protocolBitmap = bitmap;
+    }
+    uint8_t want = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | (enabled ? WIFI_PROTOCOL_LR : 0);
+    if (bitmap == want) return Status::Ok;
+    return esp_wifi_set_protocol(interface_, want) == ESP_OK ? Status::Ok : Status::LinkError;
+}
+
+// ---------------------------------------------------------------------------
+// Automatic transmit power fallback (runs in the NowTP task, lock held)
+
+namespace {
+const float kFallbackLadder[] = {17, 15, 13, 11, 8, 5};
+const uint8_t kPing[1] = {0};  // type 0: ignored by the receiver's diagnostics
+}  // namespace
+
+void EspNowTransport::startPowerFallback(const Mac& peer) {
+    if (fallback_.active) return;
+    if (std::find(fallback_.tried.begin(), fallback_.tried.end(), peer) != fallback_.tried.end()) return;
+    float current = txPower();
+    std::vector<float> ladder;
+    for (float p : kFallbackLadder) {
+        if (p < current - 0.1f) ladder.push_back(p);
+    }
+    fallback_.tried.push_back(peer);
+    if (ladder.empty()) return;
+    fallback_.active = true;
+    fallback_.peer = peer;
+    fallback_.original = current;
+    fallback_.ladder = ladder;
+    fallback_.index = 0;
+    fallback_.failures = 0;
+    fallback_.pingInFlight = false;
+    fallback_.confirming = false;
+    fallback_.nextPingAt = nowMs();
+    ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x are not acknowledged: trying lower transmit power",
+             peer.bytes[0], peer.bytes[1], peer.bytes[2], peer.bytes[3], peer.bytes[4], peer.bytes[5]);
+    applyTxPower(ladder[0]);
+}
+
+void EspNowTransport::sendFallbackPing() {
+    fallback_.pingInFlight = true;
+    Status st = engine_->send(fallback_.peer, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
+                              [this](Status s) { onFallbackPing(s); }, nowMs());
+    if (st != Status::Ok) {
+        fallback_.pingInFlight = false;
+        fallback_.nextPingAt = nowMs() + 50;
+    }
+}
+
+void EspNowTransport::onFallbackPing(Status status) {
+    if (!fallback_.active) return;
+    fallback_.pingInFlight = false;
+    const Mac& p = fallback_.peer;
+    if (fallback_.confirming) {
+        // A lower power worked; does the original power work again too? Then the
+        // peer was briefly away (rebooting, other channel), not our transmitter.
+        fallback_.confirming = false;
+        if (status == Status::Ok) {
+            fallback_.active = false;
+            if (LinkHealth* l = linkHealth(p, false)) l->failures = 0;
+            ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x get through at %.1f dBm again: keeping it",
+                     p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5], fallback_.original);
+            return;
+        }
+        applyTxPower(fallback_.ladder[fallback_.index]);
+        float now = txPower();
+        s_learnedCeilingDbm = now;
+        stats_.powerFallbacks++;
+        fallback_.active = false;
+        if (LinkHealth* l = linkHealth(p, false)) l->failures = 0;
+        ESP_LOGW(kTag,
+                 "transmit power lowered from %.1f to %.1f dBm: %02x:%02x:%02x:%02x:%02x:%02x did not acknowledge "
+                 "frames at higher power (this board's supply likely sags). Set radio.txPowerDbm to skip the search.",
+                 fallback_.original, now, p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5]);
+        return;
+    }
+    if (status == Status::Ok) {
+        fallback_.confirming = true;
+        applyTxPower(fallback_.original);
+        fallback_.nextPingAt = nowMs();
+        return;
+    }
+    if (++fallback_.failures < 2) {
+        fallback_.nextPingAt = nowMs() + 50;
+        return;
+    }
+    fallback_.failures = 0;
+    if (++fallback_.index < fallback_.ladder.size()) {
+        applyTxPower(fallback_.ladder[fallback_.index]);
+        fallback_.nextPingAt = nowMs();
+        return;
+    }
+    applyTxPower(fallback_.original);
+    fallback_.active = false;
+    ESP_LOGW(kTag, "lowering transmit power did not help with %02x:%02x:%02x:%02x:%02x:%02x: out of range, or its "
+                   "receiver is the problem",
+             p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5]);
+}
+
+void EspNowTransport::tickLinkChecks(uint32_t now) {
+    if (fallback_.active && !fallback_.pingInFlight && static_cast<int32_t>(now - fallback_.nextPingAt) >= 0) {
+        sendFallbackPing();
+    }
+    for (size_t i = 0; i < linkChecks_.size(); ++i) {
+        LinkCheck& c = linkChecks_[i];
+        if (c.inFlight || static_cast<int32_t>(now - c.nextAt) < 0) continue;
+        if (c.remaining == 0) {
+            linkChecks_.erase(linkChecks_.begin() + static_cast<std::ptrdiff_t>(i));
+            --i;
+            continue;
+        }
+        c.inFlight = true;
+        c.remaining--;
+        Mac mac = c.peer;
+        Status st = engine_->send(mac, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
+                                  [this, mac](Status s) {
+                                      for (size_t j = 0; j < linkChecks_.size(); ++j) {
+                                          if (linkChecks_[j].peer != mac) continue;
+                                          linkChecks_[j].inFlight = false;
+                                          linkChecks_[j].nextAt = nowMs() + 200;
+                                          if (s == Status::Ok) linkChecks_[j].remaining = 0;  // healthy
+                                      }
+                                  },
+                                  now);
+        if (st != Status::Ok) c.inFlight = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics API
+
+Status EspNowTransport::diagnosticsReady() const {
+    if (!started_ || !diagnostics_) return Status::InvalidState;
+    if (task_ && xTaskGetCurrentTaskHandle() == task_) return Status::InvalidState;  // would deadlock
+    return Status::Ok;
+}
+
+Status EspNowTransport::ping(const Mac& peer, float* requestPowerDbm, float* replyPowerDbm) {
+    Status st = diagnosticsReady();
+    return st == Status::Ok ? diagnostics_->ping(peer, requestPowerDbm, replyPowerDbm) : st;
+}
+
+Status EspNowTransport::measureLink(const Mac& peer, const std::vector<ProbeStep>& steps, uint8_t framesPerStep,
+                                   std::vector<ProbeResult>* forward, std::vector<ProbeResult>* reverse) {
+    Status st = diagnosticsReady();
+    return st == Status::Ok ? diagnostics_->measure(peer, steps, framesPerStep, forward, reverse) : st;
+}
+
+Status EspNowTransport::diagnose(const Mac& peer, LinkDiagnosis& out) {
+    Status st = diagnosticsReady();
+    return st == Status::Ok ? diagnostics_->diagnose(peer, out) : st;
+}
+
+Status EspNowTransport::optimizeLink(const Mac& peer, LinkProfile& out, const OptimizeOptions& options,
+                                     const LinkDiagnosis* known) {
+    Status st = diagnosticsReady();
+    if (st != Status::Ok) return st;
+    st = diagnostics_->optimize(peer, options, out, known);
+    if (st == Status::Ok && out.applied && out.txPowerDbm < txPowerLimit() - 0.01f &&
+        (s_learnedCeilingDbm == 0 || out.txPowerDbm < s_learnedCeilingDbm)) {
+        s_learnedCeilingDbm = out.txPowerDbm;
+    }
+    return st;
+}
+
+Status EspNowTransport::optimizeAll(std::vector<LinkProfile>& out, const OptimizeOptions& options) {
+    out.clear();
+    Status st = diagnosticsReady();
+    if (st != Status::Ok) return st;
+    std::vector<PeerInfo> list = peers();
+    if (list.empty()) return Status::InvalidState;  // needs discovery and at least one peer
+    float power = 0;
+    for (const PeerInfo& p : list) {
+        LinkProfile profile;
+        if (optimizeLink(p.mac, profile, options) == Status::Ok) {
+            if (profile.applied) power = power == 0 ? profile.txPowerDbm : std::min(power, profile.txPowerDbm);
+            out.push_back(profile);
+        }
+    }
+    // Power is shared by all links: settle on what works for every peer.
+    if (options.apply && power > 0) setTxPower(power);
+    return out.empty() ? Status::Timeout : Status::Ok;
+}
+
+Status EspNowTransport::deepDiscover(DeepDiscoveryReport& out, const DeepDiscoveryOptions& options) {
+    Status st = diagnosticsReady();
+    return st == Status::Ok ? diagnostics_->deepDiscover(options, out) : st;
 }
 
 }  // namespace nowtp

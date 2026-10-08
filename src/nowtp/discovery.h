@@ -77,6 +77,9 @@ public:
     const std::vector<PeerInfo>& peers() const { return peers_; }
     const PeerInfo* find(const Mac& mac) const;
 
+    /// Parses an announcement payload (as carried on kDiscoveryPort).
+    static bool parseAnnouncement(const uint8_t* data, size_t len, std::string& name, uint16_t& maxFrameSize);
+
 private:
     enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04 };
 

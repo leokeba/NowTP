@@ -441,7 +441,32 @@ void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, ui
     rxRssi_ = rssi;
     Header h;
     size_t off = 0;
-    if (data == nullptr || !decodeHeader(data, len, h, off)) {
+    bool decoded = data != nullptr && decodeHeader(data, len, h, off);
+    if (observer_ && data != nullptr && len > 0) {
+        FrameInfo info;
+        info.src = src;
+        info.rssi = rssi;
+        info.version = static_cast<uint8_t>(data[0] >> 6);
+        // Another version's header may still parse with our layout; good enough to report it.
+        Header any;
+        size_t anyOff = 0;
+        uint8_t patched[kFragmentHeaderSize];
+        info.nowtp = decoded;
+        if (!decoded && len >= kCommonHeaderSize) {
+            size_t n = len < sizeof(patched) ? len : sizeof(patched);
+            memcpy(patched, data, n);
+            patched[0] = static_cast<uint8_t>((patched[0] & 0x3F) | (kVersion << 6));
+            info.nowtp = info.version != kVersion && decodeHeader(patched, n, any, anyOff);
+        }
+        info.header = decoded ? h : any;
+        info.sameNetwork = decoded && h.networkId == config_.networkId;
+        size_t start = decoded ? off : (info.nowtp ? anyOff : 0);
+        info.payload = data + start;
+        info.payloadLen = len - start;
+        FrameObserver o = observer_;
+        o(info);
+    }
+    if (!decoded) {
         stats_.framesInvalid++;
         return;
     }

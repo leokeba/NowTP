@@ -469,6 +469,52 @@ void radioSettingsRestored() {
     ESP_ERROR_CHECK(esp_wifi_deinit());
 }
 
+// Diagnostics features that need no peer.
+void diagnosticsAlone() {
+    Status st = transport.begin();
+    if (st != Status::Ok) {
+        report("diag_begin", false, nowtp::toString(st));
+        return;
+    }
+    nowtp::RadioInfo r = transport.radioInfo();
+    report("radio_power_limit_known", r.txPowerLimitDbm >= 2 && r.txPowerLimitDbm <= 21,
+           fmt("(limit %.2f dBm)", r.txPowerLimitDbm));
+    report("set_channel", transport.setChannel(6) == Status::Ok && transport.channel() == 6);
+    transport.setChannel(1);
+    report("long_range_toggle", transport.setLongRange(true) == Status::Ok && transport.longRange() &&
+                                    transport.setLongRange(false) == Status::Ok && !transport.longRange());
+    report("lr_rate_needs_lr", !transport.rateUsable(nowtp::PhyRate::LR250K));
+
+    int64_t t0 = millis();
+    st = transport.ping(kAbsent);
+    report("ping_absent_times_out", st == Status::Timeout, fmt("(%s after %lld ms)", nowtp::toString(st), (long long)(millis() - t0)));
+
+    nowtp::DeepDiscoveryOptions o;
+    o.channels = {1, 6};
+    o.dwellMs = 500;
+    nowtp::DeepDiscoveryReport report_;
+    t0 = millis();
+    st = transport.deepDiscover(report_, o);
+    r = transport.radioInfo();
+    report("deep_discovery_alone_restores_radio",
+           st == Status::Ok && report_.homeChannel == 1 && r.channel == 1 && !r.longRange,
+           fmt("(%u nodes, %u issues, %lld ms)", (unsigned)report_.nodes.size(), (unsigned)report_.issues.size(),
+               (long long)(millis() - t0)));
+
+    // From inside a NowTP callback the blocking calls must refuse.
+    volatile Status nested = Status::Ok;
+    volatile bool ran = false;
+    transport.send(Mac::broadcast(), 1, "x", 1, nowtp::SendOptions(), [&](Status) {
+        nowtp::LinkDiagnosis d;
+        nested = transport.diagnose(kAbsent, d);
+        ran = true;
+    });
+    int64_t end = millis() + 1000;
+    while (!ran && millis() < end) vTaskDelay(1);
+    report("diagnose_in_callback_refused", ran && nested == Status::InvalidState);
+    transport.end();
+}
+
 }  // namespace
 
 extern "C" void app_main() {
@@ -493,6 +539,7 @@ extern "C" void app_main() {
     endCancelsAndRestart();
     pollModeAndManualPeers();
     noLeakAcrossRestarts();
+    diagnosticsAlone();
 
     printf("free heap after tests %lu\n", (unsigned long)esp_get_free_heap_size());
     printf("DONE pass=%d fail=%d\n", g_pass, g_fail);
