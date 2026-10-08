@@ -1,0 +1,12 @@
+version: "0.1.0"
+description: "Reliable, arbitrary-length messaging over ESP-NOW"
+url: "https://github.com/leokeba/NowTP"
+license: "MIT"
+dependencies:
+  idf:
+    version: ">=4.4"
+files:
+  exclude:
+    - "test/**/*"
+    - "build/**/*"
+    - ".github/**/*"

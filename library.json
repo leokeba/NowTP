@@ -1,0 +1,22 @@
+{
+  "name": "NowTP",
+  "version": "0.1.0",
+  "description": "Reliable, arbitrary-length messaging over ESP-NOW for Arduino and ESP-IDF",
+  "keywords": ["esp-now", "espnow", "esp32", "wireless", "transport", "fragmentation", "reliable"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leokeba/NowTP.git"
+  },
+  "authors": [{ "name": "Leo Baque", "maintainer": true }],
+  "license": "MIT",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "headers": ["NowTP.h"],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src"
+  },
+  "export": {
+    "exclude": ["test", "build", ".github"]
+  }
+}

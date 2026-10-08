@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run tests (ASan + UBSan)
+        run: |
+          cmake -S . -B build
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+  esp-idf:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [release-v4.4, release-v5.1, release-v5.4, release-v5.5, latest]
+        target: [esp32, esp32c3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: examples/idf/reliable_echo
+
+  arduino:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        core: ["2.0.17", "3.3.7"]
+        fqbn: ["esp32:esp32:esp32", "esp32:esp32:esp32c3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/compile-sketches@v1
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          platforms: |
+            - name: esp32:esp32
+              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+              version: ${{ matrix.core }}
+          sketch-paths: examples/arduino
+          libraries: |
+            - source-path: ./
