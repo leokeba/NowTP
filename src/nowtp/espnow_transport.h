@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "discovery.h"
 #include "engine.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
@@ -30,6 +31,32 @@ struct PeerOptions {
 
 struct EspNowConfig {
     Config protocol;
+
+    // --- Radio setup -------------------------------------------------------
+    /// If the application has not set up Wi-Fi, initialize and start it in
+    /// station mode (without NVS), and stop it again in end(). When false,
+    /// begin() fails unless Wi-Fi is already initialized.
+    bool initWifi = true;
+    /// Channel to use when NowTP is free to choose: no station connection and
+    /// no soft-AP. Otherwise the access point dictates the channel. 0 keeps the
+    /// current channel. All nodes must share a channel.
+    uint8_t channel = 1;
+    /// Disable Wi-Fi modem sleep. A sleeping station misses most ESP-NOW frames.
+    bool disablePowerSave = true;
+    /// Maximum transmit power in 0.25 dBm units (8..84, e.g. 34 = 8.5 dBm);
+    /// 0 leaves it unchanged. Lower it for boards whose supply cannot sustain
+    /// full-power transmission.
+    int8_t maxTxPower = 0;
+
+    // --- Discovery ---------------------------------------------------------
+    /// Announce this node and track peers (see Discovery).
+    bool enableDiscovery = false;
+    DiscoveryConfig discovery;
+    /// For discovered peers, send unicast frames of the largest size both sides
+    /// support (1470 between ESP-NOW v2 nodes), unless addPeer() set a size.
+    bool negotiateFrameSize = true;
+
+    // --- Transport -----------------------------------------------------------
     /// Frame size for broadcast and for peers without their own setting.
     /// 250 is understood by every ESP-NOW version.
     uint16_t defaultMaxFrameSize = 250;
@@ -50,12 +77,22 @@ struct EspNowConfig {
     uint32_t tickIntervalMs = 5;
 };
 
+/// How begin() found and configured the radio.
+struct RadioInfo {
+    uint8_t channel = 0;
+    wifi_interface_t interface = WIFI_IF_STA;  ///< Interface ESP-NOW peers are bound to.
+    bool stationConnected = false;             ///< Connected to an AP (channel follows it).
+    bool softApActive = false;                 ///< Running a soft-AP (channel follows it).
+    bool wifiStartedByNowTP = false;           ///< NowTP initialized/started Wi-Fi and will stop it.
+};
+
 /// NowTP over the ESP-NOW driver, for both ESP-IDF and Arduino-ESP32.
 ///
-/// Wi-Fi must be started by the application first (e.g. `WiFi.mode(WIFI_STA)` on
-/// Arduino). Only one instance can be active, since ESP-NOW has a single pair of
-/// driver callbacks. Receive and completion callbacks run in the NowTP task (or
-/// inside poll()), never in the Wi-Fi driver task; keep them short.
+/// begin() works with whatever Wi-Fi state the application left: nothing set
+/// up, station (connected or not), soft-AP or both. Only one instance can be
+/// active, since ESP-NOW has a single pair of driver callbacks. Receive and
+/// completion callbacks run in the NowTP task (or inside poll()), never in the
+/// Wi-Fi driver task; keep them short.
 class EspNowTransport {
 public:
     EspNowTransport();
@@ -84,8 +121,21 @@ public:
     Status sendAndWait(const Mac& dst, uint8_t port, const void* data, size_t len,
                        const SendOptions& options = SendOptions());
 
-    /// Sets the handler for a port (may be called before begin()).
-    void listen(uint8_t port, ReceiveHandler handler);
+    /// Sets the handler for a port (may be called before begin()). Ports from
+    /// kFirstReservedPort up are reserved and rejected.
+    Status listen(uint8_t port, ReceiveHandler handler);
+
+    /// Discovery (EspNowConfig::enableDiscovery). The handler may be set before
+    /// begin() and runs in the NowTP task.
+    void onPeerEvent(PeerHandler handler);
+    /// Asks every node in range to announce itself now.
+    Status discover();
+    /// Peers currently known to discovery.
+    std::vector<PeerInfo> peers() const;
+    /// Changes the metadata this node announces and announces it right away.
+    Status setDiscoveryMetadata(const void* data, size_t len);
+
+    RadioInfo radioInfo() const { return radio_; }
 
     /// Processes pending radio events and timers when runTask is false.
     void poll();
@@ -102,6 +152,10 @@ private:
     class RadioLink;
 
     static void taskEntry(void* arg);
+    Status prepareRadio();
+    void releaseRadio();
+    void handlePeerEvent(PeerEvent event, const PeerInfo& peer);
+    bool hasExplicitFrameSize(const Mac& mac) const;
     void processEvents(TickType_t wait);
     void lock() const;
     void unlock() const;
@@ -110,7 +164,11 @@ private:
     EspNowConfig config_;
     std::unique_ptr<RadioLink> link_;
     std::unique_ptr<Engine> engine_;
+    std::unique_ptr<Discovery> discovery_;
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
+    PeerHandler peerHandler_;
+    std::vector<Mac> explicitFrameSizes_;
+    RadioInfo radio_;
     RingbufHandle_t events_ = nullptr;
     SemaphoreHandle_t mutex_ = nullptr;
     SemaphoreHandle_t taskExited_ = nullptr;
@@ -119,6 +177,9 @@ private:
     volatile bool stopping_ = false;
     bool started_ = false;
     bool espNowInitialized_ = false;
+    bool ownsWifiInit_ = false;
+    bool ownsWifiStart_ = false;
+    bool ownsEventLoop_ = false;
 };
 
 }  // namespace nowtp

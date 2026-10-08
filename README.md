@@ -12,28 +12,27 @@ ESP-NOW sends single frames of up to 250 bytes (1470 with ESP-NOW v2), with no o
   - *latest-only*: a newer message replaces older ones that are still queued or half received. Use it for state where stale data is worse than no data.
 - **Non-blocking sends.** Each message gets a completion callback. `sendAndWait()` is available when blocking is easier.
 - **Paced by the radio.** The next frame goes out when the driver reports the previous one sent, instead of after a fixed delay.
+- **Peer discovery.** Nodes announce a name and app metadata, and report peers as they are found, change or are lost. Discovered peers get the largest frame size both sides support.
+- **Works with any Wi-Fi state.** `begin()` brings Wi-Fi up if nothing has, and otherwise adapts to the application's setup: a station (connected or not), a soft-AP, or both.
 - **Bounded memory.** Queue sizes, message size and reassembly memory are all configurable.
 - **Callbacks never run in the Wi-Fi driver task.** They run in a NowTP task, or inside `poll()` from your loop.
 - **Testable on your computer.** The protocol core has no platform dependencies and is tested on a desktop machine against a simulated lossy radio.
 
-> **Status:** early (0.1). The wire format and API may still change before 1.0.
+> **Status:** early (0.2). The wire format and API may still change before 1.0.
 
 ## Quick start (Arduino)
 
 ```cpp
 #include <NowTP.h>
-#include <WiFi.h>
 
 nowtp::EspNowTransport transport;
 
 void setup() {
     Serial.begin(115200);
-    WiFi.mode(WIFI_STA);  // NowTP uses your Wi-Fi setup; it only needs Wi-Fi started
-
     transport.listen(1, [](const nowtp::Message& m) {
         Serial.printf("got %u bytes on port %u\n", (unsigned)m.len, m.port);
     });
-    transport.begin();
+    transport.begin();  // starts Wi-Fi if the sketch has not
 }
 
 void loop() {
@@ -56,10 +55,23 @@ transport.send(peerMac, 2, data, len, opts, [](nowtp::Status s) {
 nowtp::Status s = transport.sendAndWait(peerMac, 2, data, len, opts);
 ```
 
+Finding peers:
+
+```cpp
+nowtp::EspNowConfig config;
+config.enableDiscovery = true;
+config.discovery.name = "kitchen-sensor";
+transport.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
+    if (e == nowtp::PeerEvent::Found) Serial.printf("found %s\n", p.name.c_str());
+});
+transport.begin(config);
+```
+
 More sketches are in [examples/arduino](examples/arduino):
 
 - [Broadcast](examples/arduino/Broadcast/Broadcast.ino)
-- [ReliableUnicast](examples/arduino/ReliableUnicast/ReliableUnicast.ino)
+- [Discovery](examples/arduino/Discovery/Discovery.ino)
+- [ReliableUnicast](examples/arduino/ReliableUnicast/ReliableUnicast.ino): two boards that find each other and exchange reliable messages
 - [LatestOnly](examples/arduino/LatestOnly/LatestOnly.ino), which also shows `poll()` mode
 
 ## ESP-IDF
@@ -77,13 +89,43 @@ NowTP is an ESP-IDF component. You can add it in any of these ways:
       version: main
   ```
 
-Start Wi-Fi yourself, as in Espressif's ESP-NOW examples, then call `begin()`. See [examples/idf/reliable_echo](examples/idf/reliable_echo).
+See [examples/idf/reliable_echo](examples/idf/reliable_echo).
 
 ## Concepts
 
+### Radio setup
+
+`begin()` adapts to whatever the application has done with Wi-Fi:
+
+| Wi-Fi state before `begin()` | What NowTP does | Undone by `end()` |
+|---|---|---|
+| Nothing set up | Initializes and starts a station on `EspNowConfig::channel` (default 1). On ESP-IDF it also creates the default event loop and initializes NVS if the app hasn't. On Arduino it calls `WiFi.mode(WIFI_STA)`. | Yes |
+| Initialized, not started | Starts it (station mode if no mode is set) on `channel` | Stops it |
+| Station, not connected | Sets `channel` (set it to 0 to keep the current channel) | – |
+| Station connected to an AP | Keeps the AP's channel | – |
+| Soft-AP, or AP + station | Keeps the AP's channel. In AP-only mode, ESP-NOW uses the AP interface | – |
+
+- `disablePowerSave` (default on) turns off Wi-Fi modem sleep. A sleeping station misses most ESP-NOW frames.
+- `maxTxPower` caps transmit power. See *Troubleshooting* below.
+- Set `initWifi = false` to make `begin()` fail instead of starting Wi-Fi.
+- `radioInfo()` reports the channel, interface and connection state that `begin()` found.
+
+Things to keep in mind:
+- **Shared channel.** All nodes must be on the same channel. A node connected to an AP is on the AP's channel.
+- **Addresses depend on the interface.** A node is addressed by the MAC of the interface ESP-NOW uses. A soft-AP node sends from its AP MAC, which is usually its station MAC + 1.
+
+### Discovery
+
+With `enableDiscovery`, a node announces itself by broadcast on reserved port 255.
+- **Announcements.** Each one carries `discovery.name` (up to 32 bytes), `discovery.metadata` (up to 160 bytes of app data, for example a role to filter on) and the largest frame the node can receive. Nodes announce every `announceIntervalMs` (2 s by default).
+- **Queries.** `begin()` and `discover()` ask every node in range to answer promptly, after a random delay of up to `replyJitterMs`. A node that joins late is found within about 100 ms instead of a full interval.
+- **Peer events.** `onPeerEvent()` reports peers as they are found, change their name, metadata or frame size, or are lost. A peer is lost when it says goodbye in `end()`, or after `peerTimeoutMs` (7 s by default) of silence.
+- **Reading and updating.** `peers()` returns the current list, and `setDiscoveryMetadata()` changes what this node announces.
+- **Frame size.** With `negotiateFrameSize` (on by default), unicast to a discovered peer uses the largest frame both sides support. That's 1470 bytes between two ESP-NOW v2 nodes, and 250 as soon as either side is v1.
+
 ### Ports
 
-Every message is sent to a port (0–239; ports 240–255 are reserved). `listen(port, handler)` sets that port's handler. Messages for a port with no handler are dropped, and reliable ones are answered with `Rejected`.
+Every message is sent to a port (0–239; ports 240–255 are reserved, and `send()`/`listen()` reject them). `listen(port, handler)` sets that port's handler. Messages for a port with no handler are dropped, and reliable ones are answered with `Rejected`.
 
 ### Delivery modes
 
@@ -110,9 +152,7 @@ Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work
 
 - **Peers.** Unknown unicast destinations are registered automatically as unencrypted peers on the current channel. The same happens for senders that need an ack. Set `EspNowConfig::autoAddPeers = false` to manage peers yourself with `addPeer()`. ESP-NOW allows at most 20 peers.
 - **Encryption.** Use `addPeer(mac, opts)` with `opts.encrypt` and `opts.lmk`, plus `setPrimaryKey()`. Both sides must register each other with the same keys.
-- **Frame size.** Frames are 250 bytes by default, which every ESP-NOW version understands. If both sides run ESP-NOW v2 (ESP-IDF ≥ 5.4, or Arduino-ESP32 ≥ 3.2), set `PeerOptions::maxFrameSize` up to 1470 for that peer. This cuts the number of frames by about 6×. A v1 receiver silently drops frames larger than 250 bytes.
-
-All boards must be on the same Wi-Fi channel. If a board is connected to an access point, its channel follows the AP's.
+- **Frame size.** Frames are 250 bytes by default, which every ESP-NOW version understands. If both sides run ESP-NOW v2 (ESP-IDF ≥ 5.4, or Arduino-ESP32 ≥ 3.2), larger frames of up to 1470 bytes cut the number of frames by about 6×. Discovery sets this up automatically. Without discovery, set `PeerOptions::maxFrameSize` in `addPeer()`. A v1 receiver silently drops frames larger than 250 bytes, and broadcast always uses `defaultMaxFrameSize` (250).
 
 ### Throughput and latency
 
@@ -120,7 +160,7 @@ ESP-NOW sends at 1 Mbps by default, and that rate, not NowTP, sets the ceiling. 
 - about 68 KB/s with 250-byte frames
 - about 104 KB/s with 1470-byte frames
 
-To go faster, raise the PHY rate with `esp_now_set_peer_rate_config()` (ESP-IDF ≥ 5.4) or `esp_wifi_config_espnow_rate()`, at the cost of range.
+Two boards (ESP32-S3 ↔ ESP32) measured about 102 KB/s for reliable unicast with negotiated 1470-byte frames, and a 16 KB reliable echo round trip took about 310 ms. To go faster, raise the PHY rate with `esp_now_set_peer_rate_config()` (ESP-IDF ≥ 5.4) or `esp_wifi_config_espnow_rate()`, at the cost of range.
 
 A unicast frame to a peer that is off or out of range takes the driver about 100 ms to report as failed. With the default 2 retries, a send to an unreachable peer fails with `SendFailed` after about 300 ms.
 
@@ -137,6 +177,9 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `protocol.ackTimeoutMs` | 100 | Reliable mode: wait before probing the receiver again |
 | `protocol.rxTimeoutMs` | 1000 | A partial incoming message is dropped after this long without progress |
 | `protocol.networkId` | 0 | Separates NowTP deployments on one channel (not a security feature) |
+| `initWifi`, `channel`, `disablePowerSave`, `maxTxPower` | true, 1, true, 0 | Radio setup (see above) |
+| `enableDiscovery`, `discovery`, `negotiateFrameSize` | false, –, true | Discovery (see above) |
+| `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |
 | `eventBufferSize` | 8 KB | Buffer between the Wi-Fi driver and NowTP |
 
@@ -158,20 +201,31 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `Cancelled` | `end()` was called |
 | `LinkError`, `NoMemory` | Driver or allocation failures |
 
+### Troubleshooting
+
+- **One board hears the other, but not the reverse.** Some boards can't sustain full-power transmission from their supply. Their frames then never arrive, while they still receive normally. Try `config.maxTxPower = 34` (8.5 dBm) on the board that can't be heard.
+- **Nothing arrives at all.** Check that both nodes are on the same channel with `radioInfo().channel`. A node connected to an AP follows the AP's channel.
+- **Large unicast frames are lost.** One side probably runs ESP-NOW v1 (ESP-IDF < 5.4 or Arduino-ESP32 2.x). Use discovery, which negotiates the frame size, or leave the frame size at 250.
+
 ## Compatibility
 
 - **Arduino-ESP32:** 2.x (ESP-IDF 4.4) and 3.x (ESP-IDF 5.x).
 - **ESP-IDF:** 4.4 and later.
 - **Chips:** any ESP32-family chip with Wi-Fi.
 
-CI compiles the examples for ESP32 and ESP32-C3 against ESP-IDF 4.4, 5.1, 5.4, 5.5 and the latest release, and against Arduino-ESP32 2.0.17 and 3.3.7. The core library is C++11.
+CI compiles the examples and test firmware for ESP32 and ESP32-C3 against ESP-IDF 4.4, 5.1, 5.4, 5.5 and the latest release, and against Arduino-ESP32 2.0.17 and 3.3.7. The core library is C++11.
+
+Tested on hardware with an ESP32-S3 and an ESP32:
+- ESP-IDF 6.1 on both boards
+- Arduino-ESP32 3.3 on the S3 talking to Arduino-ESP32 2.0.17 on the ESP32 (ESP-NOW v2 ↔ v1)
 
 ## How it works
 
 The wire format and the reliability scheme are described in [docs/PROTOCOL.md](docs/PROTOCOL.md). The code is in two layers:
 
 - `nowtp::Engine` ([src/nowtp/engine.h](src/nowtp/engine.h)) is the protocol engine. It has no platform dependencies and does no I/O or timekeeping of its own. It runs on any `nowtp::Link`, an interface with two methods: send a frame, and report the largest frame size.
-- `nowtp::EspNowTransport` ([src/nowtp/espnow_transport.h](src/nowtp/espnow_transport.h)) runs the engine on the ESP-NOW driver. It handles the callbacks, locking, the NowTP task and peers.
+- `nowtp::Discovery` ([src/nowtp/discovery.h](src/nowtp/discovery.h)) is the discovery service. It is also platform-independent and runs on top of an `Engine`.
+- `nowtp::EspNowTransport` ([src/nowtp/espnow_transport.h](src/nowtp/espnow_transport.h)) runs both on the ESP-NOW driver. It handles radio setup, the callbacks, locking, the NowTP task and peers.
 
 ## Development
 
@@ -189,11 +243,18 @@ The tests use a simulated network with configurable loss in three places: on air
 cd test/hardware && idf.py set-target esp32s3 && idf.py -p PORT flash monitor
 ```
 
+[test/pair](test/pair) is the two-board integration test. Flash the same firmware on two boards. They find each other through discovery, and the board with the lower MAC drives the tests. Each board goes through three radio setups:
+- nothing initialized
+- a station started by the application
+- one board as a soft-AP, with the other connected to it as a station
+
+In each setup the boards check echo in both directions, reliable and unreliable throughput, latest-only ordering, rejection and goodbyes.
+
 ## Roadmap
 
-- Automatic frame-size negotiation between v1 and v2 peers
 - Streaming API for very large transfers (e.g. OTA-sized payloads)
-- Optional add-ons: discovery/pairing, persistent peers
+- Following channel changes after `begin()` (e.g. a station that roams), and discovery across channels
+- Optional add-ons: authenticated pairing, persistent peers
 
 ## License
 

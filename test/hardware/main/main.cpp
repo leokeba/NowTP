@@ -358,6 +358,37 @@ void noLeakAcrossRestarts() {
     report("no_leak_across_restarts", heapNow + 512 >= heapAfterWarmup, detail);
 }
 
+// begin() with each starting state of the radio that one board can produce.
+void radioSetupModes() {
+    wifi_mode_t mode;
+    nowtp::EspNowConfig noInit;
+    noInit.initWifi = false;
+    report("radio_init_disabled_rejected", transport.begin(noInit) == Status::InvalidState);
+
+    // Nothing set up: NowTP initializes Wi-Fi and tears it down again.
+    Status st = transport.begin();
+    nowtp::RadioInfo r = transport.radioInfo();
+    report("radio_auto_init", st == Status::Ok && r.wifiStartedByNowTP && r.channel == 1 && r.interface == WIFI_IF_STA,
+           nowtp::toString(st));
+    transport.end();
+    report("radio_auto_init_released", esp_wifi_get_mode(&mode) == ESP_ERR_WIFI_NOT_INIT);
+
+    // Initialized by the application but not started: NowTP starts it, then stops it again.
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    nowtp::EspNowConfig ch5;
+    ch5.channel = 5;
+    st = transport.begin(ch5);
+    r = transport.radioInfo();
+    report("radio_started_for_app", st == Status::Ok && r.wifiStartedByNowTP && r.channel == 5, nowtp::toString(st));
+    transport.end();
+    uint16_t n;
+    report("radio_start_undone", esp_wifi_get_mode(&mode) == ESP_OK &&
+                                     esp_wifi_scan_get_ap_num(&n) == ESP_ERR_WIFI_NOT_STARTED);
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+}
+
 }  // namespace
 
 extern "C" void app_main() {
@@ -367,7 +398,7 @@ extern "C" void app_main() {
 
     engineOnTarget();
 
-    report("begin_without_wifi_rejected", transport.begin() == Status::InvalidState);
+    radioSetupModes();
     startWifi();
     printf("INFO free heap after Wi-Fi start %lu\n", (unsigned long)esp_get_free_heap_size());
     rawDriverLatency();

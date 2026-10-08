@@ -36,6 +36,12 @@ jobs:
           esp_idf_version: ${{ matrix.idf }}
           target: ${{ matrix.target }}
           path: test/hardware
+      - name: Build two-board test
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: test/pair
 
   arduino:
     runs-on: ubuntu-latest

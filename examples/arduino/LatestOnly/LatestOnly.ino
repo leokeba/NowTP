@@ -2,7 +2,6 @@
 // A newer "latest only" message cancels older queued or half-received ones,
 // so a slow link drops stale updates instead of falling behind.
 #include <NowTP.h>
-#include <WiFi.h>
 
 nowtp::EspNowTransport transport;
 const uint8_t kPortState = 3;
@@ -14,8 +13,6 @@ struct State {
 
 void setup() {
     Serial.begin(115200);
-    WiFi.mode(WIFI_STA);
-
     transport.listen(kPortState, [](const nowtp::Message& m) {
         if (m.len != sizeof(State)) return;
         State s;

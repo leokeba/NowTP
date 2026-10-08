@@ -99,7 +99,9 @@ public:
         bool forced = dropIf && dropIf(f);
 
         bool ok = true;
-        if (dst.isBroadcast()) {
+        if (!nodes_[from]->online) {
+            ok = dst.isBroadcast();  // a node that is off reaches nobody
+        } else if (dst.isBroadcast()) {
             for (size_t i = 0; i < nodes_.size(); ++i) {
                 if (i == from || !nodes_[i]->online) continue;
                 if (forced || chance(airLoss) || chance(appLoss)) continue;

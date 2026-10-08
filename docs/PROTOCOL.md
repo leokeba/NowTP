@@ -82,6 +82,25 @@ ESP-NOW already acknowledges and retries each unicast frame in hardware. Reliabl
 - **Latest-only on the sender.** A new latest-only message cancels queued or partly sent latest-only messages to the same destination and port.
 - **Latest-only on the receiver.** A latest-only message from a sender drops any partial older latest-only message on the same port. It also causes late fragments of older messages to be ignored. "Older" means up to 256 message IDs behind; anything further back is treated as a sender that restarted.
 
+## Discovery (port 255)
+
+Discovery messages are ordinary single-frame broadcast messages, unreliable and latest-only, on port 255. The payload layout:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | Type: `1` = hello |
+| 1 | 1 | Flags: `0x1` query (please announce yourself), `0x2` reply, `0x4` goodbye |
+| 2 | 2 | Largest frame the sender can receive (250 for ESP-NOW v1, 1470 for v2) |
+| 4 | 1 | Name length `N` (≤ 32) |
+| 5 | N | Name (UTF-8) |
+| 5+N | 1 | Metadata length `M` (≤ 160) |
+| 6+N | M | Application metadata |
+
+- **Announcing.** Nodes announce periodically, with ±10% jitter so nodes that booted together don't stay in step.
+- **Answering queries.** A node that receives a query answers with its own announcement after a random delay. Any announcement it sends in the meantime counts as the answer.
+- **Goodbye.** A goodbye removes the sender from the receiver's peer list right away.
+- **Frame size.** A sender uses `min(local maximum, peer's advertised maximum)` as the frame size for unicast to that peer.
+
 ## Limits
 
 - **Message size.** Each side sets its own maximum message size. Receivers check the claimed size before allocating memory.

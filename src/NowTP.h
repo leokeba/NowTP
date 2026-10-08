@@ -4,6 +4,7 @@
 // Arduino / umbrella header.
 #pragma once
 
+#include "nowtp/discovery.h"
 #include "nowtp/engine.h"
 #include "nowtp/types.h"
 

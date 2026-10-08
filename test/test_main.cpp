@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "nowtp/discovery.h"
 #include "nowtp/engine.h"
 #include "nowtp/wire.h"
 #include "sim.h"
@@ -799,6 +800,151 @@ TEST(larger_mtu_uses_fewer_frames) {
     size_t dataFrames = 0;
     for (auto& f : net.log) dataFrames += f.from == a;
     CHECK_EQ(dataFrames, (msg.size() + 4 + 1461 - 1) / 1461);
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+
+namespace {
+
+struct DiscoveryRig {
+    sim::Network net;
+    std::vector<std::unique_ptr<Discovery>> nodes;
+    std::vector<std::vector<std::pair<PeerEvent, PeerInfo>>> events;
+    std::mt19937 rng{99};
+
+    size_t add(const std::string& name, DiscoveryConfig cfg = DiscoveryConfig(), uint16_t maxFrame = 250) {
+        size_t i = net.addNode();
+        cfg.name = name;
+        nodes.emplace_back(new Discovery(net.engine(i), cfg, maxFrame, [this] { return static_cast<uint32_t>(rng()); }));
+        events.emplace_back();
+        nodes.back()->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { events[i].push_back(std::make_pair(e, p)); });
+        return i;
+    }
+    void run(uint32_t ms) {
+        for (uint32_t t = 0; t < ms; ++t) {
+            net.step();
+            for (auto& d : nodes) d->tick(net.now());
+        }
+    }
+    size_t count(size_t node, PeerEvent e) const {
+        size_t n = 0;
+        for (const auto& ev : events[node]) n += ev.first == e;
+        return n;
+    }
+};
+
+}  // namespace
+
+TEST(discovery_nodes_find_each_other) {
+    DiscoveryRig rig;
+    DiscoveryConfig withMeta;
+    withMeta.metadata = {1, 2, 3};
+    size_t a = rig.add("alpha", withMeta, 1470), b = rig.add("beta");
+    rig.nodes[a]->start(rig.net.now());
+    rig.nodes[b]->start(rig.net.now());
+    rig.run(100);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 1u);
+    CHECK_EQ(rig.nodes[b]->peers().size(), 1u);
+    const PeerInfo* seenByB = rig.nodes[b]->find(rig.net.mac(a));
+    CHECK(seenByB != nullptr);
+    CHECK(seenByB->name == "alpha");
+    CHECK((seenByB->metadata == std::vector<uint8_t>{1, 2, 3}));
+    CHECK_EQ(seenByB->maxFrameSize, 1470);
+    CHECK(rig.nodes[a]->find(rig.net.mac(b))->name == "beta");
+    CHECK_EQ(rig.count(a, PeerEvent::Found), 1u);
+}
+
+TEST(discovery_late_joiner_found_quickly) {
+    DiscoveryRig rig;
+    DiscoveryConfig slow;
+    slow.announceIntervalMs = 10000;
+    size_t a = rig.add("a", slow), b = rig.add("b", slow), c = rig.add("c", slow);
+    rig.nodes[a]->start(rig.net.now());
+    rig.nodes[b]->start(rig.net.now());
+    rig.run(1000);
+    rig.nodes[c]->start(rig.net.now());
+    rig.run(150);  // far less than the announce interval: the query triggers replies
+    CHECK_EQ(rig.nodes[c]->peers().size(), 2u);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+    CHECK_EQ(rig.nodes[b]->peers().size(), 2u);
+}
+
+TEST(discovery_reports_lost_peers) {
+    DiscoveryRig rig;
+    DiscoveryConfig cfg;
+    cfg.announceIntervalMs = 500;
+    cfg.peerTimeoutMs = 1600;
+    size_t a = rig.add("a", cfg), b = rig.add("b", cfg), c = rig.add("c", cfg);
+    for (auto& d : rig.nodes) d->start(rig.net.now());
+    rig.run(1000);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+
+    rig.net.node(b).online = false;  // vanishes silently
+    rig.run(2500);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), 1u);
+    CHECK(rig.events[a].back().second.mac == rig.net.mac(b));
+    CHECK_EQ(rig.nodes[a]->peers().size(), 1u);
+
+    rig.nodes[c]->stop(rig.net.now());  // says goodbye
+    rig.run(5);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), 2u);
+    CHECK(rig.nodes[a]->peers().empty());
+}
+
+TEST(discovery_metadata_updates) {
+    DiscoveryRig rig;
+    DiscoveryConfig cfg;
+    cfg.announceIntervalMs = 0;  // only explicit announcements
+    size_t a = rig.add("a", cfg), b = rig.add("b", cfg);
+    rig.nodes[a]->start(rig.net.now());
+    rig.nodes[b]->start(rig.net.now());
+    rig.run(100);
+    uint8_t meta[] = {42};
+    rig.nodes[a]->setMetadata(meta, sizeof(meta), rig.net.now());
+    rig.run(10);
+    CHECK_EQ(rig.count(b, PeerEvent::Updated), 1u);
+    CHECK_EQ(rig.nodes[b]->find(rig.net.mac(a))->metadata.size(), 1u);
+    CHECK_EQ(rig.nodes[b]->find(rig.net.mac(a))->metadata[0], 42);
+    size_t framesBefore = rig.net.log.size();
+    rig.run(5000);
+    CHECK_EQ(rig.net.log.size(), framesBefore);  // no periodic traffic
+}
+
+TEST(discovery_respects_max_peers) {
+    DiscoveryRig rig;
+    DiscoveryConfig small;
+    small.maxPeers = 2;
+    size_t a = rig.add("a", small);
+    for (int i = 0; i < 4; ++i) rig.add("n" + std::to_string(i));
+    for (auto& d : rig.nodes) d->start(rig.net.now());
+    rig.run(300);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+    CHECK_EQ(rig.nodes[1]->peers().size(), 4u);
+}
+
+TEST(discovery_ignores_malformed_announcements) {
+    DiscoveryRig rig;
+    size_t a = rig.add("a");
+    rig.nodes[a]->start(rig.net.now());
+    Mac src = {{0x02, 5, 5, 5, 5, 5}};
+    std::mt19937 rng(3);
+    for (int i = 0; i < 5000; ++i) {
+        std::vector<uint8_t> payload(rng() % 40);
+        for (auto& x : payload) x = static_cast<uint8_t>(rng());
+        if (!payload.empty()) payload[0] = 1;
+        if (payload.size() > 4) payload[4] = static_cast<uint8_t>(payload[4] % 40);
+        wire::Header h;
+        h.type = wire::Type::Single;
+        h.port = kDiscoveryPort;
+        h.messageId = static_cast<uint16_t>(i);
+        std::vector<uint8_t> f(wire::kCommonHeaderSize);
+        wire::encodeHeader(h, f.data());
+        f.insert(f.end(), payload.begin(), payload.end());
+        rig.net.inject(a, src, f);
+    }
+    // Some random payloads are valid announcements; nothing may crash or overflow.
+    CHECK(rig.nodes[a]->peers().size() <= 1u);
 }
 
 // ---------------------------------------------------------------------------

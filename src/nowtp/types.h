@@ -74,7 +74,13 @@ struct Message {
     size_t len;
     bool reliable;
     bool latestOnly;
+    /// Signal strength of the last frame in dBm; 0 if the radio did not report it.
+    int8_t rssi;
 };
+
+/// Port used by NowTP's own discovery service. Ports 240-255 are reserved.
+constexpr uint8_t kDiscoveryPort = 255;
+constexpr uint8_t kFirstReservedPort = 240;
 
 using ReceiveHandler = std::function<void(const Message&)>;
 using CompletionHandler = std::function<void(Status)>;

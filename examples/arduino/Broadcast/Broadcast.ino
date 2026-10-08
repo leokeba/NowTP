@@ -1,27 +1,22 @@
 // NowTP: broadcast a message of any size to every board on the channel.
 // Flash on two or more boards and open the serial monitor.
 #include <NowTP.h>
-#include <WiFi.h>
 
 nowtp::EspNowTransport transport;
 const uint8_t kPort = 1;
 
 void setup() {
     Serial.begin(115200);
-    WiFi.mode(WIFI_STA);  // NowTP needs Wi-Fi started; all boards must share a channel
 
     transport.listen(kPort, [](const nowtp::Message& m) {
         // Runs in the NowTP task. `m.data` is only valid during this call.
-        Serial.printf("%u bytes from %02X:%02X:%02X:%02X:%02X:%02X: %.*s\n", (unsigned)m.len, m.src.bytes[0],
-                      m.src.bytes[1], m.src.bytes[2], m.src.bytes[3], m.src.bytes[4], m.src.bytes[5],
-                      (int)min(m.len, (size_t)40), (const char*)m.data);
+        Serial.printf("%u bytes from %02X:%02X:%02X:%02X:%02X:%02X (%d dBm): %.*s\n", (unsigned)m.len,
+                      m.src.bytes[0], m.src.bytes[1], m.src.bytes[2], m.src.bytes[3], m.src.bytes[4], m.src.bytes[5],
+                      m.rssi, (int)min(m.len, (size_t)40), (const char*)m.data);
     });
 
-    if (transport.begin() != nowtp::Status::Ok) {
-        Serial.println("NowTP failed to start");
-        return;
-    }
-    Serial.printf("NowTP up on %s\n", WiFi.macAddress().c_str());
+    // begin() starts Wi-Fi itself if the sketch has not (station mode, channel 1).
+    if (transport.begin() != nowtp::Status::Ok) Serial.println("NowTP failed to start");
 }
 
 void loop() {

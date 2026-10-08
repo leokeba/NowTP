@@ -40,8 +40,8 @@ public:
     /// Messages for ports without a handler are dropped (reliable ones are rejected).
     void listen(uint8_t port, ReceiveHandler handler);
 
-    /// Feeds one frame received from the radio.
-    void onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t nowMs);
+    /// Feeds one frame received from the radio. `rssi` is in dBm, 0 if unknown.
+    void onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t nowMs, int8_t rssi = 0);
 
     /// Reports the outcome of the last frame accepted by Link::sendFrame().
     /// `delivered` is the radio's view: MAC-level ack for unicast, always true for broadcast.
@@ -108,7 +108,7 @@ private:
     RxMessage* findRx(const Mac& src, uint16_t id);
     void dropRx(RxMessage* rx, bool countAsDropped = true);
     void completeRx(RxMessage* rx, uint32_t now);
-    void deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len);
+    void deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi);
     bool hasListener(uint8_t port) const;
 
     void remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, uint32_t now);
@@ -139,6 +139,7 @@ private:
     uint32_t linkBusyUntil_ = 0;
     bool pumping_ = false;
     bool flushing_ = false;
+    int8_t rxRssi_ = 0;  // RSSI of the frame being processed
 };
 
 }  // namespace nowtp

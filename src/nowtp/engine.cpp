@@ -99,6 +99,7 @@ struct Engine::RxMessage {
     size_t lastLen = 0;
     size_t reserved = 0;  // bytes counted in rxBytes_
     uint32_t lastActivity = 0;
+    int8_t rssi = 0;
 
     bool has(uint16_t i) const { return (bitmap[i >> 3] >> (i & 7)) & 1; }
     void mark(uint16_t i) { bitmap[i >> 3] |= static_cast<uint8_t>(1u << (i & 7)); }
@@ -411,7 +412,7 @@ bool Engine::hasListener(uint8_t port) const {
     return false;
 }
 
-void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len) {
+void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi) {
     ReceiveHandler handler;
     for (const auto& l : listeners_) {
         if (l.first == port) {
@@ -431,11 +432,13 @@ void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t*
     m.len = len;
     m.reliable = (flags & kFlagReliable) != 0;
     m.latestOnly = (flags & kFlagLatest) != 0;
+    m.rssi = rssi;
     handler(m);
 }
 
-void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t now) {
+void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t now, int8_t rssi) {
     stats_.framesReceived++;
+    rxRssi_ = rssi;
     Header h;
     size_t off = 0;
     if (data == nullptr || !decodeHeader(data, len, h, off)) {
@@ -477,7 +480,7 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
     }
     remember(src, h.port, h.flags, h.messageId, now);
     if (ackRequest) queueAck(src, h.port, h.messageId, AckStatus::Complete, nullptr);
-    deliver(src, h.port, h.flags, payload, len);
+    deliver(src, h.port, h.flags, payload, len, rxRssi_);
 }
 
 void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
@@ -543,6 +546,7 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
     }
 
     rx->lastActivity = now;
+    rx->rssi = rxRssi_;
     if (!rx->has(h.index)) {
         Place result = placeFragment(*rx, h.index, payload, len);
         if (result != Place::Ok) {
@@ -675,7 +679,7 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
     if (reliable) {
         queueAck(owned->src, owned->port, owned->id, AckStatus::Complete, nullptr);
     }
-    deliver(owned->src, owned->port, owned->flags, data, len);
+    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi);
 }
 
 void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
