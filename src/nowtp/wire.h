@@ -22,6 +22,7 @@ enum Flags : uint8_t {
     kFlagReliable = 0x01,
     kFlagLatest = 0x02,
     kFlagAckRequest = 0x04,
+    kFlagAuth = 0x08,  ///< Payload ends with an authentication trailer (Security).
 };
 
 enum class AckStatus : uint8_t {
@@ -33,6 +34,11 @@ enum class AckStatus : uint8_t {
 constexpr size_t kCommonHeaderSize = 5;    // control, network id, port, message id
 constexpr size_t kFragmentHeaderSize = 9;  // + fragment index, fragment count
 constexpr size_t kCrcSize = 4;             // CRC-32 trailing a multi-frame message
+/// Trailer of an authenticated message: epoch (4), sequence (4), destination
+/// kind (1), tag (8). See docs/PROTOCOL.md.
+constexpr size_t kAuthTrailerSize = 17;
+/// Tag appended to an ack for an authenticated message.
+constexpr size_t kAckTagSize = 8;
 
 struct Header {
     Type type = Type::Single;

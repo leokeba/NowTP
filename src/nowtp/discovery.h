@@ -18,6 +18,15 @@ struct PeerInfo {
     int8_t rssi = 0;              ///< Signal strength of its last announcement, dBm.
     uint32_t firstSeenMs = 0;
     uint32_t lastSeenMs = 0;
+    /// Wi-Fi channel the peer says it is on; 0 if it does not say (NowTP < 0.5).
+    uint8_t channel = 0;
+    /// Its channel is fixed (by an access point, or by configuration): other
+    /// nodes follow it when it moves (see ChannelFollower).
+    bool anchor = false;
+    /// It offers its clock as the network time (see TimeSync).
+    bool timeReference = false;
+    /// Its announcements are authenticated with the installation key (see Security).
+    bool authenticated = false;
 };
 
 enum class PeerEvent : uint8_t {
@@ -27,6 +36,8 @@ enum class PeerEvent : uint8_t {
 };
 
 using PeerHandler = std::function<void(PeerEvent, const PeerInfo&)>;
+/// A peer announced that it is moving to another channel.
+using MoveHandler = std::function<void(const PeerInfo&, uint8_t channel)>;
 
 struct DiscoveryConfig {
     /// Human-readable name announced to others (at most 32 bytes).
@@ -67,24 +78,44 @@ public:
     void start(uint32_t nowMs);
     /// Sends a goodbye and forgets all peers (no Lost events).
     void stop(uint32_t nowMs);
+    /// Tells peers we are about to switch to `channel`; they report us lost
+    /// and may follow (see ChannelFollower). Sent a few times since broadcast
+    /// is not acknowledged.
+    bool announceMove(uint8_t channel, uint32_t nowMs);
     /// Asks every node in range to announce itself.
     void discover(uint32_t nowMs);
     void tick(uint32_t nowMs);
 
     void setMetadata(const uint8_t* data, size_t len, uint32_t nowMs);
+    /// What this node announces about its radio; announced right away when it changes.
+    void setChannelInfo(uint8_t channel, bool anchor, uint32_t nowMs);
+    void setTimeReference(bool reference, uint32_t nowMs);
     void onPeerEvent(PeerHandler handler) { handler_ = std::move(handler); }
+    void onPeerMoved(MoveHandler handler) { moveHandler_ = std::move(handler); }
 
     const std::vector<PeerInfo>& peers() const { return peers_; }
     const PeerInfo* find(const Mac& mac) const;
 
-    /// Parses an announcement payload (as carried on kDiscoveryPort).
+    /// A parsed announcement payload (as carried on kDiscoveryPort).
+    struct Announcement {
+        uint8_t flags = 0;
+        uint16_t maxFrameSize = 0;
+        std::string name;
+        const uint8_t* metadata = nullptr;
+        size_t metadataLen = 0;
+        uint8_t channel = 0;  ///< 0 when the sender does not say.
+        uint8_t extFlags = 0;
+        uint8_t moveTo = 0;   ///< Channel of a moving notice, else 0.
+    };
+    static bool parse(const uint8_t* data, size_t len, Announcement& out);
     static bool parseAnnouncement(const uint8_t* data, size_t len, std::string& name, uint16_t& maxFrameSize);
 
 private:
-    enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04 };
+    enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04, kMoving = 0x08 };
+    enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02 };
 
     void handle(const Message& m);
-    bool announce(uint8_t flags);
+    bool announce(uint8_t flags, uint8_t moveTo = 0);
     void emit(PeerEvent event, const PeerInfo& peer);
 
     Engine& engine_;
@@ -92,7 +123,10 @@ private:
     uint16_t localMaxFrameSize_;
     std::function<uint32_t()> random_;
     PeerHandler handler_;
+    MoveHandler moveHandler_;
     std::vector<PeerInfo> peers_;
+    uint8_t channel_ = 0;
+    uint8_t extFlags_ = 0;
     uint32_t now_ = 0;
     uint32_t nextAnnounce_ = 0;
     uint32_t replyAt_ = 0;

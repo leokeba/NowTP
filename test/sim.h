@@ -1,11 +1,15 @@
 // Simulated radio network for host-side tests.
 #pragma once
 
+#include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <set>
+#include <thread>
 #include <vector>
 
 #include "nowtp/diagnostics.h"
@@ -71,9 +75,11 @@ public:
     uint8_t channel() const override { return chan; }
     Status setChannel(uint8_t c) override {
         if (channelLocked) return Status::InvalidState;
+        if (c < 1 || c > 14) return Status::InvalidArgument;
         chan = c;
         return Status::Ok;
     }
+    bool channelFixed() const override { return channelLocked; }
     bool longRange() const override { return lr; }
     Status setLongRange(bool on) override {
         lr = on;
@@ -108,6 +114,12 @@ struct Node {
     nowtp::Engine engine;
     SimRadio radio;
     bool online = true;
+    /// Local clock: offset and rate error against the simulation's time.
+    uint64_t clockOffsetUs = 1000000000;
+    double clockSkew = 0;  // e.g. 40e-6 for a crystal 40 ppm fast
+    uint64_t clockUs(uint32_t nowMs) const {
+        return clockOffsetUs + static_cast<uint64_t>(static_cast<double>(nowMs) * 1000.0 * (1.0 + clockSkew));
+    }
 };
 
 /// Probability that a frame from node `from` reaches node `to`, given the
@@ -212,7 +224,8 @@ public:
                 n.link.inFlight = false;
                 n.engine.onFrameSent(e.ok, now_);
             } else if (n.online) {
-                n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi);
+                n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,
+                                         n.clockUs(now_));
             }
         }
         for (auto& n : nodes_) n->engine.tick(now_);
@@ -293,5 +306,86 @@ public:
 private:
     Network& net_;
 };
+
+/// Runs several blocking procedures (e.g. both sides of a pairing) in their
+/// own threads against one simulated network, deterministically: only one
+/// thread runs at a time, and the network advances only while every thread
+/// sleeps, up to the earliest wake-up time.
+class Scheduler {
+public:
+    explicit Scheduler(Network& net) : net_(net) {}
+
+    /// Host for one procedure thread.
+    class Host : public nowtp::ServiceHost {
+    public:
+        explicit Host(Scheduler& s) : s_(s) {}
+        uint32_t now() override { return s_.net_.now(); }
+        void sleep(uint32_t ms) override { s_.sleep(ms ? ms : 1); }
+        void lock() override {}  // only one thread runs at a time
+        void unlock() override {}
+        uint32_t random() override { return static_cast<uint32_t>(s_.net_.rng()()); }
+
+    private:
+        Scheduler& s_;
+    };
+
+    /// Runs every function in its own thread until all have returned.
+    void run(const std::vector<std::function<void()>>& procedures);
+
+private:
+    void sleep(uint32_t ms);
+
+    Network& net_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::multiset<uint32_t> wakeups_;
+    size_t starting_ = 0;     // threads that have not run yet
+    bool turnTaken_ = false;  // a thread is running
+};
+
+inline void Scheduler::sleep(uint32_t ms) {
+    std::unique_lock<std::mutex> l(m_);
+    uint32_t wake = net_.now() + ms;
+    std::multiset<uint32_t>::iterator mine = wakeups_.insert(wake);
+    turnTaken_ = false;
+    cv_.notify_all();
+    for (;;) {
+        bool idle = !turnTaken_ && starting_ == 0;
+        if (idle && static_cast<int32_t>(net_.now() - wake) >= 0) {
+            wakeups_.erase(mine);
+            turnTaken_ = true;
+            return;
+        }
+        if (idle && static_cast<int32_t>(net_.now() - *wakeups_.begin()) < 0) {
+            net_.step();  // everyone sleeps: advance to the earliest wake-up
+            cv_.notify_all();
+            continue;
+        }
+        cv_.wait(l);
+    }
+}
+
+inline void Scheduler::run(const std::vector<std::function<void()>>& procedures) {
+    {
+        std::lock_guard<std::mutex> l(m_);
+        starting_ = procedures.size();
+    }
+    std::vector<std::thread> threads;
+    for (const auto& fn : procedures) {
+        threads.emplace_back([this, fn] {
+            {
+                std::unique_lock<std::mutex> l(m_);
+                cv_.wait(l, [this] { return !turnTaken_; });
+                turnTaken_ = true;
+                starting_--;
+            }
+            fn();
+            std::lock_guard<std::mutex> l(m_);
+            turnTaken_ = false;
+            cv_.notify_all();
+        });
+    }
+    for (auto& t : threads) t.join();
+}
 
 }  // namespace sim

@@ -8,10 +8,14 @@
 #include <utility>
 #include <vector>
 
+#include "channel.h"
 #include "diagnostics.h"
 #include "discovery.h"
 #include "engine.h"
 #include "radio.h"
+#include "security.h"
+#include "stream.h"
+#include "timesync.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -86,6 +90,26 @@ struct EspNowConfig {
     /// Answer diagnostic requests and allow the diagnose()/optimize() calls.
     bool enableDiagnostics = true;
     DiagnosticsConfig diagnostics;
+
+    // --- Channel following (needs enableDiscovery) ---------------------------
+    /// Follow peers that move to another channel, and search for anchor peers
+    /// (nodes whose channel an access point fixes) once they go silent.
+    ChannelConfig channel;
+
+    // --- Security ------------------------------------------------------------
+    /// Installation key and pairing code. Security is off until a key is set
+    /// here, loaded from NVS, installed with setSecurityKey() or obtained by pair().
+    SecurityConfig security;
+    /// Keep the installation key in NVS (namespace "nowtp"): begin() loads it
+    /// when security.key is empty, and pairing and setSecurityKey() store it.
+    bool persistSecurityKey = true;
+
+    // --- Network time and streams ----------------------------------------------
+    /// Answer time requests and synchronize with the reference node.
+    bool enableTimeSync = true;
+    TimeSyncConfig timeSync;
+    /// Accept and send streams (sendStream(), onStream()).
+    bool enableStreams = true;
 
     // --- Transport -----------------------------------------------------------
     /// Frame size for broadcast and for peers without their own setting.
@@ -177,6 +201,54 @@ public:
     /// Changes the metadata this node announces and announces it right away.
     Status setDiscoveryMetadata(const void* data, size_t len);
 
+    // --- Channels --------------------------------------------------------------
+    /// Tells peers we are moving to `channel`, then switches to it; peers that
+    /// follow (EspNowConfig::channel) come along. Fails with InvalidState when
+    /// an access point fixes our channel. Blocks for up to ~300 ms.
+    Status moveToChannel(uint8_t channel);
+    /// Tells peers we are about to move to `channel` without switching: call it
+    /// before connecting the station to an access point on another channel.
+    Status announceChannelChange(uint8_t channel);
+    /// Searches the other channels for peers now (normally automatic).
+    Status searchChannels();
+    /// Called in the NowTP task whenever our channel changed: we followed a
+    /// peer, or the access point we depend on moved.
+    void onChannelChange(std::function<void(uint8_t channel)> handler);
+
+    // --- Security (see Security) ---------------------------------------------
+    /// Installs the installation key (16-32 bytes) and stores it if
+    /// persistSecurityKey is set. Every message is authenticated from then on.
+    Status setSecurityKey(const void* key, size_t len);
+    /// Removes the key, here and in NVS: security is off again.
+    Status forgetSecurityKey();
+    /// An installation key is installed.
+    bool secured() const;
+    /// Opens a pairing window for up to `timeoutMs` and hands the installation
+    /// key (created now if there is none) to one node calling pair(). Blocking.
+    Status acceptPairing(uint32_t timeoutMs, Mac* joined = nullptr);
+    /// Obtains the installation key from a node with an open pairing window. Blocking.
+    Status pair(uint32_t timeoutMs, Mac* member = nullptr);
+
+    // --- Network time (see TimeSync) -----------------------------------------
+    /// The reference node's clock now, in µs. Equals esp_timer_get_time() on
+    /// the reference and while unsynchronized.
+    uint64_t networkTimeUs() const;
+    /// The esp_timer_get_time() value at which network time `networkUs` occurs:
+    /// schedule an action there (e.g. with esp_timer_start_once()).
+    int64_t localTimeUs(uint64_t networkUs) const;
+    TimeSyncStatus timeSyncStatus() const;
+    /// Synchronizes with `peer` instead of the reference announced by discovery.
+    Status setTimeReference(const Mac& peer);
+
+    // --- Streams (see Streams) -----------------------------------------------
+    /// Sends `size` bytes pulled from `read` to `dst`. `done` runs once in the
+    /// NowTP task with the outcome. Returns at once.
+    Status sendStream(const Mac& dst, uint32_t size, StreamReader read, StreamDone done = nullptr,
+                      const StreamOptions& options = StreamOptions(), uint32_t* id = nullptr);
+    Status cancelStream(uint32_t id);
+    /// Decides about incoming streams (may be called before begin()).
+    void onStream(StreamAcceptor acceptor);
+
     /// The radio state found and set by begin(), with current power and LR state.
     RadioInfo radioInfo() const;
 
@@ -199,6 +271,7 @@ public:
     Status setChannel(uint8_t channel) override;
     bool longRange() const override;
     Status setLongRange(bool enabled) override;
+    bool channelFixed() const override;
 
     // --- Diagnostics (blocking; call from an application task) ---------------
     /// Round trip to a peer's diagnostics, falling back to lower power if needed.
@@ -248,6 +321,10 @@ private:
     void sendFallbackPing();
     void onFallbackPing(Status status);
     void tickLinkChecks(uint32_t now);
+    void pollChannel(uint32_t now);
+    Status sendMoveNotice(uint8_t channel);
+    Status appTaskReady() const;
+    void storeKey(const std::vector<uint8_t>& key);
     struct LinkHealth {
         Mac mac;
         uint32_t lastHeardMs = 0;
@@ -274,6 +351,15 @@ private:
     std::vector<LinkHealth> linkHealth_;
     std::unique_ptr<Host> host_;
     std::unique_ptr<Diagnostics> diagnostics_;
+    std::unique_ptr<Security> security_;
+    std::unique_ptr<ChannelFollower> follower_;
+    std::unique_ptr<TimeSync> timeSync_;
+    std::unique_ptr<Streams> streams_;
+    StreamAcceptor streamAcceptor_;
+    std::function<void(uint8_t)> channelHandler_;
+    uint32_t lastChannelPoll_ = 0;
+    uint8_t pendingChannel_ = 0;
+    uint32_t pendingChannelSince_ = 0;
     int8_t limitQuarterDbm_ = 80;
     struct PowerFallback {
         bool active = false;

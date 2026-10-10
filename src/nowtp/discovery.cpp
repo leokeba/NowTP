@@ -11,8 +11,11 @@ namespace {
 // Announcement layout (payload of a message on kDiscoveryPort):
 //   type (1) = kHello | flags (1) | max frame size (2, LE)
 //   | name length (1) | name | metadata length (1) | metadata
+//   | extension flags (1) | channel (1) | [move-to channel (1), moving notices only]
+// The extension is optional: earlier versions neither send nor read it.
 constexpr uint8_t kHello = 1;
 constexpr size_t kFixedSize = 6;  // type, flags, frame size, two length bytes
+constexpr size_t kExtSize = 3;
 
 inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
@@ -59,6 +62,35 @@ void Discovery::discover(uint32_t now) {
     tick(now);
 }
 
+bool Discovery::announceMove(uint8_t channel, uint32_t now) {
+    if (!running_) return false;
+    now_ = now;
+    // Not latest-only, so the copies do not replace each other in the queue.
+    bool sent = false;
+    for (int i = 0; i < 3; ++i) sent = announce(kGoodbye | kMoving, channel) || sent;
+    return sent;
+}
+
+void Discovery::setChannelInfo(uint8_t channel, bool anchor, uint32_t now) {
+    uint8_t flags = static_cast<uint8_t>(anchor ? (extFlags_ | kExtAnchor) : (extFlags_ & ~kExtAnchor));
+    if (channel == channel_ && flags == extFlags_) return;
+    channel_ = channel;
+    extFlags_ = flags;
+    if (!running_) return;
+    announceDue_ = true;
+    tick(now);
+}
+
+void Discovery::setTimeReference(bool reference, uint32_t now) {
+    uint8_t flags =
+        static_cast<uint8_t>(reference ? (extFlags_ | kExtTimeReference) : (extFlags_ & ~kExtTimeReference));
+    if (flags == extFlags_) return;
+    extFlags_ = flags;
+    if (!running_) return;
+    announceDue_ = true;
+    tick(now);
+}
+
 void Discovery::setMetadata(const uint8_t* data, size_t len, uint32_t now) {
     config_.metadata.assign(data, data + std::min(len, kMaxMetadata));
     if (!running_) return;
@@ -73,8 +105,8 @@ const PeerInfo* Discovery::find(const Mac& mac) const {
     return nullptr;
 }
 
-bool Discovery::announce(uint8_t flags) {
-    uint8_t buf[kFixedSize + kMaxName + kMaxMetadata];
+bool Discovery::announce(uint8_t flags, uint8_t moveTo) {
+    uint8_t buf[kFixedSize + kMaxName + kMaxMetadata + kExtSize];
     size_t n = 0;
     buf[n++] = kHello;
     buf[n++] = flags;
@@ -86,9 +118,12 @@ bool Discovery::announce(uint8_t flags) {
     buf[n++] = static_cast<uint8_t>(config_.metadata.size());
     if (!config_.metadata.empty()) memcpy(buf + n, config_.metadata.data(), config_.metadata.size());
     n += config_.metadata.size();
+    buf[n++] = extFlags_;
+    buf[n++] = channel_;
+    if (flags & kMoving) buf[n++] = moveTo;
 
     SendOptions opts;
-    opts.latestOnly = true;  // a queued announcement is replaced by a fresher one
+    opts.latestOnly = (flags & kMoving) == 0;  // a queued announcement is replaced by a fresher one
     return engine_.send(Mac::broadcast(), kDiscoveryPort, buf, n, opts, CompletionHandler(), now_) == Status::Ok;
 }
 
@@ -127,60 +162,78 @@ void Discovery::tick(uint32_t now) {
     }
 }
 
-bool Discovery::parseAnnouncement(const uint8_t* p, size_t len, std::string& name, uint16_t& maxFrameSize) {
+bool Discovery::parse(const uint8_t* p, size_t len, Announcement& out) {
     if (len < kFixedSize || p[0] != kHello) return false;
     size_t nameLen = p[4];
-    if (nameLen > kMaxName || 6 + nameLen > len) return false;
+    if (nameLen > kMaxName || kFixedSize + nameLen > len) return false;
     size_t metaLen = p[5 + nameLen];
-    if (metaLen > kMaxMetadata || 6 + nameLen + metaLen > len) return false;
-    name.assign(reinterpret_cast<const char*>(p + 5), nameLen);
-    maxFrameSize = wire::getU16(p + 2);
+    if (metaLen > kMaxMetadata || kFixedSize + nameLen + metaLen > len) return false;
+    out = Announcement();
+    out.flags = p[1];
+    out.maxFrameSize = wire::getU16(p + 2);
+    out.name.assign(reinterpret_cast<const char*>(p + 5), nameLen);
+    out.metadata = p + kFixedSize + nameLen;
+    out.metadataLen = metaLen;
+    size_t ext = kFixedSize + nameLen + metaLen;
+    if (len >= ext + 2) {
+        out.extFlags = p[ext];
+        out.channel = p[ext + 1];
+        if ((out.flags & kMoving) && len >= ext + 3) out.moveTo = p[ext + 2];
+    }
+    return true;
+}
+
+bool Discovery::parseAnnouncement(const uint8_t* p, size_t len, std::string& name, uint16_t& maxFrameSize) {
+    Announcement a;
+    if (!parse(p, len, a)) return false;
+    name = a.name;
+    maxFrameSize = a.maxFrameSize;
     return true;
 }
 
 void Discovery::handle(const Message& m) {
-    const uint8_t* p = m.data;
-    size_t len = m.len;
-    if (len < kFixedSize || p[0] != kHello) return;
-    uint8_t flags = p[1];
-    uint16_t maxFrame = wire::getU16(p + 2);
-    size_t nameLen = p[4];
-    if (nameLen > kMaxName || 5 + nameLen + 1 > len) return;
-    size_t metaLen = p[5 + nameLen];
-    if (metaLen > kMaxMetadata || 6 + nameLen + metaLen > len) return;
+    Announcement a;
+    if (!parse(m.data, m.len, a)) return;
 
-    if (flags & kGoodbye) {
+    if (a.flags & kGoodbye) {
         for (size_t i = 0; i < peers_.size(); ++i) {
             if (peers_[i].mac != m.src) continue;
             PeerInfo lost = peers_[i];
             peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
             emit(PeerEvent::Lost, lost);
+            if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) {
+                MoveHandler h = moveHandler_;
+                h(lost, a.moveTo);
+            }
             break;
         }
         return;
     }
 
-    if ((flags & kQuery) && !replyDue_) {
+    if ((a.flags & kQuery) && !replyDue_) {
         replyDue_ = true;
         replyAt_ = now_ + (config_.replyJitterMs ? random_() % (config_.replyJitterMs + 1) : 0);
     }
-
-    std::string name(reinterpret_cast<const char*>(p + 5), nameLen);
-    const uint8_t* meta = p + 6 + nameLen;
 
     PeerInfo* peer = nullptr;
     for (PeerInfo& q : peers_) {
         if (q.mac == m.src) peer = &q;
     }
+    bool anchor = (a.extFlags & kExtAnchor) != 0;
+    bool timeReference = (a.extFlags & kExtTimeReference) != 0;
     if (!peer) {
         if (peers_.size() >= config_.maxPeers) return;
         PeerInfo fresh;
         fresh.mac = m.src;
-        fresh.name = name;
-        fresh.metadata.assign(meta, meta + metaLen);
-        fresh.maxFrameSize = maxFrame;
+        fresh.name = a.name;
+        fresh.metadata.assign(a.metadata, a.metadata + a.metadataLen);
+        fresh.maxFrameSize = a.maxFrameSize;
         fresh.rssi = m.rssi;
         fresh.firstSeenMs = fresh.lastSeenMs = now_;
+        fresh.channel = a.channel;
+        fresh.anchor = anchor;
+        fresh.timeReference = timeReference;
+        fresh.authenticated = m.authenticated;
         peers_.push_back(fresh);
         emit(PeerEvent::Found, fresh);
         return;
@@ -188,12 +241,19 @@ void Discovery::handle(const Message& m) {
 
     peer->lastSeenMs = now_;
     peer->rssi = m.rssi;
-    bool changed = peer->name != name || peer->maxFrameSize != maxFrame || peer->metadata.size() != metaLen ||
-                   !std::equal(peer->metadata.begin(), peer->metadata.end(), meta);
+    bool changed = peer->name != a.name || peer->maxFrameSize != a.maxFrameSize ||
+                   peer->metadata.size() != a.metadataLen ||
+                   !std::equal(peer->metadata.begin(), peer->metadata.end(), a.metadata) ||
+                   peer->channel != a.channel || peer->anchor != anchor || peer->timeReference != timeReference ||
+                   peer->authenticated != m.authenticated;
     if (changed) {
-        peer->name = name;
-        peer->metadata.assign(meta, meta + metaLen);
-        peer->maxFrameSize = maxFrame;
+        peer->name = a.name;
+        peer->metadata.assign(a.metadata, a.metadata + a.metadataLen);
+        peer->maxFrameSize = a.maxFrameSize;
+        peer->channel = a.channel;
+        peer->anchor = anchor;
+        peer->timeReference = timeReference;
+        peer->authenticated = m.authenticated;
         PeerInfo copy = *peer;
         emit(PeerEvent::Updated, copy);
     }

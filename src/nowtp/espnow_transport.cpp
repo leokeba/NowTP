@@ -14,6 +14,7 @@
 #include "esp_now.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #if ESP_IDF_VERSION_MAJOR >= 5
 #include "esp_random.h"
@@ -90,6 +91,8 @@ inline int8_t quarterDbm(float dbm) {
 enum EventKind : uint8_t { kEventReceived = 1, kEventSent = 2 };
 
 struct EventHeader {
+    uint32_t timeLo;    // esp_timer time of the driver callback, µs (split: ring buffer
+    uint32_t timeHi;    // items are only 4-byte aligned)
     uint8_t kind;
     uint8_t delivered;  // kEventSent only
     int8_t rssi;        // kEventReceived only; 0 if unknown
@@ -106,6 +109,22 @@ bool s_active = false;
 
 inline uint32_t nowMs() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+}
+
+const char* const kNvsNamespace = "nowtp";
+const char* const kNvsKey = "key";
+
+bool loadStoredKey(std::vector<uint8_t>& out) {
+    nvs_handle_t h;
+    if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return false;
+    uint8_t buf[Security::kMaxKey];
+    size_t len = sizeof(buf);
+    esp_err_t err = nvs_get_blob(h, kNvsKey, buf, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len < Security::kMinKey || len > Security::kMaxKey) return false;
+    out.assign(buf, buf + len);
+    memset(buf, 0, sizeof(buf));
+    return true;
 }
 
 // Unencrypted peer on the current channel.
@@ -127,6 +146,9 @@ void pushEvent(uint8_t kind, const uint8_t* mac, bool delivered, int8_t rssi, co
         return;
     }
     EventHeader* h = static_cast<EventHeader*>(slot);
+    uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
+    h->timeLo = static_cast<uint32_t>(t);
+    h->timeHi = static_cast<uint32_t>(t >> 32);
     h->kind = kind;
     h->delivered = delivered ? 1 : 0;
     h->rssi = rssi;
@@ -280,15 +302,47 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
         return Status::NoMemory;
     }
     for (auto& l : listeners_) engine_->listen(l.first, l.second);
+    host_.reset(new Host(*this));
+
+    SecurityConfig sc = config_.security;
+    if (sc.key.empty() && config_.persistSecurityKey && loadStoredKey(sc.key)) {
+        ESP_LOGI(kTag, "using the installation key stored in NVS");
+    }
+    security_.reset(new Security(*engine_, *host_, localMac(), sc));
+    if (!sc.key.empty()) memset(sc.key.data(), 0, sc.key.size());
+    if (config_.persistSecurityKey) security_->onKeyChanged([this](const std::vector<uint8_t>& k) { storeKey(k); });
+
     if (config_.enableDiscovery) {
         discovery_.reset(new Discovery(*engine_, config_.discovery, maxSupportedFrameSize(),
                                        [] { return static_cast<uint32_t>(esp_random()); }));
         discovery_->onPeerEvent([this](PeerEvent e, const PeerInfo& p) { handlePeerEvent(e, p); });
+        discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || channelFixed(), nowMs());
+        discovery_->setTimeReference(config_.enableTimeSync && config_.timeSync.reference, nowMs());
+        follower_.reset(new ChannelFollower(*discovery_, *this, config_.channel));
+        follower_->onChannelChange([this](uint8_t ch) {
+            ESP_LOGI(kTag, "followed peers to channel %u", ch);
+            if (channelHandler_) {
+                std::function<void(uint8_t)> h = channelHandler_;
+                h(ch);
+            }
+        });
+        discovery_->onPeerMoved([this](const PeerInfo& p, uint8_t ch) { follower_->onPeerMoved(p, ch, nowMs()); });
+        // A new peer's first announcement waits for its epoch to be verified: ask again at once.
+        security_->onPeerVerified([this](const Mac& mac) {
+            if (!discovery_->find(mac)) discovery_->discover(nowMs());
+        });
     }
     if (config_.enableDiagnostics) {
-        host_.reset(new Host(*this));
         diagnostics_.reset(new Diagnostics(*engine_, *this, *host_, config_.diagnostics));
         diagnostics_->setDiscovery(discovery_.get());
+    }
+    if (config_.enableTimeSync) {
+        timeSync_.reset(new TimeSync(*engine_, [] { return static_cast<uint64_t>(esp_timer_get_time()); },
+                                     config_.timeSync));
+    }
+    if (config_.enableStreams) {
+        streams_.reset(new Streams(*engine_, [] { return static_cast<uint32_t>(esp_random()); }));
+        streams_->onIncoming(streamAcceptor_);
     }
     fallback_ = PowerFallback();
     linkChecks_.clear();
@@ -328,8 +382,14 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
     stopping_ = false;
     started_ = true;
+    lastChannelPoll_ = nowMs();
+    pendingChannel_ = 0;
+    security_->start();  // first, so that every announcement is authenticated
     if (diagnostics_) diagnostics_->start();
+    if (timeSync_) timeSync_->start(nowMs());
+    if (streams_) streams_->start();
     if (discovery_) discovery_->start(nowMs());
+    if (follower_) follower_->start(nowMs());
     if (config_.runTask) {
         BaseType_t ok = xTaskCreatePinnedToCore(taskEntry, "nowtp", config_.taskStackSize, this,
                                                 config_.taskPriority, &task_, config_.taskCore);
@@ -344,11 +404,12 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
 void EspNowTransport::end() {
     if (!started_) return;
-    if (diagnostics_) {
-        lock();
-        diagnostics_->stop();
-        unlock();
-    }
+    lock();
+    if (diagnostics_) diagnostics_->stop();
+    if (streams_) streams_->stop();  // pending streams complete with Cancelled
+    if (follower_) follower_->stop();
+    if (timeSync_) timeSync_->stop();
+    unlock();
     if (discovery_) {
         // Say goodbye so peers drop us at once, and give the frame time to go out.
         lock();
@@ -386,9 +447,14 @@ void EspNowTransport::cleanup() {
     }
     s_events = nullptr;
     s_active = false;
+    // Services before what they run on.
+    streams_.reset();
+    timeSync_.reset();
+    follower_.reset();
     diagnostics_.reset();
-    host_.reset();
     discovery_.reset();
+    security_.reset();
+    host_.reset();
     engine_.reset();
     link_.reset();
     if (events_) {
@@ -441,7 +507,8 @@ void EspNowTransport::processEvents(TickType_t wait) {
                 const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
                 Mac src = Mac::from(h->mac);
                 notePeerHeard(src);
-                engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi);
+                uint64_t at = h->timeLo | (static_cast<uint64_t>(h->timeHi) << 32);
+                engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi, at);
             } else if (h->kind == kEventSent) {
                 notePeerSendResult(Mac::from(h->mac), h->delivered != 0);
                 engine_->onFrameSent(h->delivered != 0, nowMs());
@@ -453,8 +520,16 @@ void EspNowTransport::processEvents(TickType_t wait) {
     }
     uint32_t now = nowMs();
     engine_->tick(now);
+    if (security_) security_->tick(now);
     if (discovery_) discovery_->tick(now);
     if (diagnostics_) diagnostics_->tick(now);
+    pollChannel(now);
+    if (follower_) {
+        follower_->setSuspended(diagnostics_ && diagnostics_->busy(), now);
+        follower_->tick(now);
+    }
+    if (timeSync_) timeSync_->tick(now);
+    if (streams_) streams_->tick(now);
     tickLinkChecks(now);
     unlock();
 }
@@ -1008,6 +1083,8 @@ void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
 
 void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     // Runs in the NowTP task with the lock held.
+    if (follower_) follower_->onPeerEvent(event, peer, nowMs());
+    if (timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
     // Check new peers hear us; failures feed the one-way detection and fallback.
     if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < 8) {
         LinkCheck c = {peer.mac, 3, false, nowMs()};
@@ -1113,17 +1190,23 @@ uint8_t EspNowTransport::channel() const {
     return ch;
 }
 
+bool EspNowTransport::channelFixed() const {
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) return false;
+    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) return true;
+    wifi_ap_record_t ap;
+    return mode == WIFI_MODE_STA && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+}
+
 Status EspNowTransport::setChannel(uint8_t ch) {
     if (!started_) return Status::InvalidState;
-    wifi_mode_t mode = WIFI_MODE_NULL;
-    wifi_ap_record_t ap;
-    esp_wifi_get_mode(&mode);
-    bool fixed = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA ||
-                 ((mode == WIFI_MODE_STA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
-    if (fixed) return Status::InvalidState;
+    if (channelFixed()) return Status::InvalidState;
     esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) return err == ESP_ERR_INVALID_ARG ? Status::InvalidArgument : Status::LinkError;
+    lock();
     radio_.channel = ch;
+    pendingChannel_ = 0;
+    unlock();
     return Status::Ok;
 }
 
@@ -1264,6 +1347,232 @@ void EspNowTransport::tickLinkChecks(uint32_t now) {
                                   now);
         if (st != Status::Ok) c.inFlight = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Channels (NowTP task, lock held, unless noted)
+
+namespace {
+constexpr uint32_t kChannelPollMs = 250;
+// A station's own scan visits other channels briefly; only a channel that
+// stays is a move.
+constexpr uint32_t kChannelSettleMs = 600;
+}  // namespace
+
+void EspNowTransport::pollChannel(uint32_t now) {
+    if (static_cast<int32_t>(now - lastChannelPoll_) < static_cast<int32_t>(kChannelPollMs)) return;
+    lastChannelPoll_ = now;
+    bool fixed = channelFixed();
+    if (discovery_) discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || fixed, now);
+    if (diagnostics_ && diagnostics_->busy()) {
+        pendingChannel_ = 0;  // deep discovery is visiting other channels
+        return;
+    }
+    uint8_t ch = channel();
+    if (ch == 0 || ch == radio_.channel) {
+        pendingChannel_ = 0;
+        return;
+    }
+    if (ch != pendingChannel_) {
+        pendingChannel_ = ch;
+        pendingChannelSince_ = now;
+        return;
+    }
+    if (static_cast<int32_t>(now - pendingChannelSince_) < static_cast<int32_t>(kChannelSettleMs)) return;
+    pendingChannel_ = 0;
+    ESP_LOGI(kTag, "channel changed from %u to %u%s", radio_.channel, ch,
+             fixed ? " (set by the access point)" : "");
+    radio_.channel = ch;
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&mode);
+    wifi_ap_record_t ap;
+    radio_.softApActive = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
+    radio_.stationConnected =
+        (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor || fixed, now);
+    if (follower_) follower_->onChannelChanged(ch, now);
+    if (channelHandler_) {
+        std::function<void(uint8_t)> h = channelHandler_;
+        h(ch);
+    }
+}
+
+Status EspNowTransport::appTaskReady() const {
+    if (!started_) return Status::InvalidState;
+    if (task_ && xTaskGetCurrentTaskHandle() == task_) return Status::InvalidState;  // would deadlock
+    return Status::Ok;
+}
+
+// Application task: queue the notice, then give it time to leave on this channel.
+Status EspNowTransport::sendMoveNotice(uint8_t ch) {
+    Status st = appTaskReady();
+    if (st != Status::Ok) return st;
+    if (ch < 1 || ch > 14) return Status::InvalidArgument;
+    if (!discovery_) return Status::InvalidState;
+    lock();
+    bool queued = discovery_->announceMove(ch, nowMs());
+    unlock();
+    if (!queued) return Status::QueueFull;
+    for (int i = 0; i < 150 && engine_->pendingMessages() > 0; ++i) {
+        if (task_) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        } else {
+            processEvents(pdMS_TO_TICKS(2));
+        }
+    }
+    return Status::Ok;
+}
+
+Status EspNowTransport::moveToChannel(uint8_t ch) {
+    Status st = appTaskReady();
+    if (st != Status::Ok) return st;
+    if (channelFixed()) return Status::InvalidState;
+    if (ch == channel()) return Status::Ok;
+    if (discovery_) {
+        st = sendMoveNotice(ch);
+        if (st != Status::Ok) return st;
+    }
+    st = setChannel(ch);
+    if (st != Status::Ok) return st;
+    lock();
+    if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor, nowMs());
+    if (follower_) follower_->onChannelChanged(ch, nowMs());  // and ask who is there
+    unlock();
+    return Status::Ok;
+}
+
+Status EspNowTransport::announceChannelChange(uint8_t ch) {
+    return sendMoveNotice(ch);
+}
+
+Status EspNowTransport::searchChannels() {
+    if (!started_ || !follower_) return Status::InvalidState;
+    lock();
+    Status st = follower_->search(nowMs());
+    unlock();
+    return st;
+}
+
+void EspNowTransport::onChannelChange(std::function<void(uint8_t channel)> handler) {
+    if (started_) lock();
+    channelHandler_ = std::move(handler);
+    if (started_) unlock();
+}
+
+// ---------------------------------------------------------------------------
+// Security
+
+void EspNowTransport::storeKey(const std::vector<uint8_t>& key) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "cannot store the installation key: nvs_open: %s", esp_err_to_name(err));
+        return;
+    }
+    err = key.empty() ? nvs_erase_key(h, kNvsKey) : nvs_set_blob(h, kNvsKey, key.data(), key.size());
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) ESP_LOGW(kTag, "storing the installation key: %s", esp_err_to_name(err));
+}
+
+Status EspNowTransport::setSecurityKey(const void* key, size_t len) {
+    if (!started_) return Status::InvalidState;
+    if (len < Security::kMinKey || len > Security::kMaxKey || !key) return Status::InvalidArgument;
+    Status st = security_->setKey(static_cast<const uint8_t*>(key), len);
+    if (st == Status::Ok && config_.persistSecurityKey) {
+        const uint8_t* k = static_cast<const uint8_t*>(key);
+        storeKey(std::vector<uint8_t>(k, k + len));
+    }
+    return st;
+}
+
+Status EspNowTransport::forgetSecurityKey() {
+    if (!started_) return Status::InvalidState;
+    security_->setKey(nullptr, 0);
+    if (config_.persistSecurityKey) storeKey(std::vector<uint8_t>());
+    return Status::Ok;
+}
+
+bool EspNowTransport::secured() const {
+    if (!started_) return false;
+    lock();
+    bool on = security_->enabled();
+    unlock();
+    return on;
+}
+
+Status EspNowTransport::acceptPairing(uint32_t timeoutMs, Mac* joined) {
+    Status st = appTaskReady();
+    return st == Status::Ok ? security_->acceptPairing(timeoutMs, joined) : st;
+}
+
+Status EspNowTransport::pair(uint32_t timeoutMs, Mac* member) {
+    Status st = appTaskReady();
+    return st == Status::Ok ? security_->pair(timeoutMs, member) : st;
+}
+
+// ---------------------------------------------------------------------------
+// Network time
+
+uint64_t EspNowTransport::networkTimeUs() const {
+    uint64_t local = static_cast<uint64_t>(esp_timer_get_time());
+    if (!started_ || !timeSync_) return local;
+    lock();
+    uint64_t t = timeSync_->toNetwork(local);
+    unlock();
+    return t;
+}
+
+int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
+    if (!started_ || !timeSync_) return static_cast<int64_t>(networkUs);
+    lock();
+    uint64_t t = timeSync_->toLocal(networkUs);
+    unlock();
+    return static_cast<int64_t>(t);
+}
+
+TimeSyncStatus EspNowTransport::timeSyncStatus() const {
+    if (!started_ || !timeSync_) return TimeSyncStatus();
+    lock();
+    TimeSyncStatus s = timeSync_->status();
+    unlock();
+    return s;
+}
+
+Status EspNowTransport::setTimeReference(const Mac& peer) {
+    if (!started_ || !timeSync_) return Status::InvalidState;
+    lock();
+    timeSync_->setReference(peer, nowMs());
+    unlock();
+    return Status::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+
+Status EspNowTransport::sendStream(const Mac& dst, uint32_t size, StreamReader read, StreamDone done,
+                                   const StreamOptions& options, uint32_t* id) {
+    if (!started_ || !streams_) return Status::InvalidState;
+    if (!config_.autoAddPeers && !esp_now_is_peer_exist(dst.bytes)) return Status::LinkError;
+    lock();
+    Status st = streams_->send(dst, size, std::move(read), std::move(done), options, nowMs(), id);
+    unlock();
+    return st;
+}
+
+Status EspNowTransport::cancelStream(uint32_t id) {
+    if (!started_ || !streams_) return Status::InvalidState;
+    lock();
+    Status st = streams_->cancel(id, nowMs());
+    unlock();
+    return st;
+}
+
+void EspNowTransport::onStream(StreamAcceptor acceptor) {
+    if (started_) lock();
+    streamAcceptor_ = acceptor;
+    if (streams_) streams_->onIncoming(std::move(acceptor));
+    if (started_) unlock();
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "NowTP.h"
+#include "nowtp/crypto.h"
 #include "esp_event.h"
 #include "esp_idf_version.h"
 #include "esp_now.h"
@@ -100,6 +101,31 @@ void startWifi() {
 
 // ---------------------------------------------------------------------------
 // Engine on target, simulated radio
+
+// Crypto on the chip: test vectors (real compiler and CPU), and timings.
+void cryptoOnTarget() {
+    using namespace nowtp::crypto;
+    uint8_t out[32];
+    sha256(reinterpret_cast<const uint8_t*>("abc"), 3, out);
+    const uint8_t abc[4] = {0xba, 0x78, 0x16, 0xbf};
+    report("sha256_vector", memcmp(out, abc, 4) == 0);
+
+    uint8_t a[32] = {0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
+                     0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a};
+    uint8_t pub[32];
+    int64_t t0 = esp_timer_get_time();
+    x25519Base(pub, a);
+    int64_t x25519Us = esp_timer_get_time() - t0;
+    const uint8_t apub[4] = {0x85, 0x20, 0xf0, 0x09};
+    report("x25519_vector", memcmp(pub, apub, 4) == 0, fmt("(%lld ms)", (long long)(x25519Us / 1000)));
+
+    std::vector<uint8_t> msg(16000, 0x5a);
+    uint8_t key[32] = {1};
+    t0 = esp_timer_get_time();
+    for (int i = 0; i < 10; ++i) hmacSha256(key, sizeof(key), msg.data(), msg.size(), out);
+    int64_t us = (esp_timer_get_time() - t0) / 10;
+    report("hmac_16k_speed", us > 0, fmt("(%lld us per 16 KB = %.0f KB/s)", (long long)us, 16000.0 / 1024 / (us / 1e6)));
+}
 
 void engineOnTarget() {
     sim::Network net(42);
@@ -522,6 +548,7 @@ extern "C" void app_main() {
     printf("\nNOWTP HARDWARE TEST, ESP-NOW max frame %u, free heap %lu\n", nowtp::EspNowTransport::maxSupportedFrameSize(),
            (unsigned long)esp_get_free_heap_size());
 
+    cryptoOnTarget();
     engineOnTarget();
 
     radioSetupModes();

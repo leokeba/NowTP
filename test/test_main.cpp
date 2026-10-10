@@ -5,9 +5,14 @@
 #include <string>
 #include <vector>
 
+#include "nowtp/channel.h"
+#include "nowtp/crypto.h"
 #include "nowtp/diagnostics.h"
 #include "nowtp/discovery.h"
 #include "nowtp/engine.h"
+#include "nowtp/security.h"
+#include "nowtp/stream.h"
+#include "nowtp/timesync.h"
 #include "nowtp/wire.h"
 #include "sim.h"
 
@@ -1309,6 +1314,858 @@ TEST(diag_remote_tuning_can_be_refused) {
     CHECK(rig.diag[a]->optimize(rig.net.mac(b), OptimizeOptions(), p) == Status::Ok);
     CHECK(!p.applied);
     CHECK(rig.net.node(b).radio.peerRate(rig.net.mac(a)) == PhyRate::Default);
+}
+
+// ---------------------------------------------------------------------------
+// Crypto
+
+namespace {
+
+std::vector<uint8_t> unhex(const char* s) {
+    std::vector<uint8_t> out;
+    for (size_t i = 0; s[i] && s[i + 1]; i += 2) {
+        unsigned v = 0;
+        std::sscanf(s + i, "%2x", &v);
+        out.push_back(static_cast<uint8_t>(v));
+    }
+    return out;
+}
+
+bool sameBytes(const uint8_t* a, const std::vector<uint8_t>& b) {
+    return std::memcmp(a, b.data(), b.size()) == 0;
+}
+
+}  // namespace
+
+TEST(crypto_sha256_vectors) {
+    uint8_t out[32];
+    crypto::sha256(reinterpret_cast<const uint8_t*>("abc"), 3, out);
+    CHECK(sameBytes(out, unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")));
+    crypto::Sha256 h;
+    std::vector<uint8_t> a(1001, 'a');
+    for (int i = 0; i < 1000; ++i) h.update(a.data(), i % 2 ? 999 : 1001);  // odd chunk sizes
+    h.finish(out);
+    CHECK(sameBytes(out, unhex("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")));
+}
+
+TEST(crypto_hmac_and_hkdf_vectors) {
+    uint8_t out[42];
+    const char* msg = "what do ya want for nothing?";
+    crypto::hmacSha256(reinterpret_cast<const uint8_t*>("Jefe"), 4, reinterpret_cast<const uint8_t*>(msg),
+                       std::strlen(msg), out);
+    CHECK(sameBytes(out, unhex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")));
+    std::vector<uint8_t> longKey(131, 0xaa);
+    const char* m2 = "Test Using Larger Than Block-Size Key - Hash Key First";
+    crypto::hmacSha256(longKey.data(), longKey.size(), reinterpret_cast<const uint8_t*>(m2), std::strlen(m2), out);
+    CHECK(sameBytes(out, unhex("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")));
+
+    std::vector<uint8_t> ikm(22, 0x0b), salt, info;
+    for (uint8_t i = 0; i < 13; ++i) salt.push_back(i);
+    for (uint8_t i = 0xf0; i < 0xfa; ++i) info.push_back(i);
+    crypto::hkdf(salt.data(), salt.size(), ikm.data(), ikm.size(), info.data(), info.size(), out, 42);
+    CHECK(sameBytes(out, unhex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")));
+}
+
+TEST(crypto_x25519_vectors) {
+    auto a = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    auto b = unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    uint8_t pa[32], pb[32], s1[32], s2[32];
+    crypto::x25519Base(pa, a.data());
+    crypto::x25519Base(pb, b.data());
+    CHECK(sameBytes(pa, unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")));
+    CHECK(sameBytes(pb, unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")));
+    crypto::x25519(s1, a.data(), pb);
+    crypto::x25519(s2, b.data(), pa);
+    auto shared = unhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+    CHECK(sameBytes(s1, shared));
+    CHECK(sameBytes(s2, shared));
+    CHECK(crypto::equal(s1, s2, 32));
+    s2[31] ^= 1;
+    CHECK(!crypto::equal(s1, s2, 32));
+}
+
+// ---------------------------------------------------------------------------
+// Security
+
+namespace {
+
+std::vector<uint8_t> testKey(uint8_t seed = 0x42) {
+    std::vector<uint8_t> k(32);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = static_cast<uint8_t>(seed + i * 7);
+    return k;
+}
+
+struct SecureRig {
+    sim::Network net{21};
+    sim::Scheduler sched{net};
+    sim::Scheduler::Host host{sched};
+    std::vector<std::unique_ptr<Security>> sec;
+
+    size_t add(const std::vector<uint8_t>& key, bool require = true, const std::string& code = "") {
+        size_t i = net.addNode();
+        sec.emplace_back();
+        reboot(i, key, require, code);
+        net.tickers.push_back([this, i](uint32_t now) { sec[i]->tick(now); });
+        return i;
+    }
+    // A fresh Security object, as after a reboot: new epoch, no replay state.
+    void reboot(size_t i, const std::vector<uint8_t>& key, bool require = true, const std::string& code = "") {
+        if (sec[i]) sec[i]->stop();
+        SecurityConfig c;
+        c.key = key;
+        c.requireAuthentication = require;
+        c.pairingCode = code;
+        sec[i].reset(new Security(net.engine(i), host, net.mac(i), c));
+        sec[i]->start();
+    }
+    Status sendWait(size_t from, size_t to, uint8_t port, const std::vector<uint8_t>& data, SendOptions o) {
+        Outcome out;
+        net.engine(from).send(net.mac(to), port, data.data(), data.size(), o, out.handler(), net.now());
+        net.runUntil([&] { return out.done; }, 10000);
+        return out.done ? out.status : Status::Cancelled;
+    }
+    // Last frame `from` sent on `port`.
+    std::vector<uint8_t> lastFrame(size_t from, uint8_t port) const {
+        for (size_t i = net.log.size(); i-- > 0;) {
+            const sim::Frame& f = net.log[i];
+            wire::Header h;
+            size_t off;
+            if (f.from == from && wire::decodeHeader(f.data.data(), f.data.size(), h, off) && h.port == port &&
+                h.type != wire::Type::Ack) {
+                return f.data;
+            }
+        }
+        return std::vector<uint8_t>();
+    }
+};
+
+}  // namespace
+
+TEST(secure_messages_are_authenticated) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+
+    // The first message from a new epoch waits for a challenge; reliable delivery retries through it.
+    auto msg = pattern(100);
+    CHECK(rig.sendWait(a, b, 1, msg, reliable()) == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    CHECK(inbox.messages[0] == msg);
+    CHECK(inbox.meta[0].authenticated);
+    CHECK_EQ(rig.sec[b]->counters().epochsVerified, 1u);
+
+    auto big = pattern(5000, 3);
+    CHECK(rig.sendWait(a, b, 1, big, SendOptions()) == Status::Ok);
+    rig.net.run(20);
+    CHECK_EQ(inbox.messages.size(), 2u);
+    CHECK(inbox.messages[1] == big);
+    CHECK(inbox.meta[1].authenticated);
+
+    // Broadcast is authenticated too.
+    CHECK(rig.net.engine(a).send(Mac::broadcast(), 1, msg.data(), msg.size(), SendOptions(), nullptr,
+                                 rig.net.now()) == Status::Ok);
+    rig.net.run(20);
+    CHECK_EQ(inbox.messages.size(), 3u);
+    CHECK(inbox.meta[2].authenticated);
+    CHECK_EQ(rig.net.engine(b).stats().authRejected, 0u);
+}
+
+TEST(secure_first_unreliable_message_waits_for_epoch) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    auto msg = pattern(10);
+    rig.net.engine(a).send(rig.net.mac(b), 1, msg.data(), msg.size(), SendOptions(), nullptr, rig.net.now());
+    rig.net.run(50);
+    CHECK_EQ(inbox.messages.size(), 0u);  // held back: the epoch was unknown
+    CHECK_EQ(rig.sec[b]->counters().epochsVerified, 1u);
+    rig.net.engine(a).send(rig.net.mac(b), 1, msg.data(), msg.size(), SendOptions(), nullptr, rig.net.now());
+    rig.net.run(50);
+    CHECK_EQ(inbox.messages.size(), 1u);
+}
+
+TEST(secure_refuses_unkeyed_and_wrong_key) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey()), plain = rig.add({}), other = rig.add(testKey(7));
+    (void)a;
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    auto msg = pattern(300);
+    CHECK(rig.sendWait(plain, b, 1, msg, reliable()) == Status::Rejected);
+    CHECK(rig.sendWait(other, b, 1, msg, reliable()) == Status::AuthFailed);  // b could not verify it
+    CHECK_EQ(inbox.messages.size(), 0u);
+    CHECK(rig.net.engine(b).stats().authRejected >= 2u);
+}
+
+TEST(secure_optional_mode_marks_plain_messages) {
+    SecureRig rig;
+    size_t b = rig.add(testKey(), false), plain = rig.add({});
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(plain, b, 1, pattern(20), reliable()) == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    CHECK(!inbox.meta[0].authenticated);
+}
+
+TEST(secure_rejects_tampering_and_replays) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(40), reliable()) == Status::Ok);
+    CHECK(rig.sendWait(a, b, 1, pattern(40, 9), SendOptions()) == Status::Ok);
+    rig.net.run(10);
+    CHECK_EQ(inbox.messages.size(), 2u);
+    std::vector<uint8_t> frame = rig.lastFrame(a, 1);
+    CHECK(!frame.empty());
+
+    std::vector<uint8_t> tampered = frame;
+    tampered[wire::kCommonHeaderSize + 3] ^= 0x01;  // payload byte
+    tampered[3] ^= 0x55;                           // new message id: not a duplicate
+    rig.net.inject(b, rig.net.mac(a), tampered);
+    CHECK_EQ(inbox.messages.size(), 2u);
+
+    std::vector<uint8_t> replay = frame;
+    replay[3] ^= 0x55;  // a fresh message id slips past duplicate suppression, not past the sequence check
+    rig.net.inject(b, rig.net.mac(a), replay);
+    CHECK_EQ(inbox.messages.size(), 2u);
+    rig.net.run(6000);  // also after duplicate suppression forgot it
+    rig.net.inject(b, rig.net.mac(a), frame);
+    CHECK_EQ(inbox.messages.size(), 2u);
+    CHECK(rig.sec[b]->counters().replaysRejected >= 2u);
+    CHECK(rig.sec[b]->counters().forgeriesRejected >= 1u);
+
+    // Spoofing another node's address does not help without the key either.
+    size_t c = rig.add({});
+    std::vector<uint8_t> forged = frame;
+    forged[3] ^= 0x33;
+    rig.net.inject(b, rig.net.mac(c), forged);
+    CHECK_EQ(inbox.messages.size(), 2u);
+}
+
+TEST(secure_old_epoch_is_not_replayable_after_reboot) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(40), reliable()) == Status::Ok);
+    std::vector<uint8_t> old = rig.lastFrame(a, 1);
+
+    rig.net.run(3000);
+    rig.reboot(a, testKey());
+    CHECK(rig.sendWait(a, b, 1, pattern(41), reliable()) == Status::Ok);  // the new epoch gets verified
+    CHECK_EQ(inbox.messages.size(), 2u);
+
+    old[3] ^= 0x77;
+    rig.net.inject(b, rig.net.mac(a), old);
+    rig.net.run(3000);  // challenges come back with the new epoch only
+    rig.net.inject(b, rig.net.mac(a), old);
+    rig.net.run(500);
+    CHECK_EQ(inbox.messages.size(), 2u);
+
+    // A receiver that rebooted (no state) still refuses the old epoch.
+    rig.reboot(b, testKey());
+    rig.net.engine(b).listen(1, inbox.handler());
+    rig.net.inject(b, rig.net.mac(a), old);
+    rig.net.run(1000);
+    rig.net.inject(b, rig.net.mac(a), old);
+    rig.net.run(500);
+    CHECK_EQ(inbox.messages.size(), 2u);
+}
+
+TEST(secure_forged_acks_are_ignored) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(10), reliable()) == Status::Ok);  // epoch verified
+
+    rig.net.appLoss = 1.0;  // frames reach b's radio but never its application
+    Outcome out;
+    auto msg = pattern(10, 5);
+    rig.net.engine(a).send(rig.net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), rig.net.now());
+    rig.net.run(5);
+    std::vector<uint8_t> frame = rig.lastFrame(a, 1);
+    wire::Header h;
+    size_t off;
+    CHECK(wire::decodeHeader(frame.data(), frame.size(), h, off));
+    for (int tagged = 0; tagged < 2; ++tagged) {
+        wire::Header ack;
+        ack.type = wire::Type::Ack;
+        ack.flags = tagged ? wire::kFlagAuth : 0;
+        ack.port = 1;
+        ack.messageId = h.messageId;
+        std::vector<uint8_t> f(wire::kCommonHeaderSize);
+        wire::encodeHeader(ack, f.data());
+        f.push_back(static_cast<uint8_t>(wire::AckStatus::Complete));
+        if (tagged) f.insert(f.end(), wire::kAckTagSize, 0x5A);
+        rig.net.inject(a, rig.net.mac(b), f);
+    }
+    rig.net.runUntil([&] { return out.done; }, 5000);
+    CHECK(out.done);
+    CHECK(out.status != Status::Ok);
+    CHECK(rig.net.engine(a).stats().authRejected >= 2u);
+}
+
+TEST(pairing_hands_over_the_key) {
+    SecureRig rig;
+    size_t a = rig.add({}), b = rig.add({}), bystander = rig.add({});
+    std::vector<uint8_t> savedA, savedB;
+    rig.sec[a]->onKeyChanged([&](const std::vector<uint8_t>& k) { savedA = k; });
+    rig.sec[b]->onKeyChanged([&](const std::vector<uint8_t>& k) { savedB = k; });
+    Status ra = Status::Cancelled, rb = Status::Cancelled;
+    Mac joined = Mac::broadcast(), member = Mac::broadcast();
+    rig.sched.run({[&] { ra = rig.sec[a]->acceptPairing(8000, &joined); },
+                   [&] {
+                       rig.host.sleep(300);  // the window opens first
+                       rb = rig.sec[b]->pair(8000, &member);
+                   }});
+    CHECK(ra == Status::Ok);
+    CHECK(rb == Status::Ok);
+    CHECK(joined == rig.net.mac(b));
+    CHECK(member == rig.net.mac(a));
+    CHECK_EQ(rig.sec[a]->key().size(), 32u);
+    CHECK(rig.sec[a]->key() == rig.sec[b]->key());
+    CHECK(savedA == rig.sec[a]->key());  // created by the first member
+    CHECK(savedB == rig.sec[a]->key());
+    CHECK(rig.sec[bystander]->key().empty());
+
+    Inbox inbox;
+    rig.net.engine(a).listen(1, inbox.handler());
+    CHECK(rig.sendWait(b, a, 1, pattern(500), reliable()) == Status::Ok);
+    CHECK(inbox.meta.back().authenticated);
+    CHECK(rig.sendWait(bystander, a, 1, pattern(5), reliable()) == Status::Rejected);
+}
+
+TEST(pairing_with_existing_key_and_code) {
+    SecureRig rig;
+    size_t a = rig.add(testKey(), true, "correct horse"), b = rig.add({}, true, "correct horse");
+    Status ra = Status::Cancelled, rb = Status::Cancelled;
+    rig.sched.run({[&] { ra = rig.sec[a]->acceptPairing(8000); }, [&] { rb = rig.sec[b]->pair(8000); }});
+    CHECK(ra == Status::Ok);
+    CHECK(rb == Status::Ok);
+    CHECK(rig.sec[b]->key() == testKey());  // the installation's key, unchanged on the member
+}
+
+TEST(pairing_refuses_another_code) {
+    SecureRig rig;
+    size_t a = rig.add(testKey(), true, "1234"), b = rig.add({}, true, "9999");
+    Status ra = Status::Cancelled, rb = Status::Cancelled;
+    rig.sched.run({[&] { ra = rig.sec[a]->acceptPairing(4000); }, [&] { rb = rig.sec[b]->pair(3000); }});
+    CHECK(ra == Status::AuthFailed);
+    CHECK(rb == Status::AuthFailed);
+    CHECK(rig.sec[b]->key().empty());
+}
+
+TEST(pairing_times_out_without_member) {
+    SecureRig rig;
+    size_t b = rig.add({});
+    rig.add({});  // has no window open
+    Status rb = Status::Cancelled;
+    rig.sched.run({[&] { rb = rig.sec[b]->pair(2000); }});
+    CHECK(rb == Status::Timeout);
+}
+
+// ---------------------------------------------------------------------------
+// Channel following
+
+namespace {
+
+struct FollowRig {
+    sim::Network net{5};
+    std::mt19937 rng{3};
+    std::vector<std::unique_ptr<Discovery>> disc;
+    std::vector<std::unique_ptr<ChannelFollower>> fol;
+    std::vector<int> moves;
+
+    size_t add(uint8_t channel, bool locked, ChannelConfig cc = ChannelConfig()) {
+        size_t i = net.addNode();
+        net.node(i).radio.chan = channel;
+        net.node(i).radio.channelLocked = locked;
+        DiscoveryConfig dc;
+        dc.name = "n" + std::to_string(i);
+        dc.announceIntervalMs = 500;
+        dc.peerTimeoutMs = 1600;
+        disc.emplace_back(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
+        fol.emplace_back(new ChannelFollower(*disc.back(), net.node(i).radio, cc));
+        moves.push_back(0);
+        disc[i]->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { fol[i]->onPeerEvent(e, p, net.now()); });
+        disc[i]->onPeerMoved([this, i](const PeerInfo& p, uint8_t ch) { fol[i]->onPeerMoved(p, ch, net.now()); });
+        fol[i]->onChannelChange([this, i](uint8_t) { moves[i]++; });
+        bool anchor = cc.anchor;
+        net.tickers.push_back([this, i, anchor](uint32_t now) {
+            // What the transport does: announce the current channel and anchor state.
+            const sim::SimRadio& r = net.node(i).radio;
+            disc[i]->setChannelInfo(r.chan, anchor || r.channelLocked, now);
+            disc[i]->tick(now);
+            fol[i]->tick(now);
+        });
+        return i;
+    }
+    void start() {
+        for (size_t i = 0; i < disc.size(); ++i) {
+            disc[i]->start(net.now());
+            fol[i]->start(net.now());
+        }
+    }
+    uint8_t chan(size_t i) { return net.node(i).radio.chan; }
+};
+
+}  // namespace
+
+TEST(channel_peers_follow_announced_move) {
+    FollowRig rig;
+    size_t a = rig.add(1, false), b = rig.add(1, false), c = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    CHECK_EQ(rig.disc[b]->peers().size(), 2u);
+
+    CHECK(rig.disc[a]->announceMove(6, rig.net.now()));
+    rig.net.run(20);  // the notices go out on the old channel
+    CHECK(rig.net.node(a).radio.setChannel(6) == Status::Ok);
+    rig.fol[a]->onChannelChanged(6, rig.net.now());
+    rig.net.run(500);
+    CHECK_EQ(rig.chan(b), 6);
+    CHECK_EQ(rig.chan(c), 6);
+    CHECK_EQ(rig.disc[a]->peers().size(), 2u);
+    CHECK(rig.disc[b]->find(rig.net.mac(a)) != nullptr);
+    CHECK_EQ(rig.disc[b]->find(rig.net.mac(a))->channel, 6);
+}
+
+TEST(channel_followers_find_roaming_anchor) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), b = rig.add(1, false), c = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.disc[b]->find(rig.net.mac(master))->anchor);
+
+    // The master's station roams to an access point on channel 9, without notice.
+    rig.net.node(master).radio.chan = 9;
+    rig.fol[master]->onChannelChanged(9, rig.net.now());
+    bool followed = rig.net.runUntil([&] { return rig.chan(b) == 9 && rig.chan(c) == 9; }, 20000);
+    CHECK(followed);
+    rig.net.run(1000);
+    CHECK(rig.disc[b]->find(rig.net.mac(master)) != nullptr);
+    CHECK(rig.disc[master]->find(rig.net.mac(c)) != nullptr);
+    CHECK(rig.moves[b] >= 1);
+}
+
+TEST(channel_find_anchor_at_boot) {
+    FollowRig rig;
+    ChannelConfig find;
+    find.findAnchor = true;
+    size_t master = rig.add(11, true), node = rig.add(1, false, find);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.chan(node) == 11; }, 15000));
+    rig.net.run(500);
+    CHECK(rig.disc[node]->find(rig.net.mac(master)) != nullptr);
+}
+
+TEST(channel_moves_to_the_channel_an_anchor_states) {
+    FollowRig rig;
+    size_t master = rig.add(6, true), node = rig.add(5, false);
+    rig.start();
+    // Adjacent-channel leakage: the simulation only connects equal channels,
+    // so deliver one of the master's announcements by hand.
+    rig.net.run(600);
+    std::vector<uint8_t> hello;
+    for (size_t i = rig.net.log.size(); i-- > 0;) {
+        if (rig.net.log[i].from == master) {
+            hello = rig.net.log[i].data;
+            break;
+        }
+    }
+    CHECK(!hello.empty());
+    rig.net.inject(node, rig.net.mac(master), hello);
+    rig.net.run(10);
+    CHECK_EQ(rig.chan(node), 6);
+}
+
+TEST(channel_no_search_without_anchors) {
+    FollowRig rig;
+    size_t a = rig.add(3, false), b = rig.add(3, false);
+    rig.start();
+    rig.net.run(1000);
+    rig.net.node(b).online = false;
+    rig.net.run(30000);
+    CHECK_EQ(rig.chan(a), 3);
+    CHECK_EQ(rig.moves[a], 0);
+    CHECK(!rig.fol[a]->searching());
+}
+
+TEST(channel_search_returns_home_when_nothing_found) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.retryMs = 60000;
+    size_t master = rig.add(4, true), node = rig.add(4, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    rig.net.node(master).online = false;
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->searching(); }, 10000));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 4);
+    rig.net.node(master).online = true;  // back where it was
+    rig.net.run(1500);
+    CHECK(rig.disc[node]->find(rig.net.mac(master)) != nullptr);
+}
+
+TEST(channel_anchors_ignore_moves_and_followers_ignore_non_anchors) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), b = rig.add(1, false), c = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    rig.disc[c]->announceMove(8, rig.net.now());  // c is no anchor
+    rig.net.run(50);
+    CHECK_EQ(rig.chan(master), 1);
+    CHECK_EQ(rig.chan(b), 1);  // b follows the master, not c
+}
+
+TEST(channel_follower_pauses_while_suspended) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), b = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    rig.fol[b]->setSuspended(true, rig.net.now());
+    rig.net.node(master).online = false;
+    rig.net.run(8000);
+    CHECK(!rig.fol[b]->searching());
+    CHECK_EQ(rig.chan(b), 1);
+    (void)master;
+}
+
+TEST(discovery_reads_announcements_without_extension) {
+    // A NowTP 0.4 announcement: no channel extension.
+    std::vector<uint8_t> p = {1, 0, 0xFA, 0, 3, 'a', 'b', 'c', 1, 9};
+    Discovery::Announcement a;
+    CHECK(Discovery::parse(p.data(), p.size(), a));
+    CHECK(a.name == "abc");
+    CHECK_EQ(a.channel, 0);
+    CHECK_EQ(a.metadataLen, 1u);
+    p.push_back(1);  // anchor
+    p.push_back(11);
+    CHECK(Discovery::parse(p.data(), p.size(), a));
+    CHECK_EQ(a.channel, 11);
+    CHECK_EQ(a.extFlags, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Time synchronization
+
+namespace {
+
+struct TimeRig {
+    sim::Network net{8};
+    std::mt19937 rng{4};
+    std::vector<std::unique_ptr<Discovery>> disc;
+    std::vector<std::unique_ptr<TimeSync>> ts;
+
+    size_t add(bool reference, uint64_t clockOffsetUs, double skew) {
+        size_t i = net.addNode();
+        net.node(i).clockOffsetUs = clockOffsetUs;
+        net.node(i).clockSkew = skew;
+        DiscoveryConfig dc;
+        dc.name = "t" + std::to_string(i);
+        disc.emplace_back(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
+        TimeSyncConfig tc;
+        tc.reference = reference;
+        sim::Node* node = &net.node(i);
+        sim::Network* nw = &net;
+        ts.emplace_back(new TimeSync(net.engine(i), [node, nw] { return node->clockUs(nw->now()); }, tc));
+        disc[i]->setTimeReference(reference, 0);
+        disc[i]->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { ts[i]->onPeerEvent(e, p, net.now()); });
+        net.tickers.push_back([this, i](uint32_t now) {
+            disc[i]->tick(now);
+            ts[i]->tick(now);
+        });
+        return i;
+    }
+    void start() {
+        for (size_t i = 0; i < ts.size(); ++i) {
+            disc[i]->start(net.now());
+            ts[i]->start(net.now());
+        }
+    }
+    // Error of node i's network time against the reference's clock, µs.
+    int64_t error(size_t i, size_t ref) {
+        return static_cast<int64_t>(ts[i]->networkTime() - net.node(ref).clockUs(net.now()));
+    }
+};
+
+int64_t absValue(int64_t v) {
+    return v < 0 ? -v : v;
+}
+
+}  // namespace
+
+TEST(timesync_estimates_offset_and_drift) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 5000000000ull, 0), b = rig.add(false, 1234567890ull, 40e-6);
+    rig.start();
+    CHECK(!rig.ts[b]->synced());
+    CHECK(rig.net.runUntil([&] { return rig.ts[b]->synced(); }, 5000));
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+    CHECK(rig.ts[b]->status().reference == rig.net.mac(ref));
+    rig.net.run(60000);
+    TimeSyncStatus s = rig.ts[b]->status();
+    CHECK(s.synced);
+    CHECK(s.rounds >= 10u);
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+    CHECK(s.driftPpm < -35 && s.driftPpm > -45);  // our clock runs 40 ppm fast
+    CHECK(rig.ts[ref]->status().isReference);
+    CHECK_EQ(rig.error(ref, ref), 0);
+}
+
+TEST(timesync_drift_estimate_bridges_gaps) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 7000000000ull, 0), b = rig.add(false, 1000000ull, -100e-6);
+    rig.start();
+    rig.net.run(45000);
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+    // The reference goes quiet for 30 s: 100 ppm would drift 3 ms uncorrected.
+    rig.net.node(ref).online = false;
+    rig.net.run(30000);
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+    CHECK(rig.ts[b]->synced());
+    CHECK(rig.ts[b]->status().ageMs >= 29000u);
+}
+
+TEST(timesync_converts_both_ways) {
+    TimeRig rig;
+    rig.add(true, 3000000000ull, 0);
+    size_t b = rig.add(false, 1000ull, 25e-6);
+    rig.start();
+    rig.net.run(20000);
+    uint64_t local = rig.net.node(b).clockUs(rig.net.now()) + 500000;
+    uint64_t net = rig.ts[b]->toNetwork(local);
+    int64_t back = static_cast<int64_t>(rig.ts[b]->toLocal(net) - local);
+    CHECK(absValue(back) <= 2);
+}
+
+TEST(timesync_explicit_reference_chains) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 9000000000ull, 0), b = rig.add(false, 4000000000ull, 30e-6),
+           c = rig.add(false, 1000ull, -20e-6);
+    rig.start();
+    rig.ts[c]->setReference(rig.net.mac(b), rig.net.now());  // c only talks to b
+    rig.net.run(30000);
+    CHECK(rig.ts[c]->synced());
+    CHECK(absValue(rig.error(c, ref)) < 2000);
+}
+
+TEST(timesync_rejects_outliers_and_follows_a_jump) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 2000000000ull, 0), b = rig.add(false, 1000ull, 0);
+    rig.start();
+    rig.net.run(30000);
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+    // The reference rebooted: its clock restarted from a much smaller value.
+    rig.net.node(ref).clockOffsetUs -= 1500000000ull;
+    rig.net.run(40000);
+    CHECK(absValue(rig.error(b, ref)) < 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+
+namespace {
+
+struct StreamRig {
+    sim::Network net{13};
+    std::mt19937 rng{2};
+    std::vector<std::unique_ptr<Streams>> st;
+
+    size_t add(Config cfg = Config()) {
+        size_t i = net.addNode(cfg);
+        st.emplace_back(new Streams(net.engine(i), [this] { return static_cast<uint32_t>(rng()); }));
+        st[i]->start();
+        net.tickers.push_back([this, i](uint32_t now) { st[i]->tick(now); });
+        return i;
+    }
+};
+
+struct Received {
+    std::vector<uint8_t> data;
+    bool done = false;
+    Status status = Status::Ok;
+    StreamInfo info;
+};
+
+StreamAcceptor collectInto(Received& r, bool accept = true, size_t failAt = SIZE_MAX) {
+    return [&r, accept, failAt](const StreamInfo& info, StreamSink& sink) {
+        r.info = info;
+        if (!accept) return false;
+        sink.write = [&r, failAt](uint32_t offset, const uint8_t* d, size_t n) {
+            if (offset != r.data.size() || r.data.size() + n > failAt) return false;
+            r.data.insert(r.data.end(), d, d + n);
+            return true;
+        };
+        sink.done = [&r](Status s) {
+            r.done = true;
+            r.status = s;
+        };
+        return true;
+    };
+}
+
+}  // namespace
+
+TEST(stream_transfers_large_data_under_loss) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    rig.net.airLoss = 0.05;
+    rig.net.appLoss = 0.02;
+    Received r;
+    rig.st[b]->onIncoming(collectInto(r));
+    std::vector<uint8_t> data = pattern(300 * 1024, 11);
+    uint32_t lastRead = 0;
+    bool inOrder = true;
+    uint32_t progressCalls = 0;
+    StreamOptions o;
+    o.topic = 7;
+    o.header = {1, 2, 3};
+    o.progress = [&](uint32_t, uint32_t) { progressCalls++; };
+    Outcome out;
+    CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                          [&](uint32_t offset, uint8_t* buf, size_t n) {
+                              inOrder = inOrder && offset == lastRead;
+                              lastRead = offset + static_cast<uint32_t>(n);
+                              memcpy(buf, data.data() + offset, n);
+                              return true;
+                          },
+                          out.handler(), o, rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return out.done; }, 120000));
+    if (out.status != Status::Ok) std::printf("    stream: %s after %u of %u bytes, receiver %s\n", toString(out.status), (unsigned)r.data.size(), (unsigned)data.size(), r.done ? toString(r.status) : "busy");
+    CHECK(out.status == Status::Ok);
+    CHECK(r.done);
+    CHECK(r.status == Status::Ok);
+    CHECK(r.data == data);
+    CHECK(inOrder);
+    CHECK_EQ(r.info.topic, 7);
+    CHECK((r.info.header == std::vector<uint8_t>{1, 2, 3}));
+    CHECK_EQ(r.info.size, data.size());
+    CHECK_EQ(progressCalls, (data.size() + o.chunkSize - 1) / o.chunkSize);
+    CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    CHECK_EQ(rig.st[b]->incoming(), 0u);
+}
+
+TEST(stream_refused_or_aborted_by_receiver) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    std::vector<uint8_t> data = pattern(20000);
+    auto reader = [&](uint32_t offset, uint8_t* buf, size_t n) {
+        memcpy(buf, data.data() + offset, n);
+        return true;
+    };
+    Received refused;
+    rig.st[b]->onIncoming(collectInto(refused, false));
+    Outcome out;
+    rig.st[a]->send(rig.net.mac(b), 20000, reader, out.handler(), StreamOptions(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Rejected);
+
+    Received failing;
+    rig.st[b]->onIncoming(collectInto(failing, true, 9000));  // e.g. a flash write error
+    Outcome out2;
+    rig.st[a]->send(rig.net.mac(b), 20000, reader, out2.handler(), StreamOptions(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out2.done; }));
+    CHECK(out2.status == Status::Rejected);
+    CHECK(failing.done);
+    CHECK(failing.status == Status::Rejected);
+
+    // Nobody listening for streams at all.
+    rig.st[b]->stop();
+    Outcome out3;
+    rig.st[a]->send(rig.net.mac(b), 100, reader, out3.handler(), StreamOptions(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out3.done; }));
+    CHECK(out3.status == Status::Rejected);
+}
+
+TEST(stream_cancel_and_vanishing_peers) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    std::vector<uint8_t> data(100000, 3);
+    auto reader = [&](uint32_t offset, uint8_t* buf, size_t n) {
+        memcpy(buf, data.data() + offset, n);
+        return true;
+    };
+    Received r;
+    rig.st[b]->onIncoming(collectInto(r));
+    Outcome out;
+    uint32_t id = 0;
+    rig.st[a]->send(rig.net.mac(b), 100000, reader, out.handler(), StreamOptions(), rig.net.now(), &id);
+    rig.net.run(100);
+    CHECK(rig.st[a]->cancel(id, rig.net.now()) == Status::Ok);
+    CHECK(out.done);
+    CHECK(out.status == Status::Cancelled);
+    CHECK(rig.net.runUntil([&] { return r.done; }));
+    CHECK(r.status == Status::Cancelled);
+
+    // The receiver disappears halfway.
+    Received r2;
+    rig.st[b]->onIncoming(collectInto(r2));
+    Outcome out2;
+    rig.st[a]->send(rig.net.mac(b), 100000, reader, out2.handler(), StreamOptions(), rig.net.now());
+    rig.net.runUntil([&] { return r2.data.size() > 30000; });
+    rig.net.node(b).online = false;
+    CHECK(rig.net.runUntil([&] { return out2.done; }, 30000));
+    CHECK(out2.status != Status::Ok);
+    CHECK(rig.net.runUntil([&] { return r2.done; }, 40000));  // idle timeout on the receiver
+    CHECK(r2.status == Status::Timeout);
+}
+
+TEST(stream_validates_options) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    auto reader = [](uint32_t, uint8_t*, size_t) { return true; };
+    StreamOptions big;
+    big.chunkSize = 64 * 1024;
+    CHECK(rig.st[a]->send(rig.net.mac(b), 10, reader, nullptr, big, 0) == Status::TooLarge);
+    CHECK(rig.st[a]->send(Mac::broadcast(), 10, reader, nullptr, StreamOptions(), 0) == Status::InvalidArgument);
+    StreamOptions header;
+    header.header.resize(Streams::kMaxHeader + 1);
+    CHECK(rig.st[a]->send(rig.net.mac(b), 10, reader, nullptr, header, 0) == Status::InvalidArgument);
+}
+
+TEST(stream_over_secured_link) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Streams sa(rig.net.engine(a), [] { return 77u; }), sb(rig.net.engine(b), [] { return 78u; });
+    sa.start();
+    sb.start();
+    rig.net.tickers.push_back([&](uint32_t now) {
+        sa.tick(now);
+        sb.tick(now);
+    });
+    Received r;
+    sb.onIncoming(collectInto(r));
+    std::vector<uint8_t> data = pattern(50000, 5);
+    Outcome out;
+    sa.send(rig.net.mac(b), 50000,
+            [&](uint32_t offset, uint8_t* buf, size_t n) {
+                memcpy(buf, data.data() + offset, n);
+                return true;
+            },
+            out.handler(), StreamOptions(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out.done; }, 60000));
+    CHECK(out.status == Status::Ok);
+    CHECK(r.data == data);
+    rig.net.tickers.pop_back();
+}
+
+TEST(engine_reports_receive_timestamps) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    net.node(b).clockOffsetUs = 42000000;
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    net.run(10);
+    net.engine(a).send(net.mac(b), 1, nullptr, 0, SendOptions(), nullptr, net.now());
+    net.run(5);
+    CHECK_EQ(inbox.meta.size(), 1u);
+    CHECK(inbox.meta[0].timestampUs >= 42000000u + 10000u);
+    CHECK(!inbox.meta[0].authenticated);
 }
 
 // ---------------------------------------------------------------------------

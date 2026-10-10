@@ -19,12 +19,16 @@ ESP-NOW sends single frames of up to 250 bytes (1470 with ESP-NOW v2), with no o
   - They report what limits a link, and pick and apply the fastest reliable rate and power on both ends.
   - Deep discovery finds nodes that can't talk to us yet: another channel, network ID, protocol version, Long Range only, or a one-way link.
   - A board whose supply can't sustain full transmit power is detected, and its power lowered, automatically.
+- **Channel following.** Nodes stay on their master's channel. When the master's station roams to another access point, or the application moves the network, the other nodes follow it or search the channels for it.
+- **Authenticated messages and pairing.** With an installation key, every message is authenticated and protected against replays. A new node gets the key by pairing during a short window (X25519 key exchange, with an optional pairing code). The key is kept in NVS.
+- **Network time.** Every node estimates the reference node's clock to well under a millisecond. A master can say "start at T", and all nodes start together.
+- **Streams.** Transfers of any size, such as firmware images for OTA updates of nodes that only speak ESP-NOW. Data is pulled from a reader and pushed into a sink chunk by chunk, so the transfer is never held in memory.
 - **Radio settings with safe defaults.** Transmit power, PHY rate (1 Mbps up to 65 Mbps, plus Espressif Long Range), and the country code, all set per node or per peer. The defaults are what every ESP-NOW device understands. Settings changed on the application's Wi-Fi are restored on `end()`.
 - **Bounded memory.** Queue sizes, message size and reassembly memory are all configurable.
 - **Callbacks never run in the Wi-Fi driver task.** They run in a NowTP task, or inside `poll()` from your loop.
 - **Testable on your computer.** The protocol core has no platform dependencies and is tested on a desktop machine against a simulated lossy radio.
 
-> **Status:** early (0.4). The wire format and API may still change before 1.0.
+> **Status:** early (0.5). The wire format and API may still change before 1.0.
 
 ## Quick start (Arduino)
 
@@ -81,6 +85,10 @@ More sketches are in [examples/arduino](examples/arduino):
 - [LatestOnly](examples/arduino/LatestOnly/LatestOnly.ino), which also shows `poll()` mode
 - [RadioSettings](examples/arduino/RadioSettings/RadioSettings.ino): a faster unicast rate, a power cap and Long Range
 - [Diagnostics](examples/arduino/Diagnostics/Diagnostics.ino): diagnose and tune a link, then look for incompatible nodes
+- [ChannelFollow](examples/arduino/ChannelFollow/ChannelFollow.ino): nodes that find and follow a master connected to a Wi-Fi network
+- [SecurePairing](examples/arduino/SecurePairing/SecurePairing.ino): authenticated messages, and pairing on a button press
+- [SyncedStart](examples/arduino/SyncedStart/SyncedStart.ino): every node toggles its LED at the same instant of network time
+- [FirmwareUpdate](examples/arduino/FirmwareUpdate/FirmwareUpdate.ino): stream a node's own firmware to its peers, which install it
 
 ## ESP-IDF
 
@@ -220,6 +228,87 @@ With `enableDiscovery`, a node announces itself by broadcast on reserved port 25
 - **Reading and updating.** `peers()` returns the current list, and `setDiscoveryMetadata()` changes what this node announces.
 - **Frame size.** With `negotiateFrameSize` (on by default), unicast to a discovered peer uses the largest frame both sides support. That's 1470 bytes between two ESP-NOW v2 nodes, and 250 as soon as either side is v1.
 
+### Channel following
+
+ESP-NOW only reaches nodes on the same channel. A node connected to an access point must use the access point's channel, and that channel changes when the station roams, or when the application switches networks. With discovery enabled, NowTP keeps the other nodes with it:
+
+- **Anchors.** A node whose channel is fixed is an *anchor*: its station is connected, it runs a soft-AP, or `channel.anchor` is set. Announcements say which channel a node is on, and whether it is an anchor.
+- **Following moves.** `moveToChannel(ch)` tells peers that this node is moving, then switches. Before connecting the station to a network on another channel, `announceChannelChange(ch)` sends the same notice without switching. Nodes free to change their channel go along at once. Once a node knows anchors, it only follows anchors.
+- **Searching.** When every anchor a node knew has gone silent (after `discovery.peerTimeoutMs` plus `channel.searchAfterMs`), it searches the channels, querying each for `channel.dwellMs` (250 ms). It stops where an anchor answers. If nothing answers, it goes back to its own channel and retries after `channel.retryMs`.
+  - A node may miss frames on its own channel while it searches.
+  - With `channel.findAnchor`, a node also searches when it has never seen an anchor, for example right after boot.
+- **Noticing changes.** NowTP notices its own channel changing, for example when the access point decides, and tells the application through `onChannelChange()`.
+- **What doesn't trigger a search.** Networks without anchors never search on their own: losing a peer that is just switched off doesn't make the others wander. `searchChannels()` starts a search by hand. `channel.follow = false` turns following off.
+
+### Security and pairing
+
+Trust by MAC address is weak on a shared channel: any device can send ESP-NOW frames from any address. With an *installation key* (16–32 bytes, shared by all nodes of an installation):
+
+- **What is authenticated.** Every message is authenticated: application ports, discovery, diagnostics, time sync and streams. The tag (HMAC-SHA256) covers the content, the sender, the destination and the port.
+- **Replays.** Recorded messages can't be replayed: messages carry a sequence number, and a sender's boot epoch is checked with a challenge the first time it is seen.
+- **Acks.** Acks are authenticated too, so only a key holder can confirm a reliable message.
+- **What a key-holding node accepts.** With the default `security.requireAuthentication`, a node with a key drops everything else: messages from nodes without the key, with another key, tampered or replayed. Peers that aren't paired don't show up in discovery either. Set it to false to receive both kinds, and check `Message::authenticated`.
+- **Errors.** A reliable send to a node holding another key, or none, fails with `AuthFailed`.
+
+Getting the key onto a node:
+
+```cpp
+// On a paired node, e.g. on a button press: open a 30 s pairing window.
+transport.acceptPairing(30000);   // creates the installation key if this is the first node
+// On the new node:
+transport.pair(30000);            // finds the window, obtains the key
+```
+
+- **How pairing works.** It runs an X25519 key exchange, so an eavesdropper learns nothing.
+- **Pairing code.** Set `security.pairingCode` on both sides to keep nodes from joining the wrong installation. A short code doesn't stop an active attacker present during the window: keep windows short, or use a long random code.
+- **Other ways to install a key.** `setSecurityKey()` installs a key you provision yourself, and `forgetSecurityKey()` removes it.
+- **Storage.** The key is stored in NVS (namespace `nowtp`) and loaded by `begin()`, unless `persistSecurityKey` is false.
+- **Limits.** Content is not encrypted. Every key holder can impersonate every other: the key proves membership of the installation, not which node sent a message. Diagnostics' remote tuning is authenticated along with everything else.
+
+Costs:
+- **Size.** 17 bytes per message, plus 8 per ack.
+- **First message.** The first message from a rebooted peer waits one challenge round trip. Only reliable messages retry through it.
+- **Hashing.** A 16 KB message takes about 9–10 ms to hash on each side (ESP32 and ESP32-S3 at 160 MHz). In our tests, reliable 16 KB messages at 1 Mbps went from 100 to 70 KB/s, and small messages are barely affected.
+- **Pairing.** It takes about 1 s, mostly two X25519 operations (about 0.2 s each).
+
+
+### Network time
+
+Every node estimates the clock of a *reference* node, so an instant can be named once and acted on everywhere:
+
+```cpp
+// The master (config.timeSync.reference = true) names an instant 300 ms ahead:
+uint64_t at = transport.networkTimeUs() + 300000;
+transport.send(nowtp::Mac::broadcast(), kPortStart, &at, sizeof(at));
+// Every node, on receipt, schedules it on its own clock:
+int64_t local = transport.localTimeUs(at);   // esp_timer_get_time() at that instant
+esp_timer_start_once(timer, local - esp_timer_get_time());
+```
+
+- **Estimation.** Nodes run NTP-style exchanges with the reference: 8 per round, keeping the one with the shortest round trip. Receive times are taken in the radio driver's callback. A fit over recent rounds tracks clock drift, so the estimate holds between rounds and through short outages. Between two boards a meter apart, its offset agreed with an independent min-round-trip measurement to within 25 µs.
+- **Choosing the reference.** The reference is announced through discovery, or chosen with `setTimeReference()`. A node synchronized to the reference also answers in network time, so a node out of the reference's range can synchronize through it.
+- **Status.** `timeSyncStatus()` reports the offset, round trip, drift, and the age of the last round.
+
+### Streams
+
+`sendStream()` moves data of any size, such as a firmware image, without holding it in memory:
+- **Sending.** The sender's reader is called once per chunk, in order.
+- **Receiving.** The receiving application accepts the stream in `onStream()`, based on its topic, size and a header of up to 200 bytes (a version, a hash), and provides a sink.
+- **Delivery.** Chunks (4 KB by default) travel as reliable messages, two at a time, and are written into the sink strictly in order.
+- **Checking.** A CRC-32 over the whole stream confirms the result on both sides.
+- **Failures.** Chunks that fail are retried. A receiver that refuses or fails a write ends the stream with `Rejected`.
+
+```cpp
+transport.onStream([](const nowtp::StreamInfo& info, nowtp::StreamSink& sink) {
+    if (info.topic != kFirmware || !Update.begin(info.size)) return false;
+    sink.write = [](uint32_t, const uint8_t* d, size_t n) { return Update.write((uint8_t*)d, n) == n; };
+    sink.done = [](nowtp::Status s) { if (s == nowtp::Status::Ok && Update.end()) ESP.restart(); };
+    return true;
+});
+```
+
+The reader and the sink run in the NowTP task. A flash write there pauses other NowTP traffic briefly; reliable messages ride it out.
+
 ### Ports
 
 Every message is sent to a port (0–239; ports 240–255 are reserved, and `send()`/`listen()` reject them). `listen(port, handler)` sets that port's handler. Messages for a port with no handler are dropped, and reliable ones are answered with `Rejected`.
@@ -277,6 +366,11 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `radio.initWifi`, `radio.channel`, `radio.disablePowerSave` | true, 1, true | Radio setup (see above) |
 | `radio.txPowerDbm`, `radio.broadcastRate`, `radio.unicastRate`, `radio.longRange`, `radio.countryCode` | driver, 1 Mbps, 1 Mbps, false, driver | Power, rate and Long Range (see above) |
 | `enableDiscovery`, `discovery`, `negotiateFrameSize` | false, –, true | Discovery (see above) |
+| `channel.follow`, `channel.findAnchor`, `channel.anchor` | true, false, false | Channel following (see above) |
+| `channel.searchAfterMs`, `channel.dwellMs`, `channel.retryMs`, `channel.channels` | 2000, 250, 15000, 1–13 | Channel search timing |
+| `security.key`, `security.requireAuthentication`, `security.pairingCode`, `persistSecurityKey` | none, true, "", true | Security (see above) |
+| `enableTimeSync`, `timeSync.reference`, `timeSync.intervalMs` | true, false, 5000 | Network time (see above) |
+| `enableStreams` | true | Streams (see above) |
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |
 | `eventBufferSize` | 8 KB | Buffer between the Wi-Fi driver and NowTP |
@@ -295,6 +389,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `SendFailed` | The radio could not deliver a frame (peer unreachable) |
 | `Timeout` | No confirmation before the deadline |
 | `Rejected` | The receiver has no handler on that port, or the message is too large for it |
+| `AuthFailed` | The receiver could not verify the message: it holds another installation key, or none |
 | `Superseded` | Replaced by a newer `latestOnly` message |
 | `Cancelled` | `end()` was called |
 | `LinkError`, `NoMemory` | Driver or allocation failures |
@@ -328,6 +423,12 @@ The wire format and the reliability scheme are described in [docs/PROTOCOL.md](d
 
 - `nowtp::Engine` ([src/nowtp/engine.h](src/nowtp/engine.h)) is the protocol engine. It has no platform dependencies and does no I/O or timekeeping of its own. It runs on any `nowtp::Link`, an interface with two methods: send a frame, and report the largest frame size.
 - `nowtp::Discovery` ([src/nowtp/discovery.h](src/nowtp/discovery.h)) is the discovery service. It is also platform-independent and runs on top of an `Engine`.
+- The other services are platform-independent too, and are tested the same way:
+  - `nowtp::ChannelFollower` ([src/nowtp/channel.h](src/nowtp/channel.h))
+  - `nowtp::Security` ([src/nowtp/security.h](src/nowtp/security.h)), with portable SHA-256, HMAC, HKDF and X25519 in [src/nowtp/crypto.h](src/nowtp/crypto.h)
+  - `nowtp::TimeSync` ([src/nowtp/timesync.h](src/nowtp/timesync.h))
+  - `nowtp::Streams` ([src/nowtp/stream.h](src/nowtp/stream.h))
+  - `nowtp::Diagnostics` ([src/nowtp/diagnostics.h](src/nowtp/diagnostics.h))
 - `nowtp::EspNowTransport` ([src/nowtp/espnow_transport.h](src/nowtp/espnow_transport.h)) runs both on the ESP-NOW driver. It handles radio setup, the callbacks, locking, the NowTP task and peers.
 
 ## Development
@@ -338,7 +439,15 @@ The protocol tests run on your computer, with AddressSanitizer and UndefinedBeha
 cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
-The tests use a simulated network with configurable loss in three places: on air, in the receiver's queue, and in lost MAC acks. They cover fragmentation edge cases, loss recovery, duplicate suppression, latest-only ordering, malformed and random frames, and memory limits.
+The tests use a simulated network with configurable loss in three places: on air, in the receiver's queue, and in lost MAC acks. Each node has its own skewed clock and radio channel.
+
+- **Transport.** Fragmentation edge cases, loss recovery, duplicate suppression, latest-only ordering, malformed and random frames, and memory limits.
+- **Crypto.** Test vectors from the RFCs.
+- **Security.** Tampering, replays across reboots, and forged acks.
+- **Pairing.** Both sides run in their own threads, scheduled deterministically.
+- **Channels.** Following moves, and searching for a roaming anchor.
+- **Network time.** Accuracy and drift.
+- **Streams.** Transfers under loss.
 
 [test/hardware](test/hardware) is an ESP-IDF test firmware that needs only one board. It runs the engine on the chip and checks the ESP-NOW adapter: start and stop, frame counts, throughput, failure reporting, queue limits, cancellation, poll mode, and leaks across restarts. It prints `PASS`/`FAIL` lines on the serial console:
 
@@ -355,14 +464,20 @@ cd test/hardware && idf.py set-target esp32s3 && idf.py -p PORT flash monitor
 
 The first three phases check echo in both directions, reliable and unreliable throughput, latest-only ordering, rejection and goodbyes. A sixth phase checks deep discovery: one board hides on channel 6, then on another network ID, and the other must find it.
 
+A seventh phase covers:
+- network time, checked against an independent measurement
+- a 256 KB stream, and a refused one
+- a move to another channel that the partner follows
+- a silent channel change that the partner must search for
+- pairing, with unauthenticated messages refused before it and authenticated echo and throughput after it
+
 The tests contain no board-specific values. A board that can't sustain full power is handled by the library's own fallback and diagnosis, and that same code runs on every pair. Run the pair test with only the two boards under test running NowTP, and erase or power down the others: stray nodes running the same test firmware would confuse its sync.
 
 ## Roadmap
 
 - Continuous per-peer rate adaptation from MAC-level acknowledgements (today `optimizeLink()` tunes on demand)
-- Streaming API for very large transfers (e.g. OTA-sized payloads)
-- Following channel changes after `begin()` (e.g. a station that roams), and discovery across channels
-- Optional add-ons: authenticated pairing, persistent peers
+- Per-node keys, so that a compromised node can be excluded without re-pairing everyone; optional payload encryption
+- Persistent peer lists
 
 ## License
 

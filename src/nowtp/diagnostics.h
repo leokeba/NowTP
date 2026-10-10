@@ -7,6 +7,7 @@
 
 #include "discovery.h"
 #include "engine.h"
+#include "host.h"
 #include "radio.h"
 
 namespace nowtp {
@@ -14,20 +15,8 @@ namespace nowtp {
 /// Port used by NowTP's diagnostics service (reserved range).
 constexpr uint8_t kDiagnosticsPort = 254;
 
-/// What the blocking diagnostic procedures need from the platform.
-///
-/// The procedures run in an application task: sleep() must let the engine keep
-/// processing radio events (the NowTP task on ESP32; stepping the simulated
-/// network in host tests), and lock()/unlock() guard the engine and radio.
-class DiagnosticsHost {
-public:
-    virtual ~DiagnosticsHost() {}
-    virtual uint32_t now() = 0;
-    virtual void sleep(uint32_t ms) = 0;
-    virtual void lock() = 0;
-    virtual void unlock() = 0;
-    virtual uint32_t random() = 0;
-};
+/// Host for the blocking diagnostic procedures (see ServiceHost).
+using DiagnosticsHost = ServiceHost;
 
 /// One probing configuration: frames sent at `rate` with the sender's maximum
 /// power set to `txPowerDbm` (0 keeps the sender's current power).
@@ -199,6 +188,8 @@ public:
     void tick(uint32_t nowMs);
     /// Used by deepDiscover() to query nodes.
     void setDiscovery(Discovery* discovery) { discovery_ = discovery; }
+    /// A blocking procedure is running (it may move the radio to other channels).
+    bool busy() const { return activeProcedures_ > 0; }
 
     // --- Blocking procedures ---------------------------------------------------
 
@@ -285,11 +276,13 @@ private:
         explicit Busy(Diagnostics& diag) : d(diag) {
             d.host_.lock();
             d.localProcedures_++;
+            d.activeProcedures_++;
             d.host_.unlock();
         }
         ~Busy() {
             d.host_.lock();
             d.localProcedures_--;
+            d.activeProcedures_--;
             d.host_.unlock();
         }
     };
@@ -308,7 +301,8 @@ private:
     std::vector<Reply> replies_;  // expected replies of the running procedure
     OutgoingBurst burst_;
     int replyPowerOverrides_ = 0;
-    int localProcedures_ = 0;
+    int localProcedures_ = 0;   // dropped to 0 while yielding to a peer
+    int activeProcedures_ = 0;  // never dropped
     float replySavedPower_ = 0;
 };
 

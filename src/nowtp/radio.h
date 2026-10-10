@@ -78,6 +78,8 @@ public:
     virtual uint8_t channel() const = 0;
     /// Fails with InvalidState when an access point dictates the channel.
     virtual Status setChannel(uint8_t channel) = 0;
+    /// An access point (our station's, or our own soft-AP) dictates the channel.
+    virtual bool channelFixed() const { return false; }
 
     virtual bool longRange() const = 0;
     virtual Status setLongRange(bool enabled) = 0;

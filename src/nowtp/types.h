@@ -51,6 +51,7 @@ enum class Status : uint8_t {
     Rejected,         ///< Receiver refused the message (no listener on port, too large).
     Superseded,       ///< Replaced by a newer "latest only" message to the same peer and port.
     Cancelled,        ///< Transport stopped before the message completed.
+    AuthFailed,       ///< Authentication failed: the receiver holds another installation key, or none.
 };
 
 const char* toString(Status s);
@@ -76,10 +77,17 @@ struct Message {
     bool latestOnly;
     /// Signal strength of the last frame in dBm; 0 if the radio did not report it.
     int8_t rssi;
+    /// Verified with the installation key (see Security). Always false without one.
+    bool authenticated;
+    /// Local clock (microseconds) when the radio delivered the last frame; 0 if unknown.
+    uint64_t timestampUs;
 };
 
-/// Port used by NowTP's own discovery service. Ports 240-255 are reserved.
+/// Ports used by NowTP's own services. Ports 240-255 are reserved.
 constexpr uint8_t kDiscoveryPort = 255;
+constexpr uint8_t kSecurityPort = 253;
+constexpr uint8_t kTimeSyncPort = 252;
+constexpr uint8_t kStreamPort = 251;
 constexpr uint8_t kFirstReservedPort = 240;
 
 using ReceiveHandler = std::function<void(const Message&)>;
@@ -130,6 +138,8 @@ struct Stats {
     uint32_t messagesReceived = 0;
     uint32_t messagesDropped = 0;
     uint32_t retransmissions = 0;
+    /// Messages dropped because authentication failed or was missing.
+    uint32_t authRejected = 0;
 };
 
 }  // namespace nowtp

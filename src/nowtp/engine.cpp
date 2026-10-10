@@ -49,6 +49,7 @@ const char* toString(Status s) {
         case Status::Rejected: return "Rejected";
         case Status::Superseded: return "Superseded";
         case Status::Cancelled: return "Cancelled";
+        case Status::AuthFailed: return "AuthFailed";
     }
     return "Unknown";
 }
@@ -100,6 +101,7 @@ struct Engine::RxMessage {
     size_t reserved = 0;  // bytes counted in rxBytes_
     uint32_t lastActivity = 0;
     int8_t rssi = 0;
+    uint64_t timeUs = 0;
 
     bool has(uint16_t i) const { return (bitmap[i >> 3] >> (i & 7)) & 1; }
     void mark(uint16_t i) { bitmap[i >> 3] |= static_cast<uint8_t>(1u << (i & 7)); }
@@ -115,9 +117,10 @@ Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
 
 Engine::~Engine() = default;
 
-size_t Engine::singleFramePayload(const Mac& dst) const {
+size_t Engine::singleFramePayload(const Mac& dst, uint8_t port) const {
     size_t mtu = link_.maxFrameSize(dst);
-    return mtu > kCommonHeaderSize ? mtu - kCommonHeaderSize : 0;
+    size_t overhead = kCommonHeaderSize + (auth_ && auth_->sealing(port) ? kAuthTrailerSize : 0);
+    return mtu > overhead ? mtu - overhead : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,13 +140,16 @@ Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t le
     tx->dst = dst;
     tx->port = port;
     tx->flags = static_cast<uint8_t>((options.reliable ? kFlagReliable : 0) | (options.latestOnly ? kFlagLatest : 0));
+    // Authenticated messages carry a trailer after the payload (see Security).
+    size_t trailer = auth_ && auth_->sealing(port) ? kAuthTrailerSize : 0;
+    size_t payloadLen = len + trailer;
 
-    if (len <= mtu - kCommonHeaderSize) {
+    if (payloadLen <= mtu - kCommonHeaderSize) {
         tx->count = 1;
-        tx->streamLen = len;
+        tx->streamLen = payloadLen;
     } else {
         tx->fragSize = static_cast<uint16_t>(mtu - kFragmentHeaderSize);
-        tx->streamLen = len + kCrcSize;
+        tx->streamLen = payloadLen + kCrcSize;
         size_t count = (tx->streamLen + tx->fragSize - 1) / tx->fragSize;
         if (count > 0xFFFF) return Status::TooLarge;
         tx->count = static_cast<uint16_t>(count);
@@ -173,7 +179,11 @@ Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t le
         return Status::NoMemory;
     }
     if (len > 0) memcpy(tx->stream.get(), data, len);
-    if (tx->count > 1) putU32(tx->stream.get() + len, crc32(data, len));
+    if (trailer) {
+        auth_->seal(dst, port, tx->flags, data, len, tx->stream.get() + len);
+        tx->flags = static_cast<uint8_t>(tx->flags | kFlagAuth);
+    }
+    if (tx->count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
 
     tx->id = nextId_++;
     tx->deadline = now + (options.timeoutMs ? options.timeoutMs : config_.sendTimeoutMs);
@@ -412,7 +422,8 @@ bool Engine::hasListener(uint8_t port) const {
     return false;
 }
 
-void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi) {
+void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
+                     uint64_t timestampUs, bool authenticated) {
     ReceiveHandler handler;
     for (const auto& l : listeners_) {
         if (l.first == port) {
@@ -433,12 +444,42 @@ void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t*
     m.reliable = (flags & kFlagReliable) != 0;
     m.latestOnly = (flags & kFlagLatest) != 0;
     m.rssi = rssi;
+    m.authenticated = authenticated;
+    m.timestampUs = timestampUs;
     handler(m);
 }
 
-void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t now, int8_t rssi) {
+// Splits off and checks an authentication trailer. `len` shrinks to the
+// application payload.
+Engine::Auth Engine::authorize(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t& len,
+                               bool& authenticated, uint32_t now) {
+    authenticated = false;
+    const uint8_t* trailer = nullptr;
+    if (flags & kFlagAuth) {
+        if (len < kAuthTrailerSize) return Auth::Reject;
+        len -= kAuthTrailerSize;
+        trailer = data + len;
+    }
+    if (!auth_) return Auth::Accept;  // no key: an authenticated message is delivered as a plain one
+    switch (auth_->open(src, port, static_cast<uint8_t>(flags & (kFlagReliable | kFlagLatest)), data, len, trailer,
+                        now)) {
+        case Authenticator::Verdict::Authentic:
+            authenticated = trailer != nullptr;
+            return Auth::Accept;
+        case Authenticator::Verdict::Unauthenticated: return Auth::Accept;
+        case Authenticator::Verdict::Retry: return Auth::Retry;
+        case Authenticator::Verdict::Reject: break;
+    }
+    stats_.authRejected++;
+    stats_.messagesDropped++;
+    return Auth::Reject;
+}
+
+void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t now, int8_t rssi,
+                             uint64_t timestampUs) {
     stats_.framesReceived++;
     rxRssi_ = rssi;
+    rxTimeUs_ = timestampUs;
     Header h;
     size_t off = 0;
     bool decoded = data != nullptr && decodeHeader(data, len, h, off);
@@ -488,12 +529,19 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
 
     // Also catches unreliable duplicates: the radio resends a frame whose MAC ack was lost.
     if (isRecent(src, h.messageId, now)) {
-        if (ackRequest) queueAck(src, h.port, h.messageId, AckStatus::Complete, nullptr);
+        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
         return;
     }
     if (!hasListener(h.port)) {
         stats_.messagesDropped++;
-        if (reliable) queueAck(src, h.port, h.messageId, AckStatus::Rejected, nullptr);
+        if (reliable) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
+        return;
+    }
+    bool authenticated = false;
+    Auth auth = authorize(src, h.port, h.flags, payload, len, authenticated, now);
+    if (auth != Auth::Accept) {
+        // Untagged: the sender may hold another key, or none.
+        if (auth == Auth::Reject && reliable) queueAck(src, h.port, h.messageId, 0, AckStatus::Rejected, nullptr);
         return;
     }
     if (latest) {
@@ -504,8 +552,8 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
         dropOlderLatest(src, h.port, h.messageId);
     }
     remember(src, h.port, h.flags, h.messageId, now);
-    if (ackRequest) queueAck(src, h.port, h.messageId, AckStatus::Complete, nullptr);
-    deliver(src, h.port, h.flags, payload, len, rxRssi_);
+    if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
+    deliver(src, h.port, h.flags, payload, len, rxRssi_, rxTimeUs_, authenticated);
 }
 
 void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
@@ -514,7 +562,7 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
     bool ackRequest = reliable && (h.flags & kFlagAckRequest) != 0;
 
     if (isRecent(src, h.messageId, now)) {
-        if (ackRequest) queueAck(src, h.port, h.messageId, AckStatus::Complete, nullptr);
+        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
         return;
     }
 
@@ -528,9 +576,9 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
 
     if (!rx) {
         // Every fragment carries at least one byte, so `count` bounds the size.
-        if (!hasListener(h.port) || static_cast<size_t>(h.count) > config_.maxMessageSize + kCrcSize) {
+        if (!hasListener(h.port) || static_cast<size_t>(h.count) > maxStream()) {
             stats_.messagesDropped++;
-            if (reliable) queueAck(src, h.port, h.messageId, AckStatus::Rejected, nullptr);
+            if (reliable) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
             return;
         }
         if (latest) {
@@ -561,7 +609,7 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
         }
         created->src = src;
         created->port = h.port;
-        created->flags = static_cast<uint8_t>(h.flags & (kFlagReliable | kFlagLatest));
+        created->flags = static_cast<uint8_t>(h.flags & (kFlagReliable | kFlagLatest | kFlagAuth));
         created->id = h.messageId;
         created->count = h.count;
         created->bitmap.assign(bitmapBytes, 0);
@@ -572,12 +620,13 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
 
     rx->lastActivity = now;
     rx->rssi = rxRssi_;
+    rx->timeUs = rxTimeUs_;
     if (!rx->has(h.index)) {
         Place result = placeFragment(*rx, h.index, payload, len);
         if (result != Place::Ok) {
             if (result == Place::Invalid) stats_.framesInvalid++;
             if (result == Place::TooLarge && reliable) {
-                queueAck(src, h.port, h.messageId, AckStatus::Rejected, nullptr);
+                queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
             }
             dropRx(rx);  // on NoMemory a reliable sender retries later
             return;
@@ -589,7 +638,7 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
     if (rx->received == rx->count) {
         completeRx(rx, now);
     } else if (ackRequest) {
-        queueAck(src, h.port, h.messageId, AckStatus::Missing, rx);
+        queueAck(src, h.port, h.messageId, h.flags, AckStatus::Missing, rx);
     }
 }
 
@@ -625,7 +674,7 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
     if (!rx.stashedLast.empty() && rx.stashedLast.size() > fragSize) return Place::Invalid;
     // Smallest possible stream: full fragments plus a 1-byte last one.
     size_t minStream = static_cast<size_t>(rx.count - 1) * fragSize + 1;
-    if (minStream > config_.maxMessageSize + kCrcSize) return Place::TooLarge;
+    if (minStream > maxStream()) return Place::TooLarge;
 
     size_t capacity = static_cast<size_t>(rx.count) * fragSize;
     if (!reserveRx(capacity, &rx)) return Place::NoMemory;
@@ -694,17 +743,30 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
     }
     size_t len = total - kCrcSize;
     const uint8_t* data = owned->buf.get();
-    if (len > config_.maxMessageSize || crc32(data, len) != getU32(data + len)) {
+    if (len > config_.maxMessageSize + kAuthTrailerSize || crc32(data, len) != getU32(data + len)) {
         stats_.messagesDropped++;
         return;  // corrupt or mixed-up fragments; a reliable sender will retry
     }
 
     bool reliable = (owned->flags & kFlagReliable) != 0;
+    bool authenticated = false;
+    Auth auth = authorize(owned->src, owned->port, owned->flags, data, len, authenticated, now);
+    if (auth != Auth::Accept) {
+        // On Retry the sender's probe rebuilds the message once its epoch is verified.
+        if (auth == Auth::Reject && reliable) {
+            queueAck(owned->src, owned->port, owned->id, 0, AckStatus::Rejected, nullptr);
+        }
+        return;
+    }
+    if (len > config_.maxMessageSize) {
+        stats_.messagesDropped++;
+        return;
+    }
     remember(owned->src, owned->port, owned->flags, owned->id, now);
     if (reliable) {
-        queueAck(owned->src, owned->port, owned->id, AckStatus::Complete, nullptr);
+        queueAck(owned->src, owned->port, owned->id, owned->flags, AckStatus::Complete, nullptr);
     }
-    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi);
+    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated);
 }
 
 void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
@@ -722,6 +784,27 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
     }
     if (!tx) return;  // already finished, or not ours
 
+    if (tx->flags & kFlagAuth) {
+        // Only a holder of the key may confirm an authenticated message. An
+        // untagged refusal means the receiver could not verify it: another
+        // key, or none. Forging one achieves no more than jamming would.
+        if (!(h.flags & kFlagAuth)) {
+            if (static_cast<AckStatus>(payload[0]) == AckStatus::Rejected) {
+                finish(tx, Status::AuthFailed);
+            } else {
+                stats_.authRejected++;
+            }
+            return;
+        }
+        const uint8_t* frame = payload - kCommonHeaderSize;
+        if (!auth_ || len < 1 + kAckTagSize ||
+            !auth_->openAck(src, frame, kCommonHeaderSize + len - kAckTagSize, payload + len - kAckTagSize)) {
+            stats_.authRejected++;
+            return;
+        }
+        len -= kAckTagSize;
+    }
+
     switch (static_cast<AckStatus>(payload[0])) {
         case AckStatus::Complete: finish(tx, Status::Ok); break;
         case AckStatus::Rejected: finish(tx, Status::Rejected); break;
@@ -733,9 +816,12 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
     }
 }
 
-void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, AckStatus status, const RxMessage* missing) {
+void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, AckStatus status,
+                      const RxMessage* missing) {
+    bool tagged = (flags & kFlagAuth) && auth_ && auth_->sealing(port);
     size_t mtu = link_.maxFrameSize(dst);
-    if (mtu < kAckHeaderSize) return;
+    if (mtu < kAckHeaderSize + kAckTagSize) return;
+    size_t room = tagged ? mtu - kAckTagSize : mtu;
 
     Control c;
     c.dst = dst;
@@ -743,17 +829,22 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, AckStatus statu
     c.frame.resize(mtu);
     Header h;
     h.type = Type::Ack;
+    h.flags = tagged ? kFlagAuth : 0;
     h.networkId = config_.networkId;
     h.port = port;
     h.messageId = id;
     size_t off = encodeHeader(h, c.frame.data());
     c.frame[off++] = static_cast<uint8_t>(status);
     if (missing) {
-        for (uint16_t i = 0; i < missing->count && off + 2 <= mtu; ++i) {
+        for (uint16_t i = 0; i < missing->count && off + 2 <= room; ++i) {
             if (missing->has(i)) continue;
             putU16(c.frame.data() + off, i);
             off += 2;
         }
+    }
+    if (tagged) {
+        auth_->sealAck(dst, c.frame.data(), off, c.frame.data() + off);
+        off += kAckTagSize;
     }
     c.frame.resize(off);
 

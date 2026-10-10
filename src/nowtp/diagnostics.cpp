@@ -886,6 +886,7 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         bool longRangePass = false;
         std::vector<DiscoveredNode> nodes;
         std::vector<Mac> foreign;
+        std::vector<Mac> stated;  // announced their channel: no guessing needed
         std::vector<bool> heardWithoutLr;
     };
     std::shared_ptr<Scan> scan(new Scan());
@@ -910,6 +911,7 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
             if (x.mac == f.src) n = &x;
         }
         bool onHome = scan->channel == scan->home;
+        bool stated = std::find(scan->stated.begin(), scan->stated.end(), f.src) != scan->stated.end();
         if (!n) {
             scan->nodes.push_back(DiscoveredNode());
             n = &scan->nodes.back();
@@ -917,7 +919,7 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
             n->channel = scan->channel;
             n->rssi = f.rssi;
             n->longRangeOnly = scan->longRangePass;
-        } else if (!n->heardOnHome && f.rssi != 0 && f.rssi > n->rssi && !scan->longRangePass) {
+        } else if (!stated && !n->heardOnHome && f.rssi != 0 && f.rssi > n->rssi && !scan->longRangePass) {
             // Strong signals leak into adjacent channels: keep the strongest.
             n->channel = scan->channel;
             n->rssi = f.rssi;
@@ -926,7 +928,7 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         // scanning other channels itself when we heard it elsewhere).
         if (onHome && !n->heardOnHome) {
             n->heardOnHome = true;
-            n->channel = scan->home;
+            if (!stated) n->channel = scan->home;
             n->rssi = f.rssi;
         }
         if (!scan->longRangePass) n->longRangeOnly = false;
@@ -934,11 +936,15 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         n->protocolVersion = f.version;
         n->networkId = f.header.networkId;
         if (f.header.type == wire::Type::Single && f.header.port == kDiscoveryPort) {
-            std::string name;
-            uint16_t maxFrame = 0;
-            if (Discovery::parseAnnouncement(f.payload, f.payloadLen, name, maxFrame)) {
-                n->name = name;
-                n->maxFrameSize = maxFrame;
+            Discovery::Announcement a;
+            if (Discovery::parse(f.payload, f.payloadLen, a)) {
+                n->name = a.name;
+                n->maxFrameSize = a.maxFrameSize;
+                if (a.channel != 0) {
+                    // Nodes since 0.5 say which channel they are on.
+                    n->channel = a.channel;
+                    if (!stated) scan->stated.push_back(f.src);
+                }
             }
         }
     });

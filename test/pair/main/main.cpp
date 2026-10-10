@@ -8,6 +8,8 @@
 //   1. nothing initialized: NowTP brings Wi-Fi up and down itself
 //   2. application-started station, not connected, on channel 3
 //   3. driver runs a soft-AP on channel 6, responder is a station connected to it
+// then radio settings, Long Range interop and deep discovery (phases 4-6), and
+// network time, streams, channel following and pairing (phase 7).
 //
 // Both boards print "PASS"/"FAIL" lines and finally "DONE pass=<n> fail=<n>".
 #include <stdarg.h>
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "NowTP.h"
+#include "nowtp/crypto.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -42,6 +45,7 @@ constexpr uint8_t kEchoReply = 11;
 constexpr uint8_t kBulk = 13;        // responder counts messages and bytes
 constexpr uint8_t kLatest = 14;      // responder checks sequence numbers
 constexpr uint8_t kStats = 15;       // query/reply responder counters (and reset them)
+constexpr uint8_t kTimeProbe = 16;   // responder answers with its receive and send times
 constexpr uint8_t kNoListener = 20;  // nobody listens
 
 constexpr const char* kApSsid = "NOWTP-PAIR";
@@ -194,6 +198,7 @@ void listenResponder() {
 SemaphoreHandle_t g_echoSem;
 std::mutex g_echoMutex;
 std::vector<uint8_t> g_echoData;
+bool g_echoAuthenticated = false;
 SemaphoreHandle_t g_statsSem;
 Counters g_statsReply;
 
@@ -202,6 +207,7 @@ void listenDriver() {
         {
             std::lock_guard<std::mutex> lock(g_echoMutex);
             g_echoData.assign(m.data, m.data + m.len);
+            g_echoAuthenticated = m.authenticated;
         }
         xSemaphoreGive(g_echoSem);
     });
@@ -736,11 +742,200 @@ void phaseDeepDiscovery() {
     if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7: network time, streams, channel following, pairing
+
+constexpr uint8_t kStreamTopic = 1;
+
+uint8_t streamByte(uint32_t offset) {
+    return static_cast<uint8_t>((offset * 2654435761u) >> 24);
+}
+
+// Responder: answers time probes and takes streams on kStreamTopic, checking every byte.
+void listenPhase7Responder() {
+    transport.listen(kTimeProbe, [](const nowtp::Message& m) {
+        if (m.len != 8) return;
+        uint8_t out[24];
+        memcpy(out, m.data, 8);
+        int64_t t2 = static_cast<int64_t>(m.timestampUs), t3 = esp_timer_get_time();
+        memcpy(out + 8, &t2, 8);
+        memcpy(out + 16, &t3, 8);
+        transport.send(m.src, kTimeProbe, out, sizeof(out));
+    });
+    transport.onStream([](const nowtp::StreamInfo& info, nowtp::StreamSink& sink) {
+        if (info.topic != kStreamTopic) return false;
+        sink.write = [](uint32_t offset, const uint8_t* d, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                if (d[i] != streamByte(offset + static_cast<uint32_t>(i))) return false;
+            }
+            return true;
+        };
+        return true;
+    });
+}
+
+SemaphoreHandle_t g_probeSem;
+uint8_t g_probeReply[24];
+int64_t g_probeT4;
+
+void driverTimeSync(const Mac& peer) {
+    bool synced = waitFor([] { return transport.timeSyncStatus().synced; }, 10000);
+    vTaskDelay(pdMS_TO_TICKS(8000));  // a few rounds, and a first drift estimate
+    nowtp::TimeSyncStatus s = transport.timeSyncStatus();
+
+    // Independent check through the application's own messages: the
+    // exchange with the shortest round trip gives the offset.
+    transport.listen(kTimeProbe, [](const nowtp::Message& m) {
+        if (m.len != 24) return;
+        memcpy(g_probeReply, m.data, 24);
+        g_probeT4 = static_cast<int64_t>(m.timestampUs);
+        xSemaphoreGive(g_probeSem);
+    });
+    int64_t bestRtt = INT64_MAX, bestOffset = 0, offsetAtBest = 0;
+    for (int i = 0; i < 30; ++i) {
+        xSemaphoreTake(g_probeSem, 0);
+        int64_t t1 = esp_timer_get_time();
+        transport.send(peer, kTimeProbe, &t1, sizeof(t1));
+        if (xSemaphoreTake(g_probeSem, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+        int64_t e1, t2, t3;
+        memcpy(&e1, g_probeReply, 8);
+        memcpy(&t2, g_probeReply + 8, 8);
+        memcpy(&t3, g_probeReply + 16, 8);
+        int64_t rtt = (g_probeT4 - e1) - (t3 - t2);
+        if (e1 == t1 && rtt >= 0 && rtt < bestRtt) {
+            bestRtt = rtt;
+            bestOffset = ((t2 - e1) + (t3 - g_probeT4)) / 2;
+            offsetAtBest = transport.timeSyncStatus().offsetUs;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    int64_t diff = bestOffset - offsetAtBest;
+    report("time_sync", synced && s.synced && s.reference == peer && bestRtt < INT64_MAX && diff < 300 && diff > -300,
+           fmt("(offset %lld us, round trip %u us, drift %.1f ppm; probe offset differs by %lld us, rtt %lld us)",
+               (long long)s.offsetUs, (unsigned)s.roundTripUs, s.driftPpm, (long long)diff, (long long)bestRtt));
+}
+
+void driverStreams(const Mac& peer) {
+    const uint32_t size = 256 * 1024;
+    std::atomic<int> result{-1};
+    int64_t t0 = millis();
+    nowtp::StreamOptions o;
+    o.topic = kStreamTopic;
+    Status st = transport.sendStream(
+        peer, size,
+        [](uint32_t offset, uint8_t* buf, size_t n) {
+            for (size_t i = 0; i < n; ++i) buf[i] = streamByte(offset + static_cast<uint32_t>(i));
+            return true;
+        },
+        [&](Status s) { result = static_cast<int>(s); }, o);
+    bool done = st == Status::Ok && waitFor([&] { return result.load() >= 0; }, 60000);
+    int64_t ms = millis() - t0;
+    Status outcome = done ? static_cast<Status>(result.load()) : st;
+    report("stream_256k", outcome == Status::Ok,
+           fmt("(%s in %lld ms = %.1f KB/s)", nowtp::toString(outcome), (long long)ms,
+               ms > 0 ? size / 1024.0 / (ms / 1000.0) : 0.0));
+
+    result = -1;
+    o.topic = 99;  // the responder refuses this topic
+    st = transport.sendStream(peer, 1000, [](uint32_t, uint8_t*, size_t) { return true; },
+                              [&](Status s) { result = static_cast<int>(s); }, o);
+    done = st == Status::Ok && waitFor([&] { return result.load() >= 0; }, 15000);
+    outcome = done ? static_cast<Status>(result.load()) : st;
+    report("stream_refused", outcome == Status::Rejected, nowtp::toString(outcome));
+}
+
+bool peerOnChannel(uint8_t ch) {
+    std::lock_guard<std::mutex> lock(g_peerMutex);
+    return g_peerPresent && g_peer.channel == ch;
+}
+
+void driverChannelFollow(const Mac& peer) {
+    int64_t t0 = millis();
+    Status st = transport.moveToChannel(6);
+    bool followed = st == Status::Ok && waitFor([] { return peerOnChannel(6); }, 5000);
+    report("channel_move_followed", followed,
+           fmt("(%s, peer on channel 6 after %lld ms)", nowtp::toString(st), (long long)(millis() - t0)));
+    if (followed) echoTest(peer, "echo_after_move", 2000, true);
+
+    // The channel changes under us without notice, as when a station roams:
+    // the responder loses its anchor and must search for it.
+    t0 = millis();
+    esp_wifi_set_channel(11, WIFI_SECOND_CHAN_NONE);
+    followed = waitFor([] { return peerOnChannel(11); }, 30000);
+    report("channel_search_finds_anchor", followed && transport.radioInfo().channel == 11,
+           fmt("(found again after %lld ms)", (long long)(millis() - t0)));
+    if (followed) echoTest(peer, "echo_after_search", 2000, true);
+}
+
+void driverPairing(const Mac& peer) {
+    uint8_t priv[32] = {1}, pub[32];
+    int64_t t0 = esp_timer_get_time();
+    nowtp::crypto::x25519Base(pub, priv);
+    printf("INFO x25519 takes %lld ms\n", (long long)((esp_timer_get_time() - t0) / 1000));
+
+    std::string req = "p7-pair";
+    transport.setDiscoveryMetadata(req.data(), req.size());
+    bool open = waitFor([] { return peerMeta() == "p7-window"; }, 10000);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    nowtp::SendOptions rel;
+    rel.reliable = true;
+    Status st = transport.sendAndWait(peer, kBulk, "x", 1, rel);
+    report("unauthenticated_message_refused", open && st == Status::Rejected, nowtp::toString(st));
+
+    Mac member;
+    t0 = millis();
+    st = transport.pair(20000, &member);
+    report("pairing", st == Status::Ok && member == peer && transport.secured(),
+           fmt("(%s in %lld ms)", nowtp::toString(st), (long long)(millis() - t0)));
+    if (st != Status::Ok) return;
+    echoTest(peer, "echo_authenticated", 3000, true);
+    bool authenticated;
+    {
+        std::lock_guard<std::mutex> lock(g_echoMutex);
+        authenticated = g_echoAuthenticated;
+    }
+    report("echo_reply_authenticated", authenticated);
+    int ok = 0;
+    int64_t ms = pipelined(peer, kBulk, 16000, 20, true, &ok);
+    report("authenticated_throughput", ms > 0 && ok == 20,
+           fmt("(20 x 16000 B in %lld ms = %.1f KB/s)", (long long)ms,
+               ms > 0 ? 20 * 16000.0 / 1024 / (ms / 1000.0) : 0.0));
+}
+
+void phaseNewFeatures() {
+    nowtp::EspNowConfig cfg = baseConfig("p7");
+    cfg.timeSync.reference = !g_driver;  // the responder's clock is the network time
+    cfg.channel.anchor = g_driver;       // the responder follows the driver
+    cfg.persistSecurityKey = false;
+    listenAll();
+    if (!g_driver) listenPhase7Responder();
+    if (!startPhase("p7", cfg)) return;
+    if (g_driver) {
+        Mac peer = peerInfo().mac;
+        driverTimeSync(peer);
+        driverStreams(peer);
+        driverChannelFollow(peer);
+        driverPairing(peer);
+    } else {
+        waitFor([] { return peerMeta() == "p7-pair" || peerMeta() == "p7-done"; }, 120000);
+        if (peerMeta() == "p7-pair") {
+            std::string w = "p7-window";
+            transport.setDiscoveryMetadata(w.data(), w.size());
+            Mac joined;
+            Status st = transport.acceptPairing(20000, &joined);
+            report("pairing_window", st == Status::Ok && joined == g_peerMac, nowtp::toString(st));
+        }
+    }
+    finishPhase("p7");
+    transport.onStream(nullptr);
+}
+
 }  // namespace
 
 extern "C" void app_main() {
     g_echoSem = xSemaphoreCreateBinary();
     g_statsSem = xSemaphoreCreateBinary();
+    g_probeSem = xSemaphoreCreateBinary();
     vTaskDelay(pdMS_TO_TICKS(1500));
     printf("\nNOWTP PAIR TEST\n");
 
@@ -751,6 +946,7 @@ extern "C" void app_main() {
         phaseRadioSettings();
         phaseLongRangeInterop();
         phaseDeepDiscovery();
+        phaseNewFeatures();
     }
     printf("DONE pass=%d fail=%d\n", g_pass, g_fail);
     for (;;) vTaskDelay(portMAX_DELAY);
