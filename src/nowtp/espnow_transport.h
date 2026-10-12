@@ -4,6 +4,7 @@
 
 #if defined(ESP_PLATFORM)
 
+#include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "security.h"
 #include "stream.h"
 #include "timesync.h"
+#include "esp_event.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -314,6 +316,8 @@ private:
     Status applyTxPower(float dbm);
     Status applyPeerRate(const Mac& mac);
     void releaseRadio();
+    static void wifiEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data);
+    bool stationConnected() const;
     void handlePeerEvent(PeerEvent event, const PeerInfo& peer);
     class Host;
     Status diagnosticsReady() const;
@@ -403,6 +407,10 @@ private:
     bool ownsWifiInit_ = false;
     bool ownsWifiStart_ = false;
     bool ownsEventLoop_ = false;
+    // Station association, followed from Wi-Fi events: querying the driver logs a
+    // warning on every call while the station is not associated.
+    esp_event_handler_instance_t wifiEvents_ = nullptr;
+    std::atomic<bool> staConnected_{false};
     bool ratesChanged_ = false;
 };
 

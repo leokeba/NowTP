@@ -767,11 +767,18 @@ Status EspNowTransport::prepareRadio() {
         ownsWifiStart_ = true;
     }
 
+    // Follow the station's association from events, then read where it stands now.
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &EspNowTransport::wifiEventHandler,
+                                              this, &wifiEvents_);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "no Wi-Fi event handler (%s): polling the station", esp_err_to_name(err));
+        wifiEvents_ = nullptr;
+    }
     wifi_ap_record_t ap;
+    staConnected_ = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
     radio_.wifiStartedByNowTP = ownsWifiInit_ || ownsWifiStart_;
     radio_.softApActive = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
-    radio_.stationConnected =
-        (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    radio_.stationConnected = staConnected_;
     interface_ = mode == WIFI_MODE_AP ? WIFI_IF_AP : WIFI_IF_STA;
     radio_.interface = interface_;
 
@@ -831,7 +838,28 @@ Status EspNowTransport::prepareRadio() {
     return Status::Ok;
 }
 
+void EspNowTransport::wifiEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data) {
+    (void)base;
+    (void)data;
+    EspNowTransport* self = static_cast<EspNowTransport*>(arg);
+    if (id == WIFI_EVENT_STA_CONNECTED) {
+        self->staConnected_ = true;
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED || id == WIFI_EVENT_STA_STOP) {
+        self->staConnected_ = false;
+    }
+}
+
+bool EspNowTransport::stationConnected() const {
+    if (wifiEvents_) return staConnected_;
+    wifi_ap_record_t ap;
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+}
+
 void EspNowTransport::releaseRadio() {
+    if (wifiEvents_) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEvents_);
+        wifiEvents_ = nullptr;
+    }
     // Hand the application's Wi-Fi back as it was.
     if (!ownsWifiInit_) {
         if (saved_.txPower) esp_wifi_set_max_tx_power(saved_.txPowerQuarterDbm);
@@ -1194,8 +1222,7 @@ bool EspNowTransport::channelFixed() const {
     wifi_mode_t mode = WIFI_MODE_NULL;
     if (esp_wifi_get_mode(&mode) != ESP_OK) return false;
     if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) return true;
-    wifi_ap_record_t ap;
-    return mode == WIFI_MODE_STA && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    return mode == WIFI_MODE_STA && stationConnected();
 }
 
 Status EspNowTransport::setChannel(uint8_t ch) {
@@ -1385,10 +1412,8 @@ void EspNowTransport::pollChannel(uint32_t now) {
     radio_.channel = ch;
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_wifi_get_mode(&mode);
-    wifi_ap_record_t ap;
     radio_.softApActive = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
-    radio_.stationConnected =
-        (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    radio_.stationConnected = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && stationConnected();
     if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor || fixed, now);
     if (follower_) follower_->onChannelChanged(ch, now);
     if (channelHandler_) {
