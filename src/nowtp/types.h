@@ -67,7 +67,8 @@ struct SendOptions {
     uint32_t timeoutMs = 0;
 };
 
-/// A received message. `data` is only valid during the receive callback.
+/// A received message. `data` is only valid during the receive callback,
+/// unless the handler takes `buffer`.
 struct Message {
     Mac src;
     uint8_t port;
@@ -81,6 +82,13 @@ struct Message {
     bool authenticated;
     /// Local clock (microseconds) when the radio delivered the last frame; 0 if unknown.
     uint64_t timestampUs;
+    /// For a message reassembled from several frames: the malloc()ed buffer
+    /// that `data` points to the start of. A handler keeps the message without
+    /// copying by setting this to nullptr; it then owns the buffer, `data`
+    /// stays valid, and it must free() the buffer itself. Otherwise NowTP frees
+    /// it after the handler. Null for a single-frame message (`data` points
+    /// into the frame), which must be copied to be kept.
+    mutable uint8_t* buffer = nullptr;
 };
 
 /// Ports used by NowTP's own services. Ports 240-255 are reserved.

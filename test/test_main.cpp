@@ -1,5 +1,6 @@
 // Host-side tests for the NowTP protocol engine.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -280,6 +281,30 @@ TEST(boundary_sizes_roundtrip) {
         CHECK(net.runUntil([&] { return inbox.messages.size() == 1; }));
         CHECK(inbox.messages[0] == msg);
     }
+}
+
+TEST(handler_can_take_reassembled_buffer) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    std::vector<std::pair<uint8_t*, size_t>> kept;
+    const uint8_t* singleBuffer = reinterpret_cast<const uint8_t*>(1);
+    net.engine(b).listen(1, [&](const Message& m) {
+        if (!m.buffer) {
+            singleBuffer = m.buffer;
+            return;
+        }
+        CHECK(m.data == m.buffer);
+        kept.push_back(std::make_pair(m.buffer, m.len));
+        m.buffer = nullptr;
+    });
+    auto big = pattern(5000), small = pattern(40);
+    CHECK(net.engine(a).send(net.mac(b), 1, big.data(), big.size(), SendOptions(), nullptr, net.now()) == Status::Ok);
+    CHECK(net.engine(a).send(net.mac(b), 1, small.data(), small.size(), SendOptions(), nullptr, net.now()) ==
+          Status::Ok);
+    CHECK(net.runUntil([&] { return kept.size() == 1 && singleBuffer == nullptr; }));
+    // The taken buffer outlives the handler and the engine's later work.
+    CHECK(std::vector<uint8_t>(kept[0].first, kept[0].first + kept[0].second) == big);
+    std::free(kept[0].first);
 }
 
 TEST(lost_fragment_drops_message_without_garbage) {

@@ -428,8 +428,11 @@ bool Engine::hasListener(uint8_t port) const {
     return false;
 }
 
+// `buffer`, if set, is the malloc()ed buffer behind `data`: it is freed here
+// unless the handler takes it (Message::buffer).
 void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
-                     uint64_t timestampUs, bool authenticated) {
+                     uint64_t timestampUs, bool authenticated, uint8_t* buffer) {
+    Bytes owned(buffer);
     ReceiveHandler handler;
     for (const auto& l : listeners_) {
         if (l.first == port) {
@@ -452,7 +455,9 @@ void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t*
     m.rssi = rssi;
     m.authenticated = authenticated;
     m.timestampUs = timestampUs;
+    m.buffer = owned.release();
     handler(m);
+    std::free(m.buffer);
 }
 
 // Splits off and checks an authentication trailer. `len` shrinks to the
@@ -772,7 +777,8 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
     if (reliable) {
         queueAck(owned->src, owned->port, owned->id, owned->flags, AckStatus::Complete, nullptr);
     }
-    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated);
+    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated,
+            owned->buf.release());
 }
 
 void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {

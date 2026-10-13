@@ -332,7 +332,7 @@ ESP-NOW calls its callbacks from the Wi-Fi driver task. NowTP only copies each e
 - With `runTask = true` (the default), protocol work and your receive and completion callbacks run in a dedicated NowTP task.
 - With `runTask = false`, they run inside `transport.poll()`, which you call from your loop.
 
-Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work to your own task. `Message::data` is only valid during the receive callback.
+Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work to your own task. `Message::data` is only valid during the receive callback. To keep a message reassembled from several frames without copying it, take its buffer: save `m.buffer`, set `m.buffer = nullptr`, and `free()` it when done. Single-frame messages have no buffer to take (`m.buffer` is null) and must be copied.
 
 ### Peers and frame size
 

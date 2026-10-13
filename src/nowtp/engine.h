@@ -164,7 +164,7 @@ private:
     void dropRx(RxMessage* rx, bool countAsDropped = true);
     void completeRx(RxMessage* rx, uint32_t now);
     void deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
-                 uint64_t timestampUs, bool authenticated);
+                 uint64_t timestampUs, bool authenticated, uint8_t* buffer = nullptr);
     enum class Auth : uint8_t { Accept, Reject, Retry };
     Auth authorize(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t& len, bool& authenticated,
                    uint32_t now);
