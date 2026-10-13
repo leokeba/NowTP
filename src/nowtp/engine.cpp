@@ -3,6 +3,7 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <new>
 
 namespace nowtp {
@@ -28,12 +29,17 @@ constexpr uint16_t kStaleWindow = 256;
 constexpr size_t kMaxControlFrames = 8;
 constexpr size_t kAckHeaderSize = kCommonHeaderSize + 1;  // + status byte
 
-template <typename T>
-std::unique_ptr<T[]> allocBytes(size_t n) {
-    return std::unique_ptr<T[]>(new (std::nothrow) T[n == 0 ? 1 : n]);
-}
-
 }  // namespace
+
+// Message buffers (up to maxStream) come from malloc, which returns null on a
+// short heap. `new (std::nothrow)` doesn't: with exceptions off (ESP-IDF),
+// libstdc++'s nothrow operator new calls the throwing one, whose throw aborts.
+struct FreeBytes {
+    void operator()(uint8_t* p) const { std::free(p); }
+};
+using Bytes = std::unique_ptr<uint8_t[], FreeBytes>;
+
+static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(std::malloc(n == 0 ? 1 : n))); }
 
 const char* toString(Status s) {
     switch (s) {
@@ -62,7 +68,7 @@ struct Engine::TxMessage {
     uint16_t count = 1;     // 1 = single frame
     uint16_t fragSize = 0;  // stream bytes per fragment when count > 1
     size_t streamLen = 0;   // payload, plus CRC-32 when count > 1
-    std::unique_ptr<uint8_t[]> stream;
+    Bytes stream;
     uint16_t nextIndex = 0;        // next fragment of the first pass
     std::vector<uint16_t> resend;  // fragments to send again
     bool awaitingAck = false;
@@ -94,7 +100,7 @@ struct Engine::RxMessage {
     uint16_t count = 0;
     uint16_t received = 0;
     uint16_t fragSize = 0;  // learned from the first non-last fragment
-    std::unique_ptr<uint8_t[]> buf;
+    Bytes buf;
     std::vector<uint8_t> bitmap;
     std::vector<uint8_t> stashedLast;  // last fragment, held until fragSize is known
     size_t lastLen = 0;
@@ -173,7 +179,7 @@ Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t le
         return Status::QueueFull;
     }
 
-    tx->stream = allocBytes<uint8_t>(tx->streamLen);
+    tx->stream = allocBytes(tx->streamLen);
     if (!tx->stream) {
         flushCompletions();
         return Status::NoMemory;
@@ -679,7 +685,7 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
     size_t capacity = static_cast<size_t>(rx.count) * fragSize;
     if (!reserveRx(capacity, &rx)) return Place::NoMemory;
     rx.reserved += capacity;
-    rx.buf = allocBytes<uint8_t>(capacity);
+    rx.buf = allocBytes(capacity);
     if (!rx.buf) return Place::NoMemory;
     rx.fragSize = fragSize;
 
