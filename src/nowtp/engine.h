@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <utility>
@@ -12,6 +13,14 @@
 #include "wire.h"
 
 namespace nowtp {
+
+// Heap buffers from malloc, which returns null on a short heap. `new
+// (std::nothrow)` doesn't: with exceptions off (ESP-IDF), libstdc++'s nothrow
+// operator new calls the throwing one, whose throw aborts.
+struct FreeBytes {
+    void operator()(uint8_t* p) const { std::free(p); }
+};
+typedef std::unique_ptr<uint8_t[], FreeBytes> Bytes;
 
 /// A received frame as seen before any filtering, for diagnostics.
 struct FrameInfo {
@@ -124,7 +133,8 @@ private:
     struct Control {
         Mac dst;
         uint16_t messageId;
-        std::vector<uint8_t> frame;
+        Bytes frame;  // malloc'd, `len` bytes
+        size_t len;
     };
 
     struct Recent {

@@ -31,14 +31,7 @@ constexpr size_t kAckHeaderSize = kCommonHeaderSize + 1;  // + status byte
 
 }  // namespace
 
-// Message buffers (up to maxStream) come from malloc, which returns null on a
-// short heap. `new (std::nothrow)` doesn't: with exceptions off (ESP-IDF),
-// libstdc++'s nothrow operator new calls the throwing one, whose throw aborts.
-struct FreeBytes {
-    void operator()(uint8_t* p) const { std::free(p); }
-};
-using Bytes = std::unique_ptr<uint8_t[], FreeBytes>;
-
+// Message and control frame buffers (Bytes, engine.h): null on a short heap.
 static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(std::malloc(n == 0 ? 1 : n))); }
 
 const char* toString(Status s) {
@@ -239,7 +232,7 @@ void Engine::pump(uint32_t now) {
             inflight_.active = true;
             inflight_.control = true;
             inflight_.deadline = now + config_.frameSentTimeoutMs;
-            Status st = link_.sendFrame(c.dst, c.frame.data(), c.frame.size());
+            Status st = link_.sendFrame(c.dst, c.frame.get(), c.len);
             if (st == Status::QueueFull) {
                 inflight_.active = false;
                 linkBusy_ = true;
@@ -835,35 +828,46 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
     if (mtu < kAckHeaderSize + kAckTagSize) return;
     size_t room = tagged ? mtu - kAckTagSize : mtu;
 
+    // The frame's exact size first: a full frame per acknowledgement would
+    // take an MTU of heap each time.
+    size_t len = kAckHeaderSize;
+    if (missing) {
+        for (uint16_t i = 0; i < missing->count && len + 2 <= room; ++i) {
+            if (!missing->has(i)) len += 2;
+        }
+    }
+    if (tagged) len += kAckTagSize;
     Control c;
     c.dst = dst;
     c.messageId = id;
-    c.frame.resize(mtu);
+    c.frame = allocBytes(len);
+    if (!c.frame) return;  // no heap: the sender sends again
+    c.len = len;
     Header h;
     h.type = Type::Ack;
     h.flags = tagged ? kFlagAuth : 0;
     h.networkId = config_.networkId;
     h.port = port;
     h.messageId = id;
-    size_t off = encodeHeader(h, c.frame.data());
+    size_t off = encodeHeader(h, c.frame.get());
     c.frame[off++] = static_cast<uint8_t>(status);
     if (missing) {
         for (uint16_t i = 0; i < missing->count && off + 2 <= room; ++i) {
             if (missing->has(i)) continue;
-            putU16(c.frame.data() + off, i);
+            putU16(c.frame.get() + off, i);
             off += 2;
         }
     }
     if (tagged) {
-        auth_->sealAck(dst, c.frame.data(), off, c.frame.data() + off);
+        auth_->sealAck(dst, c.frame.get(), off, c.frame.get() + off);
         off += kAckTagSize;
     }
-    c.frame.resize(off);
 
     // Only the newest feedback for a message matters.
     for (Control& q : control_) {
         if (q.messageId == id && q.dst == dst) {
             q.frame.swap(c.frame);
+            q.len = c.len;
             return;
         }
     }
