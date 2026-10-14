@@ -114,6 +114,7 @@ constexpr size_t Security::kMaxKey;
 Security::Security(Engine& engine, ServiceHost& host, const Mac& localMac, const SecurityConfig& config)
     : engine_(engine), host_(host), local_(localMac), config_(config) {
     if (config_.maxPeers == 0) config_.maxPeers = 1;
+    peers_.reserve(config_.maxPeers);  // never grows on the receive path
     while (epoch_ == 0) epoch_ = host_.random();
     if (config_.key.size() >= kMinKey && config_.key.size() <= kMaxKey) key_ = config_.key;
     crypto::wipe(config_.key.data(), config_.key.size());
@@ -267,6 +268,19 @@ bool Security::acceptSequence(Peer& p, uint32_t seq) {
     if (p.window & bit) return false;
     p.window |= bit;
     return true;
+}
+
+// Before reassembly: a multi-frame message from a sender we haven't verified
+// may be garbage, and only the complete message's tag tells.
+Authenticator::Screen Security::screen(const Mac& src, uint8_t port, uint8_t flags) const {
+    if (key_.empty()) return Screen::Normal;
+    if (!(flags & wire::kFlagAuth)) {
+        return config_.requireAuthentication && port != kSecurityPort ? Screen::Reject : Screen::Normal;
+    }
+    for (const Peer& p : peers_) {
+        if (p.mac == src) return p.verified ? Screen::Normal : Screen::Limited;
+    }
+    return Screen::Limited;
 }
 
 void Security::sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) {

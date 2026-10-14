@@ -109,6 +109,7 @@ public:
                  uint32_t nowMs) override;
     void sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) override;
     bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag) override;
+    Screen screen(const Mac& src, uint8_t port, uint8_t flags) const override;
 
 private:
     enum MsgType : uint8_t {

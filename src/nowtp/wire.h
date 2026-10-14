@@ -38,6 +38,7 @@ constexpr size_t kCrcSize = 4;             // CRC-32 trailing a multi-frame mess
 /// Trailer of an authenticated message: epoch (4), sequence (4), destination
 /// kind (1), tag (8). See docs/PROTOCOL.md.
 constexpr size_t kAuthTrailerSize = 17;
+constexpr size_t kMaxFrameSize = 1470;  // ESP-NOW v2
 /// Tag appended to an ack for an authenticated message.
 constexpr size_t kAckTagSize = 8;
 

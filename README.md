@@ -334,6 +334,22 @@ ESP-NOW calls its callbacks from the Wi-Fi driver task. NowTP only copies each e
 
 Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work to your own task. `Message::data` is only valid during the receive callback. To keep a message reassembled from several frames without copying it, take its buffer: save `m.buffer`, set `m.buffer = nullptr`, and `free()` it when done. Single-frame messages have no buffer to take (`m.buffer` is null) and must be copied.
 
+Sending works the other way round. `send()` copies the payload, so a large message briefly exists twice. `sendBuffer(dst, port, buf, len, capacity)` takes a `malloc()`ed buffer instead and frees it when done, including on errors. Allocate `len + nowtp::kSendOverhead` bytes so NowTP can add its trailer and checksum without reallocating.
+
+### Memory
+
+The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
+
+The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes` plus about 3 KB, and the event buffer. For example, with 30 to 50 KB free:
+
+```cpp
+cfg.protocol.maxMessageSize = 8 * 1024;
+cfg.protocol.maxTxBytes = 12 * 1024;
+cfg.protocol.maxTxBytesPerPeer = 8 * 1024 + nowtp::kSendOverhead;
+cfg.protocol.maxRxBytes = 12 * 1024;
+cfg.protocol.maxRxMessages = 3;
+```
+
 ### Peers and frame size
 
 - **Peers.** Unknown unicast destinations are registered automatically as unencrypted peers on the current channel. The same happens for senders that need an ack. Set `EspNowConfig::autoAddPeers = false` to manage peers yourself with `addPeer()`. ESP-NOW allows at most 20 peers. When its table is full, the automatically added peer used least recently is removed to make room. Peers you registered with `addPeer()` are never removed that way, and a peer that discovery reports lost gives its automatic slot back.

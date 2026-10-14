@@ -3,7 +3,6 @@
 #pragma once
 
 #include <cstdlib>
-#include <deque>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -21,6 +20,10 @@ struct FreeBytes {
     void operator()(uint8_t* p) const { std::free(p); }
 };
 typedef std::unique_ptr<uint8_t[], FreeBytes> Bytes;
+
+/// Bytes after the payload that NowTP may need in an outgoing message's
+/// buffer: the authentication trailer and the CRC of a multi-frame message.
+constexpr size_t kSendOverhead = wire::kAuthTrailerSize + wire::kCrcSize;
 
 /// A received frame as seen before any filtering, for diagnostics.
 struct FrameInfo {
@@ -66,6 +69,20 @@ public:
     virtual void sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) = 0;
     /// Verifies an ack frame from `src`.
     virtual bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag) = 0;
+
+    enum class Screen : uint8_t {
+        Normal,
+        Limited,  ///< Sender without a verified epoch: one reassembly slot shared by all of them.
+        Reject,   ///< Will be rejected once complete anyway (e.g. unauthenticated where required).
+    };
+    /// Screens a multi-frame message before reassembly takes memory for it;
+    /// its tag can only be checked once it is complete. `flags` as on the wire.
+    virtual Screen screen(const Mac& src, uint8_t port, uint8_t flags) const {
+        (void)src;
+        (void)port;
+        (void)flags;
+        return Screen::Normal;
+    }
 };
 
 /// Platform-independent protocol engine: fragmentation, reassembly, pacing,
@@ -90,6 +107,12 @@ public:
     /// with the final outcome; it may run before send() returns.
     Status send(const Mac& dst, uint8_t port, const uint8_t* data, size_t len, const SendOptions& options,
                 CompletionHandler done, uint32_t nowMs);
+    /// Like send(), but takes `buffer`: a malloc()ed block of `capacity` bytes
+    /// whose first `len` are the payload. With capacity >= len + kSendOverhead
+    /// it is used without a copy; otherwise it is realloc()ed. It is freed in
+    /// every case, including when an error is returned.
+    Status sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
+                      const SendOptions& options, CompletionHandler done, uint32_t nowMs);
 
     /// Sets the handler for messages arriving on `port`; an empty handler removes it.
     /// Messages for ports without a handler are dropped (reliable ones are rejected).
@@ -132,6 +155,23 @@ private:
     struct TxMessage;
     struct RxMessage;
 
+    // Objects from malloc, like Bytes: `new (std::nothrow)` aborts on a short
+    // heap with exceptions off.
+    template <class T>
+    struct FreeObject {
+        void operator()(T* p) const {
+            if (!p) return;
+            p->~T();
+            std::free(p);
+        }
+    };
+    template <class T>
+    using Owned = std::unique_ptr<T, FreeObject<T>>;
+    template <class T>
+    static Owned<T> create();
+
+    static constexpr size_t kMaxControlFrames = 8;
+
     struct Control {
         Mac dst;
         uint16_t messageId;
@@ -171,6 +211,8 @@ private:
     Backoff* backoff(const Mac& dst);
     size_t buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest);
     void frameSent(bool delivered, uint32_t now);
+    Status queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
+                 const SendOptions& options, CompletionHandler done, uint32_t now);
     void finish(TxMessage* tx, Status status);
     void flushCompletions();
 
@@ -182,7 +224,7 @@ private:
     Place placeFragment(RxMessage& rx, uint16_t index, const uint8_t* payload, size_t len);
     Place allocateRxBuffer(RxMessage& rx, uint16_t fragSize);
     enum class Admission : uint8_t { Yes, Busy, Never };
-    Admission admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, uint32_t now);
+    Admission admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, bool limited, uint32_t now);
     bool reserveRx(size_t bytes);
     RxMessage* findRx(const Mac& src, uint16_t id);
     void dropRx(RxMessage* rx, bool countAsDropped = true);
@@ -203,19 +245,26 @@ private:
 
     void queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, wire::AckStatus status,
                   const RxMessage* missing);
+    Control& control(size_t i) { return control_[(controlHead_ + i) % kMaxControlFrames]; }
+    void popControl();
 
     Link& link_;
     Config config_;
     Stats stats_;
     uint16_t nextId_;
 
-    std::vector<std::unique_ptr<TxMessage>> tx_;
-    std::vector<std::unique_ptr<RxMessage>> rx_;
-    std::deque<Control> control_;
+    // Fixed capacities, reserved up front: nothing on the send or receive
+    // path grows a container (an allocation failure would abort).
+    std::vector<Owned<TxMessage>> tx_;
+    std::vector<Owned<RxMessage>> rx_;
+    Control control_[kMaxControlFrames];  // ring of acks to send
+    size_t controlHead_ = 0;
+    size_t controlCount_ = 0;
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
-    std::vector<std::pair<CompletionHandler, Status>> completions_;
+    TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
+    TxMessage* doneTail_ = nullptr;
     std::vector<uint8_t> frame_;
 
     std::vector<Backoff> backoffs_;

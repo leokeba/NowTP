@@ -187,6 +187,11 @@ public:
     /// Queues a message; returns immediately. `done` runs once with the outcome.
     Status send(const Mac& dst, uint8_t port, const void* data, size_t len,
                 const SendOptions& options = SendOptions(), CompletionHandler done = nullptr);
+    /// Like send(), without copying: takes `buffer`, malloc()ed with `capacity`
+    /// bytes, the first `len` of them the payload. Allocate len + kSendOverhead
+    /// so NowTP needn't realloc() it. Freed in every case, errors included.
+    Status sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
+                      const SendOptions& options = SendOptions(), CompletionHandler done = nullptr);
     /// Sends and blocks until the outcome is known. Requires runTask and must not
     /// be called from a NowTP callback.
     Status sendAndWait(const Mac& dst, uint8_t port, const void* data, size_t len,

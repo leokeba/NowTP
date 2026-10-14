@@ -443,6 +443,33 @@ TEST(per_peer_byte_limit) {
           Status::Ok);
 }
 
+TEST(send_buffer_takes_ownership) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    for (size_t len : {100u, 3000u}) {
+        for (size_t slack : {kSendOverhead, size_t(0)}) {  // in place, then via realloc
+            auto msg = pattern(len, static_cast<uint8_t>(len + slack));
+            uint8_t* buf = static_cast<uint8_t*>(std::malloc(len + slack));
+            std::memcpy(buf, msg.data(), len);
+            Outcome out;
+            CHECK(net.engine(a).sendBuffer(net.mac(b), 1, buf, len, len + slack, reliable(), out.handler(),
+                                           net.now()) == Status::Ok);
+            CHECK(net.runUntil([&] { return out.done; }));
+            CHECK(out.status == Status::Ok);
+            CHECK(inbox.messages.back() == msg);
+        }
+    }
+    // Freed on errors too (ASan reports a leak or double free otherwise).
+    uint8_t* big = static_cast<uint8_t*>(std::malloc(net.engine(a).config().maxMessageSize + 1));
+    CHECK(net.engine(a).sendBuffer(net.mac(b), 1, big, net.engine(a).config().maxMessageSize + 1,
+                                   net.engine(a).config().maxMessageSize + 1, SendOptions(), nullptr,
+                                   net.now()) == Status::TooLarge);
+    CHECK(net.engine(a).sendBuffer(net.mac(b), 1, nullptr, 0, 0, SendOptions(), nullptr, net.now()) ==
+          Status::InvalidArgument);
+}
+
 TEST(lost_mac_ack_does_not_duplicate_messages) {
     sim::Network net(5);
     net.macAckLoss = 0.4;
@@ -1791,6 +1818,20 @@ TEST(secure_messages_are_authenticated) {
     CHECK(inbox.messages[1] == big);
     CHECK(inbox.meta[1].authenticated);
 
+    // A buffer handed over keeps room for the trailer and CRC.
+    auto owned = pattern(3000, 5);
+    uint8_t* buf = static_cast<uint8_t*>(std::malloc(owned.size() + kSendOverhead));
+    std::memcpy(buf, owned.data(), owned.size());
+    Outcome sent;
+    rig.net.engine(a).sendBuffer(rig.net.mac(b), 1, buf, owned.size(), owned.size() + kSendOverhead, reliable(),
+                                 sent.handler(), rig.net.now());
+    rig.net.runUntil([&] { return sent.done; });
+    CHECK(sent.status == Status::Ok);
+    CHECK(inbox.messages.back() == owned);
+    CHECK(inbox.meta.back().authenticated);
+    inbox.messages.pop_back();
+    inbox.meta.pop_back();
+
     // Broadcast is authenticated too.
     CHECK(rig.net.engine(a).send(Mac::broadcast(), 1, msg.data(), msg.size(), SendOptions(), nullptr,
                                  rig.net.now()) == Status::Ok);
@@ -1826,6 +1867,36 @@ TEST(secure_refuses_unkeyed_and_wrong_key) {
     CHECK(rig.sendWait(other, b, 1, msg, reliable()) == Status::AuthFailed);  // b could not verify it
     CHECK_EQ(inbox.messages.size(), 0u);
     CHECK(rig.net.engine(b).stats().authRejected >= 2u);
+}
+
+// Reassembly checks the tag only once a message is complete, so it must not
+// hand its memory to whoever claims a large message.
+TEST(secure_reassembly_bounds_unverified_senders) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey()), plain = rig.add({});
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+
+    // Unauthenticated where authentication is required: refused at the first fragment.
+    auto msg = pattern(4000);
+    size_t before = rig.net.log.size();
+    CHECK(rig.sendWait(plain, b, 1, msg, reliable()) == Status::Rejected);
+    size_t sent = 0;
+    for (size_t i = before; i < rig.net.log.size(); ++i) sent += rig.net.log[i].from == plain;
+    CHECK(sent < 5u);  // not all 17 fragments
+
+    // Claimed authenticated, from senders b hasn't verified: one slot for all of them.
+    uint32_t refused = rig.net.engine(b).stats().reassemblyRefused;
+    for (uint8_t i = 0; i < 3; ++i) {
+        Mac spoof = {{0x02, 6, 6, 6, 6, i}};
+        rig.net.inject(b, spoof, fragmentsOf(msg, wire::kFlagAuth, 1, 1)[0]);
+    }
+    CHECK_EQ(rig.net.engine(b).stats().reassemblyRefused, refused + 2);
+
+    // A key holder b hasn't verified yet still gets through, once the slot's idle.
+    CHECK(rig.sendWait(a, b, 1, msg, reliable()) == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    CHECK(inbox.meta[0].authenticated);
 }
 
 TEST(secure_optional_mode_marks_plain_messages) {

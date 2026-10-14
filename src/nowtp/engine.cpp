@@ -26,7 +26,6 @@ inline bool olderWithin(uint16_t a, uint16_t b, uint16_t window) {
 // Late frames of a superseded message are at most a few ids behind; anything
 // further back is more likely a rebooted sender and is accepted.
 constexpr uint16_t kStaleWindow = 256;
-constexpr size_t kMaxControlFrames = 8;
 constexpr size_t kAckHeaderSize = kCommonHeaderSize + 1;  // + status byte
 // Backoff of a destination whose frames fail, doubling per failure. A failed
 // unicast frame holds the radio ~100 ms (hardware retries), so an absent peer
@@ -38,6 +37,15 @@ constexpr uint32_t kBackoffMaxMs = 800;
 
 // Message and control frame buffers (Bytes, engine.h): null on a short heap.
 static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(std::malloc(n == 0 ? 1 : n))); }
+static Bytes allocZeroed(size_t n) { return Bytes(static_cast<uint8_t*>(std::calloc(n == 0 ? 1 : n, 1))); }
+
+constexpr size_t Engine::kMaxControlFrames;
+
+template <class T>
+Engine::Owned<T> Engine::create() {
+    void* p = std::malloc(sizeof(T));
+    return Owned<T>(p ? new (p) T() : nullptr);
+}
 
 const char* toString(Status s) {
     switch (s) {
@@ -67,26 +75,50 @@ struct Engine::TxMessage {
     uint16_t fragSize = 0;  // stream bytes per fragment when count > 1
     size_t streamLen = 0;   // payload, plus CRC-32 when count > 1
     Bytes stream;
-    uint16_t nextIndex = 0;        // next fragment of the first pass
-    std::vector<uint16_t> resend;  // fragments to send again
+    uint16_t nextIndex = 0;  // next fragment of the first pass
+    Bytes resend;            // bitmap of fragments to send again, allocated on first use
+    uint16_t resendCount = 0;
     bool awaitingAck = false;
     uint32_t ackDeadline = 0;
     uint32_t deadline = 0;
     uint8_t frameFailures = 0;
     CompletionHandler done;
+    Status result = Status::Ok;  // once finished
+    TxMessage* nextDone = nullptr;
 
     bool reliable() const { return (flags & kFlagReliable) != 0; }
     bool latest() const { return (flags & kFlagLatest) != 0; }
     bool firstPassPending() const { return nextIndex < count; }
-    bool hasPendingFrame() const { return firstPassPending() || !resend.empty(); }
-    uint16_t pendingFrame() const { return firstPassPending() ? nextIndex : resend.front(); }
-    bool isLastPending() const {
-        return firstPassPending() ? (nextIndex + 1 == count && resend.empty()) : resend.size() == 1;
+    bool hasPendingFrame() const { return firstPassPending() || resendCount > 0; }
+    bool resending(uint16_t i) const { return resend && ((resend[i >> 3] >> (i & 7)) & 1); }
+    uint16_t pendingFrame() const {
+        if (firstPassPending()) return nextIndex;
+        for (uint16_t i = 0; i < count; ++i) {
+            if (resending(i)) return i;
+        }
+        return 0;
     }
+    bool isLastPending() const {
+        return firstPassPending() ? (nextIndex + 1 == count && resendCount == 0) : resendCount == 1;
+    }
+    // Without memory for the bitmap, the fragment is not queued: the probe
+    // after the ack timeout asks the receiver again.
     void addResend(uint16_t index) {
         if (index >= count) return;
         if (firstPassPending() && index >= nextIndex) return;  // first pass will send it anyway
-        if (std::find(resend.begin(), resend.end(), index) == resend.end()) resend.push_back(index);
+        if (!resend) resend = allocZeroed((static_cast<size_t>(count) + 7) / 8);
+        if (!resend || resending(index)) return;
+        resend[index >> 3] = static_cast<uint8_t>(resend[index >> 3] | (1u << (index & 7)));
+        resendCount++;
+    }
+    void sentResend(uint16_t index) {
+        if (!resending(index)) return;
+        resend[index >> 3] = static_cast<uint8_t>(resend[index >> 3] & ~(1u << (index & 7)));
+        resendCount--;
+    }
+    void clearResend() {
+        resend.reset();
+        resendCount = 0;
     }
 };
 
@@ -98,9 +130,10 @@ struct Engine::RxMessage {
     uint16_t count = 0;
     uint16_t received = 0;
     uint16_t fragSize = 0;  // learned from the first non-last fragment
+    bool limited = false;   // its sender has no verified epoch (Authenticator::screen)
     Bytes buf;
-    std::vector<uint8_t> bitmap;
-    std::vector<uint8_t> stashedLast;  // last fragment, held until fragSize is known
+    Bytes bitmap;
+    Bytes stashedLast;  // last fragment, held until fragSize is known (lastLen bytes)
     size_t lastLen = 0;
     size_t reserved = 0;  // bytes counted in rxBytes_
     uint32_t lastActivity = 0;
@@ -117,9 +150,18 @@ Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
     if (config_.sendTimeoutMs == 0) config_.sendTimeoutMs = 1;
     recent_.resize(config_.recentEntries);
     for (Recent& r : recent_) r.used = false;
+    tx_.reserve(config_.maxTxMessages);
+    rx_.reserve(config_.maxRxMessages);
+    backoffs_.reserve(config_.maxTxMessages);
+    frame_.reserve(kMaxFrameSize);
 }
 
-Engine::~Engine() = default;
+Engine::~Engine() {
+    while (doneHead_) {
+        Owned<TxMessage> done(doneHead_);
+        doneHead_ = doneHead_->nextDone;
+    }
+}
 
 size_t Engine::singleFramePayload(const Mac& dst, uint8_t port) const {
     size_t mtu = link_.maxFrameSize(dst);
@@ -133,30 +175,38 @@ size_t Engine::singleFramePayload(const Mac& dst, uint8_t port) const {
 Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t len, const SendOptions& options,
                     CompletionHandler done, uint32_t now) {
     if (data == nullptr && len > 0) return Status::InvalidArgument;
+    return queue(dst, port, data, Bytes(), len, 0, options, std::move(done), now);
+}
+
+Status Engine::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
+                          const SendOptions& options, CompletionHandler done, uint32_t now) {
+    Bytes owned(buffer);
+    if (!owned || capacity < len) return Status::InvalidArgument;
+    return queue(dst, port, nullptr, std::move(owned), len, capacity, options, std::move(done), now);
+}
+
+// The payload is `data`, copied, or the first `len` bytes of `owned`.
+Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
+                     const SendOptions& options, CompletionHandler done, uint32_t now) {
     if (options.reliable && dst.isBroadcast()) return Status::InvalidArgument;
     if (len > config_.maxMessageSize) return Status::TooLarge;
 
     size_t mtu = link_.maxFrameSize(dst);
     if (mtu <= kFragmentHeaderSize) return Status::InvalidArgument;
 
-    std::unique_ptr<TxMessage> tx(new (std::nothrow) TxMessage());
-    if (!tx) return Status::NoMemory;
-    tx->dst = dst;
-    tx->port = port;
-    tx->flags = static_cast<uint8_t>((options.reliable ? kFlagReliable : 0) | (options.latestOnly ? kFlagLatest : 0));
+    uint8_t flags = static_cast<uint8_t>((options.reliable ? kFlagReliable : 0) | (options.latestOnly ? kFlagLatest : 0));
     // Authenticated messages carry a trailer after the payload (see Security).
     size_t trailer = auth_ && auth_->sealing(port) ? kAuthTrailerSize : 0;
     size_t payloadLen = len + trailer;
-
-    if (payloadLen <= mtu - kCommonHeaderSize) {
-        tx->count = 1;
-        tx->streamLen = payloadLen;
-    } else {
-        tx->fragSize = static_cast<uint16_t>(mtu - kFragmentHeaderSize);
-        tx->streamLen = payloadLen + kCrcSize;
-        size_t count = (tx->streamLen + tx->fragSize - 1) / tx->fragSize;
-        if (count > 0xFFFF) return Status::TooLarge;
-        tx->count = static_cast<uint16_t>(count);
+    uint16_t count = 1;
+    uint16_t fragSize = 0;
+    size_t streamLen = payloadLen;
+    if (payloadLen > mtu - kCommonHeaderSize) {
+        fragSize = static_cast<uint16_t>(mtu - kFragmentHeaderSize);
+        streamLen = payloadLen + kCrcSize;
+        size_t n = (streamLen + fragSize - 1) / fragSize;
+        if (n > 0xFFFF) return Status::TooLarge;
+        count = static_cast<uint16_t>(n);
     }
 
     // A newer latest-only message replaces older ones before queue limits apply,
@@ -178,29 +228,50 @@ Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t le
         peerMessages++;
         peerBytes += t->streamLen;
     }
-    if (tx_.size() >= config_.maxTxMessages || txBytes_ + tx->streamLen > config_.maxTxBytes ||
-        peerMessages >= config_.maxTxMessagesPerPeer || peerBytes + tx->streamLen > config_.maxTxBytesPerPeer) {
+    if (tx_.size() >= config_.maxTxMessages || txBytes_ + streamLen > config_.maxTxBytes ||
+        peerMessages >= config_.maxTxMessagesPerPeer || peerBytes + streamLen > config_.maxTxBytesPerPeer) {
         flushCompletions();
         return Status::QueueFull;
     }
 
-    tx->stream = allocBytes(tx->streamLen);
-    if (!tx->stream) {
+    Bytes stream;
+    if (owned) {
+        if (capacity >= streamLen) {
+            stream = std::move(owned);
+        } else {
+            uint8_t* grown = static_cast<uint8_t*>(std::realloc(owned.get(), streamLen));
+            if (grown) {
+                owned.release();  // moved into `grown`
+                stream.reset(grown);
+            }
+        }
+    } else {
+        stream = allocBytes(streamLen);
+        if (stream && len > 0) memcpy(stream.get(), data, len);
+    }
+    Owned<TxMessage> tx = create<TxMessage>();
+    if (!stream || !tx) {
         flushCompletions();
         return Status::NoMemory;
     }
-    if (len > 0) memcpy(tx->stream.get(), data, len);
+    tx->dst = dst;
+    tx->port = port;
+    tx->flags = flags;
+    tx->count = count;
+    tx->fragSize = fragSize;
+    tx->streamLen = streamLen;
+    tx->stream = std::move(stream);
     if (trailer) {
-        auth_->seal(dst, port, tx->flags, data, len, tx->stream.get() + len);
+        auth_->seal(dst, port, tx->flags, tx->stream.get(), len, tx->stream.get() + len);
         tx->flags = static_cast<uint8_t>(tx->flags | kFlagAuth);
     }
-    if (tx->count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
+    if (count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
 
     tx->id = nextId_++;
     tx->deadline = now + (options.timeoutMs ? options.timeoutMs : config_.sendTimeoutMs);
     tx->done = std::move(done);
     txBytes_ += tx->streamLen;
-    tx_.push_back(std::move(tx));
+    tx_.push_back(std::move(tx));  // within the reserved capacity
 
     pump(now);
     flushCompletions();
@@ -238,8 +309,8 @@ void Engine::pump(uint32_t now) {
         }
 
         // Control frames (acks) go first: they unblock the peer's sender.
-        if (!control_.empty()) {
-            Control& c = control_.front();
+        if (controlCount_ > 0) {
+            Control& c = control(0);
             inflight_ = InFlight();
             inflight_.active = true;
             inflight_.control = true;
@@ -251,7 +322,7 @@ void Engine::pump(uint32_t now) {
                 linkBusyUntil_ = now + config_.linkBusyBackoffMs;
                 break;
             }
-            control_.pop_front();
+            popControl();
             if (st == Status::Ok) {
                 stats_.framesSent++;
             } else {
@@ -360,13 +431,15 @@ void Engine::frameSent(bool delivered, uint32_t now) {
     Backoff* b = backoff(tx->dst);
     if (!delivered) {
         stats_.framesFailed++;
-        if (!b) {
+        if (!b && backoffs_.size() < backoffs_.capacity()) {  // never grows (see tx_)
             Backoff fresh = {tx->dst, 0, 0};
             backoffs_.push_back(fresh);
             b = &backoffs_.back();
         }
-        if (b->failures < 8) b->failures++;
-        b->retryAt = now + std::min(kBackoffMaxMs, kBackoffMinMs << (b->failures - 1));
+        if (b) {
+            if (b->failures < 8) b->failures++;
+            b->retryAt = now + std::min(kBackoffMaxMs, kBackoffMinMs << (b->failures - 1));
+        }
         if (++tx->frameFailures > config_.frameRetries) finish(tx, Status::SendFailed);
         return;  // otherwise the same frame is still pending and goes out again
     }
@@ -377,8 +450,7 @@ void Engine::frameSent(bool delivered, uint32_t now) {
         // Not backwards: a Busy ack may have ended the first pass meanwhile.
         tx->nextIndex = std::max(tx->nextIndex, static_cast<uint16_t>(f.index + 1));
     } else {
-        auto it = std::find(tx->resend.begin(), tx->resend.end(), f.index);
-        if (it != tx->resend.end()) tx->resend.erase(it);
+        tx->sentResend(f.index);
     }
 
     if (tx->hasPendingFrame()) return;
@@ -402,8 +474,21 @@ void Engine::finish(TxMessage* tx, Status status) {
         } else {
             stats_.messagesFailed++;
         }
-        if (tx->done) completions_.push_back(std::make_pair(std::move(tx->done), status));
+        Owned<TxMessage> owned(std::move(tx_[i]));
         tx_.erase(tx_.begin() + static_cast<std::ptrdiff_t>(i));
+        if (owned->done) {
+            // The handler runs from flushCompletions(); its memory goes back now.
+            owned->result = status;
+            owned->stream.reset();
+            owned->clearResend();
+            TxMessage* t = owned.release();
+            if (doneTail_) {
+                doneTail_->nextDone = t;
+            } else {
+                doneHead_ = t;
+            }
+            doneTail_ = t;
+        }
         return;
     }
 }
@@ -411,11 +496,12 @@ void Engine::finish(TxMessage* tx, Status status) {
 void Engine::flushCompletions() {
     if (flushing_) return;
     flushing_ = true;
-    std::vector<std::pair<CompletionHandler, Status>> batch;
-    while (!completions_.empty()) {
-        batch.clear();
-        batch.swap(completions_);
-        for (auto& c : batch) c.first(c.second);
+    // Handlers may finish more messages; they join the end of the list.
+    while (doneHead_) {
+        Owned<TxMessage> t(doneHead_);
+        doneHead_ = t->nextDone;
+        if (!doneHead_) doneTail_ = nullptr;
+        t->done(t->result);
     }
     flushing_ = false;
 }
@@ -466,7 +552,7 @@ void Engine::tick(uint32_t now) {
 void Engine::cancelAll(Status reason) {
     while (!tx_.empty()) finish(tx_.front().get(), reason);
     while (!rx_.empty()) dropRx(rx_.front().get(), false);
-    control_.clear();
+    while (controlCount_ > 0) popControl();
     flushCompletions();
 }
 
@@ -665,8 +751,25 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
             dropOlderLatest(src, h.port, h.messageId);
         }
 
+        // Authentication is only checked once the message is complete: until
+        // then, unverified senders share a single slot.
+        bool limited = false;
+        if (auth_) {
+            Authenticator::Screen screen = auth_->screen(src, h.port, h.flags);
+            if (screen == Authenticator::Screen::Reject) {
+                if (h.index == 0 || ackRequest) {
+                    stats_.authRejected++;
+                    stats_.messagesDropped++;
+                    // Untagged, as for any authentication failure.
+                    if (reliable) queueAck(src, h.port, h.messageId, 0, AckStatus::Rejected, nullptr);
+                }
+                return;
+            }
+            limited = screen == Authenticator::Screen::Limited;
+        }
+
         size_t bitmapBytes = (static_cast<size_t>(h.count) + 7) / 8;
-        Admission admission = admitRx(src, h.index, h.count, len, now);
+        Admission admission = admitRx(src, h.index, h.count, len, limited, now);
         if (admission == Admission::Never) {
             stats_.messagesDropped++;
             if (reliable) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
@@ -683,17 +786,19 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
             }
             return;
         }
-        std::unique_ptr<RxMessage> created(new (std::nothrow) RxMessage());
-        if (!created) {
+        Owned<RxMessage> created = create<RxMessage>();
+        Bytes bitmap = allocZeroed(bitmapBytes);
+        if (!created || !bitmap) {
             rxBytes_ -= bitmapBytes;
-            return;
+            return;  // a reliable sender retries
         }
         created->src = src;
         created->port = h.port;
         created->flags = static_cast<uint8_t>(h.flags & (kFlagReliable | kFlagLatest | kFlagAuth));
         created->id = h.messageId;
         created->count = h.count;
-        created->bitmap.assign(bitmapBytes, 0);
+        created->bitmap = std::move(bitmap);
+        created->limited = limited;
         created->reserved = bitmapBytes;
         rx = created.get();
         rx_.push_back(std::move(created));
@@ -746,7 +851,9 @@ Engine::Place Engine::placeFragment(RxMessage& rx, uint16_t index, const uint8_t
     if (rx.fragSize == 0) {
         if (!reserveRx(len)) return Place::NoMemory;
         rx.reserved += len;
-        rx.stashedLast.assign(payload, payload + len);
+        rx.stashedLast = allocBytes(len);
+        if (!rx.stashedLast) return Place::NoMemory;
+        memcpy(rx.stashedLast.get(), payload, len);
         return Place::Ok;
     }
     if (len > rx.fragSize) return Place::Invalid;
@@ -755,7 +862,7 @@ Engine::Place Engine::placeFragment(RxMessage& rx, uint16_t index, const uint8_t
 }
 
 Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
-    if (!rx.stashedLast.empty() && rx.stashedLast.size() > fragSize) return Place::Invalid;
+    if (rx.stashedLast && rx.lastLen > fragSize) return Place::Invalid;
     // Smallest possible stream: full fragments plus a 1-byte last one.
     size_t minStream = static_cast<size_t>(rx.count - 1) * fragSize + 1;
     if (minStream > maxStream()) return Place::TooLarge;
@@ -767,10 +874,9 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
     if (!rx.buf) return Place::NoMemory;
     rx.fragSize = fragSize;
 
-    if (!rx.stashedLast.empty()) {
-        memcpy(rx.buf.get() + static_cast<size_t>(rx.count - 1) * fragSize, rx.stashedLast.data(),
-               rx.stashedLast.size());
-        std::vector<uint8_t>().swap(rx.stashedLast);
+    if (rx.stashedLast) {
+        memcpy(rx.buf.get() + static_cast<size_t>(rx.count - 1) * fragSize, rx.stashedLast.get(), rx.lastLen);
+        rx.stashedLast.reset();
     }
     return Place::Ok;
 }
@@ -778,7 +884,8 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
 // Makes room for a new message by evicting only idle ones: a live sender
 // sends again within its ack timeout (a probe at worst), so a partial message
 // idle for longer is abandoned, or waits on a sender busy elsewhere.
-Engine::Admission Engine::admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, uint32_t now) {
+Engine::Admission Engine::admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, bool limited,
+                                  uint32_t now) {
     if (config_.maxRxMessages == 0 || config_.maxRxMessagesPerSender == 0) return Admission::Never;
     // Room for its whole buffer, so admitted messages can finish. A last
     // fragment arriving first (a probe) doesn't tell the fragment size:
@@ -797,17 +904,21 @@ Engine::Admission Engine::admitRx(const Mac& src, uint16_t index, uint16_t count
 
     uint32_t idleMs = 3 * config_.ackTimeoutMs;
     for (;;) {
-        size_t fromSrc = 0;
+        size_t fromSrc = 0, unverified = 0;
         for (const auto& r : rx_) {
             if (r->src == src) fromSrc++;
+            if (r->limited) unverified++;
         }
         bool perSender = fromSrc >= config_.maxRxMessagesPerSender;
-        if (!perSender && rx_.size() < config_.maxRxMessages && rxBytes_ + need <= config_.maxRxBytes) {
+        bool shared = limited && unverified >= 1;
+        if (!perSender && !shared && rx_.size() < config_.maxRxMessages && rxBytes_ + need <= config_.maxRxBytes) {
             return Admission::Yes;
         }
+        // Evicting only helps if it lifts the limits that apply.
         RxMessage* victim = nullptr;
         for (auto& r : rx_) {
             if (perSender && !(r->src == src)) continue;
+            if (shared && !r->limited) continue;
             if (!reached(now, r->lastActivity + idleMs)) continue;
             if (!victim || static_cast<int32_t>(r->lastActivity - victim->lastActivity) < 0) victim = r.get();
         }
@@ -841,7 +952,7 @@ void Engine::dropRx(RxMessage* rx, bool countAsDropped) {
 
 void Engine::completeRx(RxMessage* rx, uint32_t now) {
     // Detach first: the handler may re-enter the engine.
-    std::unique_ptr<RxMessage> owned;
+    Owned<RxMessage> owned;
     for (size_t i = 0; i < rx_.size(); ++i) {
         if (rx_[i].get() == rx) {
             owned = std::move(rx_[i]);
@@ -934,7 +1045,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
             // fragment, which reopens reassembly once there is room. Spread
             // by message id so refused senders don't return in step.
             stats_.receiverBusy++;
-            tx->resend.clear();
+            tx->clearResend();
             tx->nextIndex = tx->count;
             tx->awaitingAck = true;
             tx->ackDeadline = now + config_.ackTimeoutMs + config_.ackTimeoutMs * (tx->id % 4u) / 2;
@@ -986,15 +1097,22 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
     }
 
     // Only the newest feedback for a message matters.
-    for (Control& q : control_) {
+    for (size_t i = 0; i < controlCount_; ++i) {
+        Control& q = control(i);
         if (q.messageId == id && q.dst == dst) {
             q.frame.swap(c.frame);
             q.len = c.len;
             return;
         }
     }
-    if (control_.size() >= kMaxControlFrames) control_.pop_front();
-    control_.push_back(std::move(c));
+    if (controlCount_ >= kMaxControlFrames) popControl();
+    control(controlCount_++) = std::move(c);
+}
+
+void Engine::popControl() {
+    control(0).frame.reset();
+    controlHead_ = (controlHead_ + 1) % kMaxControlFrames;
+    controlCount_--;
 }
 
 // ---------------------------------------------------------------------------

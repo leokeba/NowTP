@@ -32,6 +32,7 @@ Discovery::Discovery(Engine& engine, const DiscoveryConfig& config, uint16_t loc
     if (config_.name.size() > kMaxName) config_.name.resize(kMaxName);
     if (config_.metadata.size() > kMaxMetadata) config_.metadata.resize(kMaxMetadata);
     if (!random_) random_ = [] { return 0u; };
+    peers_.reserve(config_.maxPeers);  // the table never grows on the receive path
 }
 
 Discovery::~Discovery() {

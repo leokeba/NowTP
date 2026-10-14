@@ -645,6 +645,20 @@ Status EspNowTransport::send(const Mac& dst, uint8_t port, const void* data, siz
     return st;
 }
 
+Status EspNowTransport::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
+                                   const SendOptions& options, CompletionHandler done) {
+    Bytes owned(buffer);
+    if (!started_) return Status::InvalidState;
+    if (port >= kFirstReservedPort) return Status::InvalidArgument;
+    if (!config_.autoAddPeers && !dst.isBroadcast() && !esp_now_is_peer_exist(dst.bytes)) {
+        return Status::LinkError;
+    }
+    lock();
+    Status st = engine_->sendBuffer(dst, port, owned.release(), len, capacity, options, std::move(done), nowMs());
+    unlock();
+    return st;
+}
+
 Status EspNowTransport::sendAndWait(const Mac& dst, uint8_t port, const void* data, size_t len,
                                     const SendOptions& options) {
     if (!started_ || !config_.runTask || xTaskGetCurrentTaskHandle() == task_) return Status::InvalidState;
