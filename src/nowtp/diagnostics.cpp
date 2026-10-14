@@ -241,7 +241,7 @@ void Diagnostics::handle(const Message& m) {
             break;
         }
         case kBurstRequest: {
-            if (m.len < 6) return;
+            if (m.len < 6 || !trusted(m)) return;
             uint8_t perStep = d[4];
             size_t n = d[5];
             if (n == 0 || n > kMaxSteps || m.len < 6 + 2 * n || perStep == 0) return;
@@ -277,7 +277,7 @@ void Diagnostics::handle(const Message& m) {
             break;
         }
         case kApply: {
-            if (m.len < 6) return;
+            if (m.len < 6 || !config_.acceptRemoteTuning || !trusted(m)) return;
             if (localProcedures_ > 0) {
                 uint8_t busy[5] = {kApplyAck, d[1], d[2], 0, 1};
                 reply(m.src, attempt, busy, sizeof(busy));
@@ -285,7 +285,6 @@ void Diagnostics::handle(const Message& m) {
             }
             PhyRate rate = static_cast<PhyRate>(d[4]);
             float power = fromQuarter(static_cast<int8_t>(d[5]));
-            if (!config_.acceptRemoteTuning) return;
             if (isValid(rate) && radio_.rateUsable(rate)) radio_.setPeerRate(m.src, rate);
             if (power >= 2) radio_.setTxPower(std::min(power, radio_.txPowerLimit()));
             uint8_t out[5] = {kApplyAck, d[1], d[2], 0, 0};

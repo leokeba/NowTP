@@ -1161,7 +1161,9 @@ TEST(diag_finds_rate_failures) {
 
 TEST(diag_optimize_picks_fastest_reliable_rates) {
     DiagRig rig;
-    size_t a = rig.add(), b = rig.add();
+    DiagnosticsConfig tunable;
+    tunable.acceptRemoteTuning = true;
+    size_t a = rig.add(), b = rig.add("", Config(), 1470, tunable);
     // Rates above 24 Mbps fail from a to b; b to a everything works.
     rig.net.linkModel = [a](size_t from, size_t, PhyRate rate, float) {
         return from == a && nominalKbps(rate) > 26000 ? 1.0 : 0.0;
@@ -1190,7 +1192,9 @@ TEST(diag_optimize_picks_fastest_reliable_rates) {
 
 TEST(diag_optimize_lowers_power_of_weak_board) {
     DiagRig rig;
-    size_t a = rig.add(), b = rig.add();
+    DiagnosticsConfig tunable;
+    tunable.acceptRemoteTuning = true;
+    size_t a = rig.add(), b = rig.add("", Config(), 1470, tunable);
     rig.net.linkModel = weakSupply(b);
     LinkProfile p;
     CHECK(rig.diag[a]->optimize(rig.net.mac(b), OptimizeOptions(), p) == Status::Ok);
@@ -1308,7 +1312,9 @@ TEST(diag_rejects_oversized_burst_requests) {
 
 TEST(diag_random_payloads_do_not_crash) {
     DiagRig rig;
-    size_t a = rig.add();
+    DiagnosticsConfig tunable;
+    tunable.acceptRemoteTuning = true;
+    size_t a = rig.add("", Config(), 1470, tunable);
     std::mt19937 rng(77);
     for (int i = 0; i < 20000; ++i) {
         std::vector<uint8_t> payload(rng() % 140);
@@ -1330,15 +1336,69 @@ TEST(diag_random_payloads_do_not_crash) {
     CHECK(rig.net.node(a).radio.bcast == PhyRate::Default);
 }
 
-TEST(diag_remote_tuning_can_be_refused) {
+TEST(diag_remote_tuning_is_refused_by_default) {
     DiagRig rig;
-    DiagnosticsConfig strict;
-    strict.acceptRemoteTuning = false;
-    size_t a = rig.add(), b = rig.add("", Config(), 1470, strict);
+    size_t a = rig.add(), b = rig.add();
+    rig.net.linkModel = weakSupply(b);  // optimize() would lower b's power
     LinkProfile p;
     CHECK(rig.diag[a]->optimize(rig.net.mac(b), OptimizeOptions(), p) == Status::Ok);
     CHECK(!p.applied);
     CHECK(rig.net.node(b).radio.peerRate(rig.net.mac(a)) == PhyRate::Default);
+    CHECK(rig.net.node(b).radio.power == 20.0f);
+}
+
+namespace {
+
+// A spoofed Apply (rate 1 Mbps, 5 dBm) from `src`, without authentication.
+void injectApply(sim::Network& net, size_t to, const Mac& src) {
+    std::vector<uint8_t> payload = {6, 1, 0, 0, static_cast<uint8_t>(PhyRate::B1M), 20};
+    wire::Header h;
+    h.port = kDiagnosticsPort;
+    std::vector<uint8_t> f(wire::kCommonHeaderSize);
+    wire::encodeHeader(h, f.data());
+    f.insert(f.end(), payload.begin(), payload.end());
+    net.inject(to, src, f);
+    net.run(500);
+}
+
+}  // namespace
+
+TEST(diag_remote_tuning_requires_authentication_with_a_key) {
+    DiagRig rig;
+    DiagnosticsConfig tunable;
+    tunable.acceptRemoteTuning = true;
+    size_t a = rig.add("", Config(), 1470, tunable);
+    Mac src = {{0x02, 9, 9, 9, 9, 9}};
+
+    // Without a key, an opted-in node accepts the request.
+    injectApply(rig.net, a, src);
+    CHECK(rig.net.node(a).radio.power == 5.0f);
+    CHECK(rig.net.node(a).radio.peerRate(src) == PhyRate::B1M);
+
+    // With a key, even in optional mode (plain messages delivered), it must be authenticated.
+    rig.net.node(a).radio.power = 20.0f;
+    SecurityConfig sc;
+    sc.key = std::vector<uint8_t>(32, 0x42);
+    sc.requireAuthentication = false;
+    Security sec(rig.net.engine(a), rig.host, rig.net.mac(a), sc);
+    sec.start();
+    Mac other = {{0x02, 9, 9, 9, 9, 8}};
+    size_t before = rig.net.log.size();
+    injectApply(rig.net, a, other);
+    CHECK(rig.net.node(a).radio.power == 20.0f);
+    CHECK(rig.net.node(a).radio.peerRate(other) == PhyRate::Default);
+
+    // Nor does an unauthenticated burst request start a burst.
+    std::vector<uint8_t> payload = {4, 2, 0, 0, 5, 1, static_cast<uint8_t>(PhyRate::B1M), 80};
+    wire::Header h;
+    h.port = kDiagnosticsPort;
+    std::vector<uint8_t> f(wire::kCommonHeaderSize);
+    wire::encodeHeader(h, f.data());
+    f.insert(f.end(), payload.begin(), payload.end());
+    rig.net.inject(a, other, f);
+    rig.net.run(500);
+    CHECK_EQ(rig.net.log.size(), before);  // no reply, no burst
+    sec.stop();
 }
 
 // ---------------------------------------------------------------------------

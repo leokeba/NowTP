@@ -113,6 +113,8 @@ public:
 
     /// Authenticates outgoing messages and checks incoming ones (null: none).
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
+    /// True when outgoing messages on `port` are authenticated (a key is installed).
+    bool authenticates(uint8_t port) const { return auth_ && auth_->sealing(port); }
 
     /// Fails every outgoing message with `reason` and drops partial incoming ones.
     void cancelAll(Status reason = Status::Cancelled);

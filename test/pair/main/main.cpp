@@ -579,6 +579,7 @@ bool hasIssue(const std::vector<nowtp::Issue>& issues, nowtp::IssueKind kind, co
 void phaseRadioSettings() {
     nowtp::EspNowConfig cfg = baseConfig("p4");
     cfg.radio.longRange = true;
+    cfg.diagnostics.acceptRemoteTuning = true;  // optimizeLink() tunes both boards
     listenAll();
     if (!startPhase("p4", cfg)) return;
     nowtp::RadioInfo r = transport.radioInfo();

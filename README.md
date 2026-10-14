@@ -179,7 +179,7 @@ Every node answers diagnostic requests on reserved port 254 (`enableDiagnostics`
 
 Two settings control what other nodes may do:
 - `diagnostics.respond = false` stops answering altogether.
-- `diagnostics.acceptRemoteTuning = false` refuses a peer's request to change our transmit power and our rate toward it. That request is what `optimizeLink()` uses to tune both ends. ESP-NOW frames aren't authenticated, so keep remote tuning on only among trusted nodes.
+- `diagnostics.acceptRemoteTuning` (off by default) lets a peer change our transmit power and our rate toward it. That request is what `optimizeLink()` uses to tune both ends; with it off, `optimizeLink()` still tunes the initiator and reports `applied = false`. Power is global to the node (station and soft-AP too), and without a security key anyone in radio range could send the request, so turn it on only among trusted nodes. With a key installed, tuning and probe burst requests are honored only when authenticated, even with `security.requireAuthentication = false`.
 
 The procedures below block for a few seconds each:
 - Call them from your own task or `loop()`, never from a NowTP callback (they return `InvalidState` there).
@@ -263,7 +263,7 @@ transport.pair(30000);            // finds the window, obtains the key
 - **Pairing code.** Set `security.pairingCode` on both sides to keep nodes from joining the wrong installation. A short code doesn't stop an active attacker present during the window: keep windows short, or use a long random code.
 - **Other ways to install a key.** `setSecurityKey()` installs a key you provision yourself, and `forgetSecurityKey()` removes it.
 - **Storage.** The key is stored in NVS (namespace `nowtp`) and loaded by `begin()`, unless `persistSecurityKey` is false.
-- **Limits.** Content is not encrypted. Every key holder can impersonate every other: the key proves membership of the installation, not which node sent a message. Diagnostics' remote tuning is authenticated along with everything else.
+- **Limits.** Content is not encrypted. Every key holder can impersonate every other: the key proves membership of the installation, not which node sent a message. Diagnostics' remote tuning (when enabled) and probe burst requests are accepted only from key holders.
 
 Costs:
 - **Size.** 17 bytes per message, plus 8 per ack.

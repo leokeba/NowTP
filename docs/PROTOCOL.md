@@ -117,9 +117,9 @@ Diagnostics messages are single-frame unicast messages on port 254, except probe
 | 1 | Burst | step, sequence, padding | Probe frame (default 200-byte payload), broadcast at the step's rate and power |
 | 2 | Collect | attempt | "Report what you counted for this session" |
 | 3 | Report | power, n, n × (received, average RSSI) | |
-| 4 | BurstRequest | attempt, frames per step, n, n × (rate, power) | Power 0 means "keep yours". Steps the responder can't send (e.g. LR without Long Range) are skipped, never substituted. |
+| 4 | BurstRequest | attempt, frames per step, n, n × (rate, power) | Power 0 means "keep yours". Steps the responder can't send (e.g. LR without Long Range) are skipped, never substituted. Ignored if unauthenticated while the responder has a key. |
 | 5 | BurstAck | power, power limit, flags | Flag `0x1`: busy with its own measurement. The initiator backs off and retries. |
-| 6 | Apply | attempt, rate, power | Asks the peer to use `rate` toward us, and `power`. Refused if remote tuning is off. |
+| 6 | Apply | attempt, rate, power | Asks the peer to use `rate` toward us, and `power`. Ignored (no reply) if remote tuning is off, which is the default, or if unauthenticated while the responder has a key. |
 | 7 | ApplyAck | power, flags | Flag `0x1`: busy |
 | 8 | Ping | attempt | |
 | 9 | Pong | power, power limit | |

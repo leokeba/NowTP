@@ -157,9 +157,11 @@ struct DiagnosticsConfig {
     /// Answer other nodes' diagnostic requests (like ping on a network).
     bool respond = true;
     /// Let a peer that ran optimize() set our rate toward it and our transmit
-    /// power. Power is global to the node, so only enable this among trusted
-    /// nodes (ESP-NOW frames are not authenticated unless encrypted).
-    bool acceptRemoteTuning = true;
+    /// power. Power is global to the node (station and soft-AP included), so
+    /// this is off by default: without a security key, anyone in radio range
+    /// could send the request. With a key, only authenticated requests are
+    /// honored (as are probe burst requests).
+    bool acceptRemoteTuning = false;
     /// Upper bound on frames sent for one remote burst request.
     uint16_t maxBurstFrames = 400;
     /// Size of probe frames' payload.
@@ -258,6 +260,8 @@ private:
     };
 
     void handle(const Message& m);
+    /// May `m` change our radio settings? With a key installed, only if authenticated.
+    bool trusted(const Message& m) const { return m.authenticated || !engine_.authenticates(kDiagnosticsPort); }
     void countBurst(const Message& m);
     void reply(const Mac& to, uint8_t attempt, const uint8_t* data, size_t len);
     Counter* counter(const Mac& src, uint16_t session, size_t steps, bool create);

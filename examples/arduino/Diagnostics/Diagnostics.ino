@@ -1,7 +1,9 @@
 // NowTP: diagnose and tune links, and look for incompatible nodes.
-// Flash on two or more boards (any NowTP sketch answers diagnostics). This one
-// finds a peer, measures the link in both directions, prints what limits it,
-// applies the fastest reliable settings, then scans channels and radio modes.
+// Flash on two or more boards (any NowTP sketch answers diagnostics, but only
+// one that opts into remote tuning, like this one, lets a peer apply settings
+// to it). This one finds a peer, measures the link in both directions, prints
+// what limits it, applies the fastest reliable settings, then scans channels
+// and radio modes.
 #include <NowTP.h>
 
 nowtp::EspNowTransport transport;
@@ -26,6 +28,9 @@ void setup() {
 
     nowtp::EspNowConfig config;
     config.enableDiscovery = true;  // diagnostics are on by default
+    // Let peers running optimizeLink() set our power and rate. Only on a trusted
+    // bench: without a security key, anyone in range could.
+    config.diagnostics.acceptRemoteTuning = true;
     transport.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
         if (e == nowtp::PeerEvent::Found) xQueueSend(foundPeers, &p.mac, 0);
     });
