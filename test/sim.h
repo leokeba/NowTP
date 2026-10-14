@@ -14,6 +14,7 @@
 
 #include "nowtp/diagnostics.h"
 #include "nowtp/engine.h"
+#include "nowtp/peer_table.h"
 #include "nowtp/radio.h"
 
 namespace sim {
@@ -91,15 +92,49 @@ public:
     }
 };
 
+/// The radio's peer table, as ESP-NOW's: a fixed number of slots.
+class SimPeerDriver : public nowtp::PeerTable::Driver {
+public:
+    size_t capacity = 0;  // 0: unlimited, and the table is not modelled
+    std::vector<Mac> table;
+    size_t removed = 0;
+
+    Result add(const Mac& m) override {
+        if (exists(m)) return Result::Ok;
+        if (table.size() >= capacity) return Result::Full;
+        table.push_back(m);
+        return Result::Ok;
+    }
+    void remove(const Mac& m) override {
+        for (size_t i = 0; i < table.size(); ++i) {
+            if (table[i] == m) {
+                table.erase(table.begin() + static_cast<std::ptrdiff_t>(i));
+                removed++;
+                return;
+            }
+        }
+    }
+    bool exists(const Mac& m) const override {
+        for (const Mac& t : table) {
+            if (t == m) return true;
+        }
+        return false;
+    }
+};
+
 class SimLink : public nowtp::Link {
 public:
-    SimLink(Network& net, size_t index) : net_(net), index_(index) {}
+    SimLink(Network& net, size_t index) : peers(driver), net_(net), index_(index) {}
     Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override;
     size_t maxFrameSize(const Mac&) const override { return mtu; }
 
     size_t mtu = 250;
     bool inFlight = false;
     int busyReplies = 0;  // next N sendFrame() calls return QueueFull
+    /// Set driver.capacity to model the peer table, managed like the ESP-NOW
+    /// transport does: unicast destinations are added on use, LRU evicted.
+    SimPeerDriver driver;
+    nowtp::PeerTable peers;
 
 private:
     Network& net_;
@@ -226,6 +261,7 @@ public:
             Node& n = *nodes_[e.node];
             if (e.kind == Event::SendDone) {
                 n.link.inFlight = false;
+                n.link.peers.clearInFlight();
                 n.engine.onFrameSent(e.ok, now_);
             } else if (n.online) {
                 n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,
@@ -299,7 +335,13 @@ private:
 };
 
 inline Status SimLink::sendFrame(const Mac& dst, const uint8_t* data, size_t len) {
-    return net_.transmit(index_, dst, data, len);
+    if (driver.capacity > 0 && !dst.isBroadcast()) {
+        bool added = false;
+        if (peers.use(dst, net_.now(), added) != Status::Ok) return Status::LinkError;
+    }
+    Status st = net_.transmit(index_, dst, data, len);
+    if (st == Status::Ok) peers.setInFlight(dst);
+    return st;
 }
 
 /// Diagnostics host for the simulation: sleeping steps the whole network.

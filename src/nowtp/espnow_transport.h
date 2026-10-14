@@ -13,6 +13,7 @@
 #include "diagnostics.h"
 #include "discovery.h"
 #include "engine.h"
+#include "peer_table.h"
 #include "radio.h"
 #include "security.h"
 #include "stream.h"
@@ -120,7 +121,9 @@ struct EspNowConfig {
     /// Register unknown unicast destinations as unencrypted peers on first use,
     /// including senders that need an acknowledgement. When false, call addPeer()
     /// for every peer you exchange unicast or reliable messages with, on both sides.
-    /// ESP-NOW allows at most 20 peers.
+    /// ESP-NOW allows at most 20 peers: when full, the automatic peer used least
+    /// recently makes room (never one registered with addPeer()), and a peer
+    /// discovery reports lost is removed.
     bool autoAddPeers = true;
     /// Process radio events and run callbacks in a dedicated task. When false,
     /// call EspNowTransport::poll() regularly (e.g. from Arduino's loop()).
@@ -309,6 +312,7 @@ public:
 
 private:
     class RadioLink;
+    class PeerDriver;
 
     static void taskEntry(void* arg);
     Status prepareRadio();
@@ -345,6 +349,8 @@ private:
     void cleanup();
 
     EspNowConfig config_;
+    std::unique_ptr<PeerDriver> peerDriver_;
+    std::unique_ptr<PeerTable> peerTable_;  // ESP-NOW's 20 slots: LRU eviction of automatic peers
     std::unique_ptr<RadioLink> link_;
     std::unique_ptr<Engine> engine_;
     std::unique_ptr<Discovery> discovery_;

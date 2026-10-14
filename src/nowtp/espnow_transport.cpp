@@ -185,19 +185,44 @@ void onSent(const uint8_t* mac, esp_now_send_status_t status) {
 
 }  // namespace
 
+// ESP-NOW's peer table, for PeerTable.
+class EspNowTransport::PeerDriver : public PeerTable::Driver {
+public:
+    explicit PeerDriver(wifi_interface_t interface) : interface_(interface) {}
+    Result add(const Mac& mac) override {
+        esp_err_t err = addPlainPeer(mac, interface_);
+        if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST) return Result::Ok;
+        if (err == ESP_ERR_ESPNOW_FULL) return Result::Full;
+        ESP_LOGW(kTag, "adding peer: %s", esp_err_to_name(err));
+        return Result::Error;
+    }
+    void remove(const Mac& mac) override { esp_now_del_peer(mac.bytes); }
+    bool exists(const Mac& mac) const override { return esp_now_is_peer_exist(mac.bytes); }
+
+private:
+    wifi_interface_t interface_;
+};
+
 // Link implementation over esp_now_send(), with per-peer frame sizes.
 class EspNowTransport::RadioLink : public Link {
 public:
-    RadioLink(uint16_t defaultSize, bool autoAddPeers, wifi_interface_t interface, std::function<void(const Mac&)> added)
-        : defaultSize_(defaultSize), autoAddPeers_(autoAddPeers), interface_(interface), added_(std::move(added)) {}
+    RadioLink(uint16_t defaultSize, bool autoAddPeers, PeerTable& peers, std::function<void(const Mac&)> added)
+        : defaultSize_(defaultSize), autoAddPeers_(autoAddPeers), peers_(peers), added_(std::move(added)) {}
 
     Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override {
-        esp_err_t err = esp_now_send(dst.bytes, data, len);
-        if (err == ESP_ERR_ESPNOW_NOT_FOUND && autoAddPeers_ && addPlainPeer(dst, interface_) == ESP_OK) {
-            if (added_) added_(dst);  // apply the unicast rate to the new peer
-            err = esp_now_send(dst.bytes, data, len);
+        if (autoAddPeers_ && !dst.isBroadcast()) {
+            bool added = false;
+            if (peers_.use(dst, nowMs(), added) != Status::Ok) {
+                ESP_LOGW(kTag, "no room in the ESP-NOW peer table");
+                return Status::LinkError;
+            }
+            if (added && added_) added_(dst);  // apply the unicast rate to the new peer
         }
-        if (err == ESP_OK) return Status::Ok;
+        esp_err_t err = esp_now_send(dst.bytes, data, len);
+        if (err == ESP_OK) {
+            peers_.setInFlight(dst);
+            return Status::Ok;
+        }
         if (err == ESP_ERR_ESPNOW_NO_MEM) return Status::QueueFull;
         ESP_LOGW(kTag, "esp_now_send: %s", esp_err_to_name(err));
         return Status::LinkError;
@@ -227,7 +252,7 @@ public:
 private:
     uint16_t defaultSize_;
     bool autoAddPeers_;
-    wifi_interface_t interface_;
+    PeerTable& peers_;
     std::function<void(const Mac&)> added_;
     std::vector<std::pair<Mac, uint16_t>> sizes_;
 };
@@ -294,7 +319,9 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     events_ = xRingbufferCreate(config_.eventBufferSize, RINGBUF_TYPE_NOSPLIT);
     mutex_ = xSemaphoreCreateRecursiveMutex();
     taskExited_ = xSemaphoreCreateBinary();
-    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, interface_,
+    peerDriver_.reset(new PeerDriver(interface_));
+    peerTable_.reset(new PeerTable(*peerDriver_));
+    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, *peerTable_,
                               [this](const Mac& mac) { applyPeerRate(mac); }));
     engine_.reset(new Engine(*link_, config_.protocol, static_cast<uint16_t>(esp_random())));
     if (!events_ || !mutex_ || !taskExited_) {
@@ -457,6 +484,8 @@ void EspNowTransport::cleanup() {
     host_.reset();
     engine_.reset();
     link_.reset();
+    peerTable_.reset();
+    peerDriver_.reset();
     if (events_) {
         vRingbufferDelete(events_);
         events_ = nullptr;
@@ -511,6 +540,7 @@ void EspNowTransport::processEvents(TickType_t wait) {
                 engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi, at);
             } else if (h->kind == kEventSent) {
                 notePeerSendResult(Mac::from(h->mac), h->delivered != 0);
+                peerTable_->clearInFlight();
                 engine_->onFrameSent(h->delivered != 0, nowMs());
             }
         }
@@ -557,7 +587,12 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
         peer.ifidx = interface_;
         peer.encrypt = options.encrypt;
         if (options.encrypt) memcpy(peer.lmk, options.lmk, sizeof(peer.lmk));
+        lock();
         esp_err_t err = esp_now_is_peer_exist(mac.bytes) ? esp_now_mod_peer(&peer) : esp_now_add_peer(&peer);
+        // Room taken by peers added automatically is the application's to claim.
+        if (err == ESP_ERR_ESPNOW_FULL && peerTable_->evictOne()) err = esp_now_add_peer(&peer);
+        if (err == ESP_OK) peerTable_->pin(mac);
+        unlock();
         if (err == ESP_ERR_ESPNOW_FULL) return Status::NoMemory;
         if (err != ESP_OK) {
             ESP_LOGE(kTag, "adding peer: %s", esp_err_to_name(err));
@@ -581,8 +616,9 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
 Status EspNowTransport::removePeer(const Mac& mac) {
     if (!started_) return Status::InvalidState;
     if (mac.isBroadcast()) return Status::InvalidArgument;
-    esp_err_t err = esp_now_del_peer(mac.bytes);
     lock();
+    esp_err_t err = esp_now_del_peer(mac.bytes);
+    peerTable_->forget(mac);
     link_->setFrameSize(mac, 0);
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
@@ -1118,6 +1154,8 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
         LinkCheck c = {peer.mac, 3, false, nowMs()};
         linkChecks_.push_back(c);
     }
+    // Its slot in ESP-NOW's peer table, if we added it, goes back to the pool.
+    if (event == PeerEvent::Lost) peerTable_->release(peer.mac);
     if (config_.negotiateFrameSize && !hasExplicitFrameSize(peer.mac)) {
         uint16_t size = 0;  // default
         if (event != PeerEvent::Lost) {
@@ -1195,7 +1233,8 @@ Status EspNowTransport::setPeerRate(const Mac& mac, PhyRate rate) {
     if (rate != PhyRate::Default) peerRates_.push_back(std::make_pair(mac, rate));
     Status st = Status::Ok;
     if (!esp_now_is_peer_exist(mac.bytes)) {
-        st = config_.autoAddPeers && addPlainPeer(mac, interface_) == ESP_OK ? Status::Ok : Status::LinkError;
+        bool added = false;
+        st = config_.autoAddPeers ? peerTable_->use(mac, nowMs(), added) : Status::LinkError;
     }
     if (st == Status::Ok) st = applyPeerRate(mac);
     unlock();

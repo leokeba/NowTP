@@ -52,7 +52,9 @@ struct DiscoveryConfig {
     uint32_t peerTimeoutMs = 7000;
     /// Replies to a query are delayed randomly by up to this much to avoid collisions.
     uint32_t replyJitterMs = 50;
-    /// Peers tracked at most; further ones are ignored until a slot frees up.
+    /// Peers tracked at most. When full, a new one replaces (and reports lost)
+    /// a peer silent for 1.5 announcement intervals, the one heard least
+    /// recently first; an authenticated peer only gives way to another.
     uint8_t maxPeers = 20;
 };
 

@@ -222,7 +222,33 @@ void Discovery::handle(const Message& m) {
     bool anchor = (a.extFlags & kExtAnchor) != 0;
     bool timeReference = (a.extFlags & kExtTimeReference) != 0;
     if (!peer) {
-        if (peers_.size() >= config_.maxPeers) return;
+        if (peers_.size() >= config_.maxPeers) {
+            // Full: a peer that missed an announcement gives way, the one heard
+            // least recently first, so a burst of (possibly spoofed)
+            // announcements can't hide peers for good. Peers that keep
+            // announcing keep their place (no churn), and an authenticated peer
+            // gives way only to another one.
+            uint32_t silentMs = config_.announceIntervalMs ? config_.announceIntervalMs * 3 / 2
+                                                           : config_.peerTimeoutMs / 2;
+            size_t victim = peers_.size();
+            for (size_t i = 0; i < peers_.size(); ++i) {
+                if (peers_[i].authenticated && !m.authenticated) continue;
+                if (static_cast<int32_t>(now_ - peers_[i].lastSeenMs) < static_cast<int32_t>(silentMs)) continue;
+                if (victim == peers_.size() ||
+                    static_cast<int32_t>(peers_[i].lastSeenMs - peers_[victim].lastSeenMs) < 0) {
+                    victim = i;
+                }
+            }
+            if (victim == peers_.size()) return;
+            PeerInfo lost = peers_[victim];
+            peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(victim));
+            emit(PeerEvent::Lost, lost);
+            // The handler may have re-entered; look again.
+            for (PeerInfo& q : peers_) {
+                if (q.mac == m.src) return;
+            }
+            if (peers_.size() >= config_.maxPeers) return;
+        }
         PeerInfo fresh;
         fresh.mac = m.src;
         fresh.name = a.name;

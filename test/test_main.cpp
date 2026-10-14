@@ -11,6 +11,7 @@
 #include "nowtp/diagnostics.h"
 #include "nowtp/discovery.h"
 #include "nowtp/engine.h"
+#include "nowtp/peer_table.h"
 #include "nowtp/security.h"
 #include "nowtp/stream.h"
 #include "nowtp/timesync.h"
@@ -987,6 +988,79 @@ TEST(larger_mtu_uses_fewer_frames) {
 }
 
 // ---------------------------------------------------------------------------
+// Peer table
+
+// ESP-NOW holds 20 peers. Acks alone (to spoofed or real senders) used to
+// fill it for good; then every new destination failed with LinkError.
+TEST(peer_table_full_of_senders_still_reaches_new_peers) {
+    sim::Network net;
+    size_t gw = net.addNode();
+    net.node(gw).link.driver.capacity = 20;
+    Inbox inbox;
+    net.engine(gw).listen(1, inbox.handler());
+    std::vector<size_t> senders;
+    std::vector<Outcome> outs(25);
+    for (size_t i = 0; i < 25; ++i) senders.push_back(net.addNode());
+    auto msg = pattern(50);
+    for (size_t i = 0; i < 25; ++i) {
+        net.engine(senders[i]).send(net.mac(gw), 1, msg.data(), msg.size(), reliable(), outs[i].handler(),
+                                    net.now());
+    }
+    CHECK(net.runUntil([&] {
+        for (auto& o : outs) {
+            if (!o.done) return false;
+        }
+        return true;
+    }));
+    for (auto& o : outs) CHECK(o.status == Status::Ok);  // every ack went out
+    CHECK(net.node(gw).link.driver.table.size() == 20u);
+    CHECK(net.node(gw).link.driver.removed >= 5u);
+
+    size_t fresh = net.addNode();
+    Inbox in2;
+    for (size_t i : {fresh, senders[0], senders[24]}) net.engine(i).listen(1, in2.handler());
+    for (size_t i : {fresh, senders[0], senders[24]}) {
+        Outcome out;
+        net.engine(gw).send(net.mac(i), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+        CHECK(net.runUntil([&] { return out.done; }));
+        CHECK(out.status == Status::Ok);
+    }
+}
+
+TEST(peer_table_keeps_pinned_and_in_flight_peers) {
+    sim::SimPeerDriver d;
+    d.capacity = 3;
+    PeerTable t(d);
+    Mac m[5];
+    for (uint8_t i = 0; i < 5; ++i) m[i] = Mac{{0x02, 0, 0, 0, 1, i}};
+    CHECK(d.add(m[0]) == PeerTable::Driver::Result::Ok);
+    t.pin(m[0]);  // the application's (e.g. encrypted) peer
+    bool added = false;
+    CHECK(t.use(m[1], 1, added) == Status::Ok && added);
+    CHECK(t.use(m[2], 2, added) == Status::Ok && added);
+    CHECK(t.use(m[1], 3, added) == Status::Ok && !added);
+    t.setInFlight(m[2]);
+    // Full: m[2] is the least recently used, but a frame to it is in flight.
+    CHECK(t.use(m[3], 4, added) == Status::Ok && added);
+    CHECK(d.exists(m[0]) && d.exists(m[2]) && d.exists(m[3]) && !d.exists(m[1]));
+    // A peer that left is removed once its frame is reported.
+    t.release(m[2]);
+    CHECK(d.exists(m[2]));
+    t.clearInFlight();
+    CHECK(!d.exists(m[2]));
+    t.release(m[0]);  // pinned: stays
+    CHECK(d.exists(m[0]));
+    t.setInFlight(m[3]);
+    CHECK(t.use(m[4], 5, added) == Status::Ok && added);  // a free slot
+    CHECK(t.use(m[1], 6, added) == Status::Ok && added);  // evicts m[4], not m[3] (in flight)
+    CHECK(d.exists(m[1]) && d.exists(m[3]) && !d.exists(m[4]));
+    // Nothing evictable: the new destination fails.
+    t.pin(m[1]);
+    CHECK(t.use(m[4], 7, added) == Status::LinkError);
+    CHECK_EQ(t.automatic(), 1u);
+}
+
+// ---------------------------------------------------------------------------
 // Discovery
 
 namespace {
@@ -1105,6 +1179,23 @@ TEST(discovery_respects_max_peers) {
     rig.run(300);
     CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
     CHECK_EQ(rig.nodes[1]->peers().size(), 4u);
+    // Peers that keep announcing keep their place...
+    size_t lostBefore = rig.count(a, PeerEvent::Lost);
+    rig.run(4000);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), lostBefore);
+    // ...but once they fall silent, a newcomer replaces one (reported lost),
+    // before the peer timeout.
+    for (size_t i = 0; i < rig.nodes.size(); ++i) rig.net.node(i).online = i == a;
+    rig.run(3500);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), lostBefore);
+    size_t late = rig.add("late");
+    rig.nodes[late]->start(rig.net.now());
+    rig.run(300);
+    bool found = false;
+    for (const PeerInfo& p : rig.nodes[a]->peers()) found = found || p.name == "late";
+    CHECK(found);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+    CHECK(rig.count(a, PeerEvent::Lost) > lostBefore);
 }
 
 TEST(discovery_ignores_malformed_announcements) {
