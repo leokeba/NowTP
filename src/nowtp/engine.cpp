@@ -156,7 +156,6 @@ Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
     tx_.reserve(config_.maxTxMessages);
     rx_.reserve(config_.maxRxMessages);
     backoffs_.reserve(config_.maxTxMessages);
-    frame_.reserve(kMaxFrameSize);
 }
 
 Engine::~Engine() {
@@ -282,9 +281,16 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     return Status::Ok;
 }
 
+// 0 if there is no memory for the frame buffer.
 size_t Engine::buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest) {
     size_t mtu = link_.maxFrameSize(tx.dst);
-    if (frame_.size() < mtu) frame_.resize(mtu);
+    if (frameCapacity_ < mtu) {
+        // As large as the largest frame sent so far (1470 bytes with v2 peers).
+        Bytes bigger = allocBytes(mtu);
+        if (!bigger) return 0;
+        frame_ = std::move(bigger);
+        frameCapacity_ = mtu;
+    }
 
     Header h;
     h.type = tx.count > 1 ? Type::Fragment : Type::Single;
@@ -294,11 +300,11 @@ size_t Engine::buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest) 
     h.messageId = tx.id;
     h.index = index;
     h.count = tx.count;
-    size_t off = encodeHeader(h, frame_.data());
+    size_t off = encodeHeader(h, frame_.get());
 
     size_t start = tx.count > 1 ? static_cast<size_t>(index) * tx.fragSize : 0;
     size_t n = tx.count > 1 ? std::min<size_t>(tx.fragSize, tx.streamLen - start) : tx.streamLen;
-    if (n > 0) memcpy(frame_.data() + off, tx.stream.get() + start, n);
+    if (n > 0) memcpy(frame_.get() + off, tx.stream.get() + start, n);
     return off + n;
 }
 
@@ -343,6 +349,11 @@ void Engine::pump(uint32_t now) {
         uint16_t index = tx->pendingFrame();
         bool ackRequest = tx->reliable() && tx->isLastPending();
         size_t len = buildFrame(*tx, index, ackRequest);
+        if (len == 0) {  // short heap: try again shortly
+            linkBusy_ = true;
+            linkBusyUntil_ = now + config_.linkBusyBackoffMs;
+            break;
+        }
 
         inflight_ = InFlight();
         inflight_.active = true;
@@ -352,7 +363,7 @@ void Engine::pump(uint32_t now) {
         inflight_.ackRequest = ackRequest;
         inflight_.deadline = now + config_.frameSentTimeoutMs;
 
-        Status st = link_.sendFrame(tx->dst, frame_.data(), len);
+        Status st = link_.sendFrame(tx->dst, frame_.get(), len);
         if (st == Status::QueueFull) {
             inflight_.active = false;
             linkBusy_ = true;

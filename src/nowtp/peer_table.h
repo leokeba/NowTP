@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include <vector>
-
+#include "table.h"
 #include "types.h"
 
 namespace nowtp {
@@ -28,7 +27,8 @@ public:
         virtual bool exists(const Mac& mac) const = 0;
     };
 
-    explicit PeerTable(Driver& driver) : driver_(driver) {}
+    /// `limit`: peers tracked at most (ESP-NOW holds 20).
+    explicit PeerTable(Driver& driver, size_t limit = 20) : driver_(driver), entries_(limit) {}
 
     /// Makes sure `mac` is registered before a frame goes to it, evicting if
     /// needed. `added` tells the caller to apply its per-peer settings.
@@ -62,7 +62,7 @@ private:
     Entry* find(const Mac& mac);
 
     Driver& driver_;
-    std::vector<Entry> entries_;
+    Table<Entry> entries_;
     Mac inFlight_{};
     bool hasInFlight_ = false;
     bool releaseInFlight_ = false;

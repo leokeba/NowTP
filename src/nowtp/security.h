@@ -7,6 +7,7 @@
 
 #include "engine.h"
 #include "host.h"
+#include "table.h"
 
 namespace nowtp {
 
@@ -197,7 +198,7 @@ private:
     uint8_t challengeKey_[32];
     uint32_t epoch_ = 0;
     uint32_t seq_ = 0;
-    std::vector<Peer> peers_;
+    Table<Peer> peers_;  // memory per verified sender, not reserved for maxPeers
     uint32_t responseWindowStart_ = 0;
     uint8_t responsesInWindow_ = 0;
     Pairing pairing_;

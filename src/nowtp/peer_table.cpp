@@ -21,6 +21,7 @@ Status PeerTable::use(const Mac& mac, uint32_t nowMs, bool& added) {
     } else if (driver_.exists(mac)) {
         return Status::Ok;  // registered outside NowTP's knowledge: leave it alone
     }
+    if (!e && entries_.full() && !evictOne()) return Status::LinkError;  // room to track it
     for (;;) {
         Driver::Result r = driver_.add(mac);
         if (r == Driver::Result::Ok) break;
@@ -32,7 +33,10 @@ Status PeerTable::use(const Mac& mac, uint32_t nowMs, bool& added) {
         e->lastUsed = nowMs;
     } else {
         Entry fresh = {mac, nowMs, false};
-        entries_.push_back(fresh);
+        if (!entries_.add(fresh)) {  // no memory to track it: don't leave it untracked
+            driver_.remove(mac);
+            return Status::LinkError;
+        }
     }
     return Status::Ok;
 }
@@ -46,7 +50,7 @@ bool PeerTable::evictOne() {
     }
     if (victim == entries_.size()) return false;
     driver_.remove(entries_[victim].mac);
-    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(victim));
+    entries_.erase(victim);
     return true;
 }
 
@@ -56,7 +60,8 @@ void PeerTable::pin(const Mac& mac) {
         e->pinned = true;
     } else {
         Entry fresh = {mac, 0, true};
-        entries_.push_back(fresh);
+        if (entries_.full()) evictOne();
+        entries_.add(fresh);  // untracked on failure: never evicted either
     }
     if (hasInFlight_ && inFlight_ == mac) releaseInFlight_ = false;
 }
@@ -64,7 +69,7 @@ void PeerTable::pin(const Mac& mac) {
 void PeerTable::forget(const Mac& mac) {
     for (size_t i = 0; i < entries_.size(); ++i) {
         if (entries_[i].mac == mac) {
-            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            entries_.erase(i);
             break;
         }
     }

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "table.h"
 
 namespace nowtp {
 
@@ -95,7 +96,8 @@ public:
     void onPeerEvent(PeerHandler handler) { handler_ = std::move(handler); }
     void onPeerMoved(MoveHandler handler) { moveHandler_ = std::move(handler); }
 
-    const std::vector<PeerInfo>& peers() const { return peers_; }
+    /// A copy of the peers tracked.
+    std::vector<PeerInfo> peers() const;
     const PeerInfo* find(const Mac& mac) const;
 
     /// A parsed announcement payload (as carried on kDiscoveryPort).
@@ -126,7 +128,7 @@ private:
     std::function<uint32_t()> random_;
     PeerHandler handler_;
     MoveHandler moveHandler_;
-    std::vector<PeerInfo> peers_;
+    Table<PeerInfo> peers_;  // memory per peer heard, not reserved for maxPeers
     uint8_t channel_ = 0;
     uint8_t extFlags_ = 0;
     uint32_t now_ = 0;

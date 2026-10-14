@@ -15,6 +15,7 @@
 #include "nowtp/security.h"
 #include "nowtp/send_tracker.h"
 #include "nowtp/stream.h"
+#include "nowtp/table.h"
 #include "nowtp/timesync.h"
 #include "nowtp/wire.h"
 #include "sim.h"
@@ -1086,6 +1087,21 @@ TEST(peer_table_keeps_pinned_and_in_flight_peers) {
     t.pin(m[1]);
     CHECK(t.use(m[4], 7, added) == Status::LinkError);
     CHECK_EQ(t.automatic(), 1u);
+}
+
+TEST(table_holds_up_to_its_limit) {
+    Table<std::string> t(3);
+    CHECK(t.empty());
+    CHECK(t.add("a") && t.add("b") && t.add("c"));
+    CHECK(t.full());
+    CHECK(t.add("d") == nullptr);  // refused, never grown
+    t.erase(1);
+    CHECK(t.add("e") != nullptr);
+    std::string all;
+    for (const std::string& x : t) all += x;
+    CHECK(all == "ace");
+    t.clear();
+    CHECK_EQ(t.size(), 0u);
 }
 
 // The radio's "sent" callback doesn't say which frame it reports.

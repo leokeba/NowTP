@@ -340,7 +340,7 @@ Sending works the other way round. `send()` copies the payload, so a large messa
 
 The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
 
-The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes` plus about 3 KB, and the event buffer (`eventBufferSize`, about 12 KB by default with ESP-NOW v2; 6 KB still holds 4 large frames). For example, with 30 to 50 KB free:
+The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 2 KB of tables and a frame buffer (plus about 100 bytes per peer), and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
 
 ```cpp
 cfg.protocol.maxMessageSize = 8 * 1024;
@@ -391,7 +391,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `enableStreams` | true | Streams (see above) |
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |
-| `eventBufferSize` | 0: 8 frames, ≥ 8 KB | Buffer for received frames between the Wi-Fi driver and NowTP (about 12 KB with ESP-NOW v2). Overflows are counted in `stats().droppedEvents` |
+| `eventBufferSize` | 8 KB | Buffer for received frames between the Wi-Fi driver and NowTP (about 5 frames of 1470 bytes). Overflows are counted in `stats().droppedEvents` |
 
 ### Status codes
 

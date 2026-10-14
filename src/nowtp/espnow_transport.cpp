@@ -360,9 +360,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     if (config_.defaultMaxFrameSize < 32) config_.defaultMaxFrameSize = 32;
     if (config_.tickIntervalMs == 0) config_.tickIntervalMs = 1;
 
-    // Room for a few of the largest frames by default.
-    size_t ring = config_.eventBufferSize;
-    if (ring == 0) ring = std::max<size_t>(8 * 1024, 8 * ringItemSize(maxSupportedFrameSize()));
+    // At least one frame of the largest size must fit.
+    size_t ring = std::max(config_.eventBufferSize, ringItemSize(maxSupportedFrameSize()));
     events_ = xRingbufferCreate(ring, RINGBUF_TYPE_NOSPLIT);
     sendTracker_ = SendTracker();
     mutex_ = xSemaphoreCreateRecursiveMutex();

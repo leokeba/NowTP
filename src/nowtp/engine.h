@@ -187,12 +187,12 @@ private:
         size_t len;
     };
 
-    struct Recent {
-        Mac src;
+    struct Recent {  // 24 bytes, packed by hand
+        uint32_t at;
+        uint16_t messageId;
         uint8_t port;
         uint8_t flags;
-        uint16_t messageId;
-        uint32_t at;
+        Mac src;
         bool used;
         bool bound;  // `bind` holds the message's epoch and sequence
         uint8_t bind[wire::kAckBindSize];
@@ -275,7 +275,8 @@ private:
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;
-    std::vector<uint8_t> frame_;
+    Bytes frame_;  // the frame being built, malloc'd at the largest size used
+    size_t frameCapacity_ = 0;
 
     std::vector<Backoff> backoffs_;
     Mac lastDst_{};  // destination of the last data frame, for round-robin

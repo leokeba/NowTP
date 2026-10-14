@@ -119,9 +119,8 @@ constexpr size_t Security::kMinKey;
 constexpr size_t Security::kMaxKey;
 
 Security::Security(Engine& engine, ServiceHost& host, const Mac& localMac, const SecurityConfig& config)
-    : engine_(engine), host_(host), local_(localMac), config_(config) {
+    : engine_(engine), host_(host), local_(localMac), config_(config), peers_(config.maxPeers ? config.maxPeers : 1) {
     if (config_.maxPeers == 0) config_.maxPeers = 1;
-    peers_.reserve(config_.maxPeers);  // never grows on the receive path
     while (epoch_ == 0) epoch_ = host_.random();
     if (config_.key.size() >= kMinKey && config_.key.size() <= kMaxKey) key_ = config_.key;
     crypto::wipe(config_.key.data(), config_.key.size());
@@ -247,6 +246,7 @@ Authenticator::Verdict Security::open(const Mac& src, uint8_t port, uint8_t flag
     uint32_t epoch = getU32(trailer);
     uint32_t seq = getU32(trailer + 4);
     Peer* p = peer(src, true, now);
+    if (!p) return Verdict::Retry;  // no memory to track it: the sender tries again
     // Replays are dropped silently: a refusal would reach the real sender,
     // which may have a message with that id in flight (and it may be one
     // sealed before our last challenge, which the sender has sealed again).
@@ -344,18 +344,17 @@ Security::Peer* Security::peer(const Mac& mac, bool create, uint32_t now) {
         }
     }
     if (!create) return nullptr;
-    if (peers_.size() >= config_.maxPeers) {
+    if (peers_.full()) {
         size_t oldest = 0;
         for (size_t i = 1; i < peers_.size(); ++i) {
             if (static_cast<int32_t>(peers_[i].lastUse - peers_[oldest].lastUse) < 0) oldest = i;
         }
-        peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(oldest));
+        peers_.erase(oldest);
     }
-    peers_.push_back(Peer());
-    Peer& p = peers_.back();
-    p.mac = mac;
-    p.lastUse = now;
-    return &p;
+    Peer fresh = Peer();
+    fresh.mac = mac;
+    fresh.lastUse = now;
+    return peers_.add(fresh);  // null on a short heap
 }
 
 // ---------------------------------------------------------------------------

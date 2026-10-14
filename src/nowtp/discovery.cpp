@@ -28,11 +28,14 @@ constexpr size_t Discovery::kMaxMetadata;
 
 Discovery::Discovery(Engine& engine, const DiscoveryConfig& config, uint16_t localMaxFrameSize,
                      std::function<uint32_t()> random)
-    : engine_(engine), config_(config), localMaxFrameSize_(localMaxFrameSize), random_(std::move(random)) {
+    : engine_(engine),
+      config_(config),
+      localMaxFrameSize_(localMaxFrameSize),
+      random_(std::move(random)),
+      peers_(config.maxPeers) {
     if (config_.name.size() > kMaxName) config_.name.resize(kMaxName);
     if (config_.metadata.size() > kMaxMetadata) config_.metadata.resize(kMaxMetadata);
     if (!random_) random_ = [] { return 0u; };
-    peers_.reserve(config_.maxPeers);  // the table never grows on the receive path
 }
 
 Discovery::~Discovery() {
@@ -99,6 +102,13 @@ void Discovery::setMetadata(const uint8_t* data, size_t len, uint32_t now) {
     tick(now);
 }
 
+std::vector<PeerInfo> Discovery::peers() const {
+    std::vector<PeerInfo> out;
+    out.reserve(peers_.size());
+    for (const PeerInfo& p : peers_) out.push_back(p);
+    return out;
+}
+
 const PeerInfo* Discovery::find(const Mac& mac) const {
     for (const PeerInfo& p : peers_) {
         if (p.mac == mac) return &p;
@@ -136,7 +146,7 @@ void Discovery::tick(uint32_t now) {
     for (size_t i = 0; i < peers_.size();) {
         if (reached(now, peers_[i].lastSeenMs + config_.peerTimeoutMs)) {
             PeerInfo lost = peers_[i];
-            peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
+            peers_.erase(i);
             emit(PeerEvent::Lost, lost);
             continue;
         }
@@ -200,7 +210,7 @@ void Discovery::handle(const Message& m) {
         for (size_t i = 0; i < peers_.size(); ++i) {
             if (peers_[i].mac != m.src) continue;
             PeerInfo lost = peers_[i];
-            peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
+            peers_.erase(i);
             emit(PeerEvent::Lost, lost);
             if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) {
                 MoveHandler h = moveHandler_;
@@ -223,7 +233,7 @@ void Discovery::handle(const Message& m) {
     bool anchor = (a.extFlags & kExtAnchor) != 0;
     bool timeReference = (a.extFlags & kExtTimeReference) != 0;
     if (!peer) {
-        if (peers_.size() >= config_.maxPeers) {
+        if (peers_.full()) {
             // Full: a peer that missed an announcement gives way, the one heard
             // least recently first, so a burst of (possibly spoofed)
             // announcements can't hide peers for good. Peers that keep
@@ -242,13 +252,13 @@ void Discovery::handle(const Message& m) {
             }
             if (victim == peers_.size()) return;
             PeerInfo lost = peers_[victim];
-            peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(victim));
+            peers_.erase(victim);
             emit(PeerEvent::Lost, lost);
             // The handler may have re-entered; look again.
             for (PeerInfo& q : peers_) {
                 if (q.mac == m.src) return;
             }
-            if (peers_.size() >= config_.maxPeers) return;
+            if (peers_.full()) return;
         }
         PeerInfo fresh;
         fresh.mac = m.src;
@@ -261,7 +271,7 @@ void Discovery::handle(const Message& m) {
         fresh.anchor = anchor;
         fresh.timeReference = timeReference;
         fresh.authenticated = m.authenticated;
-        peers_.push_back(fresh);
+        if (!peers_.add(fresh)) return;  // no memory: heard again at its next announcement
         emit(PeerEvent::Found, fresh);
         return;
     }
