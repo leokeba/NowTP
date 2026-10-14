@@ -60,8 +60,8 @@ Port and message ID repeat the values of the message being acknowledged. Status 
   - A message of up to `F − 5` bytes is sent as one single frame.
   - Anything larger is sent as fragments with chunk size `S = F − 9`.
 - **Pacing.** A sender has at most one frame outstanding with the radio. It sends the next frame only after the radio's send-complete callback, or after a short timeout if the callback never arrives. Ack frames go before data frames.
-- **Order.** Messages go out in the order they were queued. A reliable message that is waiting for its ack does not hold up the messages behind it.
-- **Link failures.** For unicast, the radio reports whether the peer's MAC acknowledged the frame. A failed frame is retried a few times, and the message fails after that.
+- **Order.** Destinations take turns, one frame each. To any one destination, messages go out in the order they were queued. A reliable message that is waiting for its ack does not hold up the messages behind it.
+- **Link failures.** For unicast, the radio reports whether the peer's MAC acknowledged the frame. A failed frame is retried a few times, and the message fails after that. Since the radio takes about 100 ms to report a failure, a destination whose frames fail waits a backoff (50 ms, doubling up to 800 ms, reset by a delivered frame) while other destinations have frames to send.
 
 ## Reliable delivery (unicast only)
 

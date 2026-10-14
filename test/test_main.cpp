@@ -368,6 +368,80 @@ TEST(unicast_link_failure_reports_send_failed) {
     CHECK_EQ(net.log.size(), 1u + net.engine(a).config().frameRetries);
 }
 
+// An absent peer's frames take ~100 ms each to fail. Messages to it must not
+// hold up other destinations, or fill the queue for them.
+TEST(absent_peer_does_not_block_others) {
+    sim::Network net;  // failed frames are reported after 100 ms, as on hardware
+    size_t a = net.addNode(), b = net.addNode(), c = net.addNode();
+    net.node(c).online = false;
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    auto small = pattern(100);
+    std::vector<Outcome> dead(5);
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK(net.engine(a).send(net.mac(c), 1, small.data(), small.size(), SendOptions(), dead[i].handler(),
+                                 net.now()) == Status::Ok);
+    }
+    // The queue limit applies per destination.
+    CHECK(net.engine(a).send(net.mac(c), 1, small.data(), small.size(), SendOptions(), dead[4].handler(),
+                             net.now()) == Status::QueueFull);
+    uint32_t t0 = net.now();
+    CHECK(net.engine(a).send(net.mac(b), 1, small.data(), small.size(), SendOptions(), nullptr, net.now()) ==
+          Status::Ok);
+    CHECK(net.runUntil([&] { return !inbox.messages.empty(); }));
+    CHECK(net.now() - t0 <= 110u);  // one failing frame at most, not 4 messages x 3 attempts
+
+    // A large message streams mostly during the absent peer's backoff.
+    auto big = pattern(16000);
+    Outcome out;
+    t0 = net.now();
+    CHECK(net.engine(a).send(net.mac(b), 1, big.data(), big.size(), reliable(), out.handler(), net.now()) ==
+          Status::Ok);
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    uint32_t bigMs = net.now() - t0;
+    std::printf("    16 KB to a live peer beside an absent one: %u ms\n", bigMs);
+    CHECK(bigMs < 700u);
+    CHECK(net.runUntil([&] { return dead[3].done; }, 10000));
+    for (size_t i = 0; i < 4; ++i) CHECK(dead[i].status == Status::SendFailed);
+}
+
+TEST(destinations_take_turns) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode(), c = net.addNode();
+    Inbox ib, ic;
+    net.engine(b).listen(1, ib.handler());
+    net.engine(c).listen(1, ic.handler());
+    auto big = pattern(8000);
+    auto small = pattern(100);
+    net.engine(a).send(net.mac(b), 1, big.data(), big.size(), SendOptions(), nullptr, net.now());
+    net.engine(a).send(net.mac(c), 1, small.data(), small.size(), SendOptions(), nullptr, net.now());
+    // The short message to c doesn't wait for the whole 8 KB to b.
+    CHECK(net.runUntil([&] { return !ic.messages.empty(); }));
+    CHECK(ib.messages.empty());
+    CHECK(net.runUntil([&] { return !ib.messages.empty(); }));
+    // Frames alternate while both have some.
+    net.engine(a).send(net.mac(b), 1, big.data(), big.size(), SendOptions(), nullptr, net.now());
+    net.engine(a).send(net.mac(c), 1, big.data(), big.size(), SendOptions(), nullptr, net.now());
+    size_t from = net.log.size();
+    CHECK(net.runUntil([&] { return ib.messages.size() == 2 && ic.messages.size() == 2; }));
+    for (size_t i = from + 1; i < from + 20; ++i) CHECK(!(net.log[i].dst == net.log[i - 1].dst));
+}
+
+TEST(per_peer_byte_limit) {
+    sim::Network net;
+    Config cfg;
+    cfg.maxTxBytesPerPeer = 10000;
+    size_t a = net.addNode(cfg), b = net.addNode(), c = net.addNode();
+    auto msg = pattern(6000);
+    CHECK(net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), SendOptions(), nullptr, net.now()) ==
+          Status::Ok);
+    CHECK(net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), SendOptions(), nullptr, net.now()) ==
+          Status::QueueFull);
+    CHECK(net.engine(a).send(net.mac(c), 1, msg.data(), msg.size(), SendOptions(), nullptr, net.now()) ==
+          Status::Ok);
+}
+
 TEST(lost_mac_ack_does_not_duplicate_messages) {
     sim::Network net(5);
     net.macAckLoss = 0.4;

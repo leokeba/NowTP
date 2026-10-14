@@ -150,6 +150,9 @@ public:
     /// Probability that a unicast frame arrives but its MAC ack is lost, so the
     /// sender sees a failure and may send it again.
     double macAckLoss = 0.0;
+    /// How long the radio takes to report a failed unicast frame: the real
+    /// driver retries in hardware for ~100 ms first.
+    uint32_t failLatencyMs = 100;
     /// Return true to drop a specific frame (applied before random loss).
     std::function<bool(const Frame&)> dropIf;
     /// Rate/power-dependent delivery (default: always).
@@ -205,7 +208,8 @@ public:
                 if (chance(macAckLoss) || !hears(to, from, nowtp::PhyRate::B1M)) ok = false;
             }
         }
-        schedule(Event{now_ + 1, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
+        uint32_t latency = ok ? 1 : std::max<uint32_t>(1, failLatencyMs);
+        schedule(Event{now_ + latency, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
         return Status::Ok;
     }
 
@@ -261,7 +265,12 @@ private:
         return static_cast<int8_t>(v);
     }
 
-    void schedule(const Event& e) { events_.push_back(e); }
+    // In time order, FIFO among equal times.
+    void schedule(const Event& e) {
+        auto it = events_.end();
+        while (it != events_.begin() && (it - 1)->time > e.time) --it;
+        events_.insert(it, e);
+    }
     // One frame from `from` decoded by `to` (random draw with the link model).
     bool hears(size_t from, size_t to, nowtp::PhyRate rate) {
         const Node& a = *nodes_[from];
@@ -270,7 +279,7 @@ private:
         if (nowtp::isLongRange(rate) && !b.radio.lr) return false;
         if (!linkModel) return true;
         return chance(1.0 - linkModel(from, to, rate, a.radio.power));
-    }  // all events use now+1, so FIFO == time order
+    }
     bool chance(double p) { return p > 0 && std::uniform_real_distribution<double>(0, 1)(rng_) < p; }
     size_t find(const Mac& m) const {
         for (size_t i = 0; i < nodes_.size(); ++i) {

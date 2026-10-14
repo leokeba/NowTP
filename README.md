@@ -358,6 +358,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 |---|---|---|
 | `protocol.maxMessageSize` | 16 KB | Largest message accepted, sending or receiving |
 | `protocol.maxTxMessages` / `maxTxBytes` | 8 / 32 KB | Send queue limits (`QueueFull` beyond) |
+| `protocol.maxTxMessagesPerPeer` / `maxTxBytesPerPeer` | 4 / 24 KB | Of those, for one destination, so an absent peer can't fill the queue for the others |
 | `protocol.maxRxMessages` / `maxRxBytes` | 4 / 32 KB | Messages being reassembled at once, and their memory. Beyond them a new message is refused (the sender backs off and retries), never one in progress. |
 | `protocol.maxRxMessagesPerSender` | 2 | Of those, from one sender |
 | `protocol.sendTimeoutMs` | 2000 | Default deadline for a whole message (`SendOptions::timeoutMs` overrides it) |

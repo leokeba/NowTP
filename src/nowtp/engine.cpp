@@ -28,6 +28,11 @@ inline bool olderWithin(uint16_t a, uint16_t b, uint16_t window) {
 constexpr uint16_t kStaleWindow = 256;
 constexpr size_t kMaxControlFrames = 8;
 constexpr size_t kAckHeaderSize = kCommonHeaderSize + 1;  // + status byte
+// Backoff of a destination whose frames fail, doubling per failure. A failed
+// unicast frame holds the radio ~100 ms (hardware retries), so an absent peer
+// served in turn would still take most of the airtime.
+constexpr uint32_t kBackoffMinMs = 50;
+constexpr uint32_t kBackoffMaxMs = 800;
 
 }  // namespace
 
@@ -167,7 +172,14 @@ Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t le
         }
     }
 
-    if (tx_.size() >= config_.maxTxMessages || txBytes_ + tx->streamLen > config_.maxTxBytes) {
+    size_t peerMessages = 0, peerBytes = 0;
+    for (const auto& t : tx_) {
+        if (!(t->dst == dst)) continue;
+        peerMessages++;
+        peerBytes += t->streamLen;
+    }
+    if (tx_.size() >= config_.maxTxMessages || txBytes_ + tx->streamLen > config_.maxTxBytes ||
+        peerMessages >= config_.maxTxMessagesPerPeer || peerBytes + tx->streamLen > config_.maxTxBytesPerPeer) {
         flushCompletions();
         return Status::QueueFull;
     }
@@ -249,14 +261,9 @@ void Engine::pump(uint32_t now) {
             continue;
         }
 
-        TxMessage* tx = nullptr;
-        for (auto& t : tx_) {
-            if (t->hasPendingFrame()) {
-                tx = t.get();
-                break;
-            }
-        }
+        TxMessage* tx = nextMessage(now);
         if (!tx) break;
+        lastDst_ = tx->dst;
 
         uint16_t index = tx->pendingFrame();
         bool ackRequest = tx->reliable() && tx->isLastPending();
@@ -290,6 +297,48 @@ void Engine::pump(uint32_t now) {
     pumping_ = false;
 }
 
+// Destinations take turns, one frame each, in the order of their oldest
+// pending message; within one, messages go in order. One whose frames are
+// failing waits out its backoff while others have something to send.
+Engine::TxMessage* Engine::nextMessage(uint32_t now) {
+    size_t n = tx_.size();
+    // Start after the last served destination's current message.
+    size_t start = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (tx_[i]->hasPendingFrame() && tx_[i]->dst == lastDst_) {
+            start = i + 1;
+            break;
+        }
+    }
+    TxMessage* waiting = nullptr;  // in backoff; sent only if nothing else is
+    for (size_t k = 0; k < n; ++k) {
+        TxMessage* t = tx_[(start + k) % n].get();
+        if (!t->hasPendingFrame()) continue;
+        bool head = true;  // oldest pending message for its destination
+        for (size_t j = 0; j < n && tx_[j].get() != t; ++j) {
+            if (tx_[j]->hasPendingFrame() && tx_[j]->dst == t->dst) {
+                head = false;
+                break;
+            }
+        }
+        if (!head) continue;
+        Backoff* b = backoff(t->dst);
+        if (b && !reached(now, b->retryAt)) {
+            if (!waiting) waiting = t;
+            continue;
+        }
+        return t;
+    }
+    return waiting;
+}
+
+Engine::Backoff* Engine::backoff(const Mac& dst) {
+    for (Backoff& b : backoffs_) {
+        if (b.dst == dst) return &b;
+    }
+    return nullptr;
+}
+
 void Engine::onFrameSent(bool delivered, uint32_t now) {
     frameSent(delivered, now);
     pump(now);
@@ -308,12 +357,21 @@ void Engine::frameSent(bool delivered, uint32_t now) {
     TxMessage* tx = f.msg;
     if (!tx) return;  // finished (acked, superseded, timed out) while in flight
 
+    Backoff* b = backoff(tx->dst);
     if (!delivered) {
         stats_.framesFailed++;
+        if (!b) {
+            Backoff fresh = {tx->dst, 0, 0};
+            backoffs_.push_back(fresh);
+            b = &backoffs_.back();
+        }
+        if (b->failures < 8) b->failures++;
+        b->retryAt = now + std::min(kBackoffMaxMs, kBackoffMinMs << (b->failures - 1));
         if (++tx->frameFailures > config_.frameRetries) finish(tx, Status::SendFailed);
         return;  // otherwise the same frame is still pending and goes out again
     }
 
+    if (b) backoffs_.erase(backoffs_.begin() + (b - backoffs_.data()));
     tx->frameFailures = 0;
     if (f.firstPass) {
         // Not backwards: a Busy ack may have ended the first pass meanwhile.
@@ -377,6 +435,17 @@ void Engine::tick(uint32_t now) {
             // No feedback: probe by resending the last fragment with an ack request.
             tx->awaitingAck = false;
             tx->addResend(static_cast<uint16_t>(tx->count - 1));
+        }
+        ++i;
+    }
+
+    // Forget a backoff once it is over and nothing is queued for its destination.
+    for (size_t i = 0; i < backoffs_.size();) {
+        bool queued = false;
+        for (const auto& t : tx_) queued = queued || t->dst == backoffs_[i].dst;
+        if (!queued && reached(now, backoffs_[i].retryAt)) {
+            backoffs_.erase(backoffs_.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
         }
         ++i;
     }

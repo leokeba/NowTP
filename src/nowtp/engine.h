@@ -148,6 +148,14 @@ private:
         bool used;
     };
 
+    // A destination whose frames failed: served again only after `retryAt`
+    // while others have frames to send.
+    struct Backoff {
+        Mac dst;
+        uint8_t failures;
+        uint32_t retryAt;
+    };
+
     struct InFlight {
         bool active = false;
         bool control = false;
@@ -159,6 +167,8 @@ private:
     };
 
     void pump(uint32_t now);
+    TxMessage* nextMessage(uint32_t now);
+    Backoff* backoff(const Mac& dst);
     size_t buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest);
     void frameSent(bool delivered, uint32_t now);
     void finish(TxMessage* tx, Status status);
@@ -208,6 +218,8 @@ private:
     std::vector<std::pair<CompletionHandler, Status>> completions_;
     std::vector<uint8_t> frame_;
 
+    std::vector<Backoff> backoffs_;
+    Mac lastDst_{};  // destination of the last data frame, for round-robin
     InFlight inflight_;
     size_t txBytes_ = 0;
     size_t rxBytes_ = 0;

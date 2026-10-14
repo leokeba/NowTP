@@ -112,6 +112,10 @@ struct Config {
     uint8_t maxTxMessages = 8;
     /// Total payload bytes held by queued outgoing messages.
     size_t maxTxBytes = 32 * 1024;
+    /// Of those, to a single destination, so an absent peer cannot fill the
+    /// queue for everyone (send() returns QueueFull for that destination only).
+    uint8_t maxTxMessagesPerPeer = 4;
+    size_t maxTxBytesPerPeer = 24 * 1024;
     /// Messages being reassembled at once. When full (or over maxRxBytes), a
     /// new message replaces one idle for 3 x ackTimeoutMs, or else is refused
     /// (a reliable sender is told to back off and retry). A message in
