@@ -13,6 +13,7 @@
 #include "nowtp/engine.h"
 #include "nowtp/peer_table.h"
 #include "nowtp/security.h"
+#include "nowtp/send_tracker.h"
 #include "nowtp/stream.h"
 #include "nowtp/timesync.h"
 #include "nowtp/wire.h"
@@ -1085,6 +1086,46 @@ TEST(peer_table_keeps_pinned_and_in_flight_peers) {
     t.pin(m[1]);
     CHECK(t.use(m[4], 7, added) == Status::LinkError);
     CHECK_EQ(t.automatic(), 1u);
+}
+
+// The radio's "sent" callback doesn't say which frame it reports.
+TEST(send_tracker_matches_callbacks_to_frames) {
+    Mac a = {{0x02, 0, 0, 0, 0, 1}}, b = {{0x02, 0, 0, 0, 0, 2}};
+    {
+        SendTracker t;
+        t.sent(a, 0, 0);
+        CHECK(!t.reports(0, a));  // nothing new
+        CHECK(t.reports(1, a));
+        CHECK(!t.reports(1, a));  // once
+        t.sent(b, 1, 10);
+        CHECK(!t.reports(2, a));  // another destination's
+    }
+    {
+        // The engine gave up on a frame; its late callback isn't the next frame's.
+        SendTracker t;
+        t.sent(a, 0, 0);
+        t.sent(a, 0, 600);
+        CHECK(!t.reports(1, a));
+        CHECK(t.reports(2, a));
+    }
+    {
+        // A callback that never came stops counting after a while...
+        SendTracker t;
+        t.sent(a, 0, 0);
+        t.sent(b, 0, 3000);
+        CHECK(t.reports(1, b));
+        // ...and if it comes after all, it isn't taken for the next frame's.
+        SendTracker u;
+        u.sent(a, 0, 0);
+        u.sent(b, 0, 3000);
+        CHECK(!u.reports(1, a));
+        CHECK(u.reports(2, b));
+    }
+    {
+        SendTracker t;  // a driver that doesn't name the destination
+        t.sent(a, 0, 0);
+        CHECK(t.reports(1, Mac()));
+    }
 }
 
 // ---------------------------------------------------------------------------

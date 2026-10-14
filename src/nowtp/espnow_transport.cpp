@@ -88,24 +88,55 @@ inline int8_t quarterDbm(float dbm) {
     return static_cast<int8_t>(dbm * 4.0f + 0.5f);
 }
 
-enum EventKind : uint8_t { kEventReceived = 1, kEventSent = 2 };
-
+// A received frame in the event buffer: this header, then the frame.
 struct EventHeader {
-    uint32_t timeLo;    // esp_timer time of the driver callback, µs (split: ring buffer
-    uint32_t timeHi;    // items are only 4-byte aligned)
-    uint8_t kind;
-    uint8_t delivered;  // kEventSent only
-    int8_t rssi;        // kEventReceived only; 0 if unknown
-    uint8_t mac[6];     // source (received) or destination (sent); zero if unknown
+    uint32_t timeLo;  // esp_timer time of the driver callback, µs (split: ring buffer
+    uint32_t timeHi;  // items are only 4-byte aligned)
+    int8_t rssi;      // 0 if unknown
+    uint8_t mac[6];   // source
 };
 
+// A ring buffer item's own header, and its rounding.
+constexpr size_t kRingItemOverhead = 8;
+inline size_t ringItemSize(size_t frame) {
+    return kRingItemOverhead + ((sizeof(EventHeader) + frame + 3) & ~static_cast<size_t>(3));
+}
+
 // ESP-NOW callbacks carry no user pointer, so they reach the active
-// instance's event buffer through these.
-RingbufHandle_t volatile s_events = nullptr;
+// instance through these.
+std::atomic<RingbufHandle_t> s_events{nullptr};  // received frames
+std::atomic<TaskHandle_t> s_task{nullptr};       // woken by both callbacks
+std::atomic<int> s_inCallback{0};                // end() waits for these to return
+// The last "sent" callback. Kept out of the event buffer: a burst of
+// received frames could fill it, and a lost "sent" event stalls sending.
+// The callback writes the fields, then bumps `count`.
+struct SentSlot {
+    std::atomic<uint32_t> count{0};
+    std::atomic<bool> delivered{false};
+    uint8_t mac[6];
+};
+SentSlot s_sent;
 // Power found to work by the automatic fallback or optimize(); kept for the boot.
 float s_learnedCeilingDbm = 0;
 volatile uint32_t s_droppedEvents = 0;
 bool s_active = false;
+
+struct CallbackGuard {
+    CallbackGuard() { s_inCallback.fetch_add(1); }
+    ~CallbackGuard() { s_inCallback.fetch_sub(1); }
+};
+
+void wakeTask() {
+    TaskHandle_t t = s_task.load();
+    if (t) xTaskNotifyGive(t);
+}
+
+// After the callbacks are unregistered: one may still be running.
+void waitForCallbacks() {
+    s_events = nullptr;
+    s_task = nullptr;
+    while (s_inCallback.load() != 0) vTaskDelay(1);
+}
 
 inline uint32_t nowMs() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
@@ -136,8 +167,9 @@ esp_err_t addPlainPeer(const Mac& mac, wifi_interface_t interface) {
     return esp_now_add_peer(&peer);
 }
 
-// Runs in the Wi-Fi driver task: copy the event out and return quickly.
-void pushEvent(uint8_t kind, const uint8_t* mac, bool delivered, int8_t rssi, const uint8_t* data, size_t len) {
+// Runs in the Wi-Fi driver task: copy the frame out and return quickly.
+void pushReceived(const uint8_t* mac, int8_t rssi, const uint8_t* data, size_t len) {
+    CallbackGuard guard;
     RingbufHandle_t rb = s_events;
     if (!rb) return;
     void* slot = nullptr;
@@ -149,28 +181,23 @@ void pushEvent(uint8_t kind, const uint8_t* mac, bool delivered, int8_t rssi, co
     uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
     h->timeLo = static_cast<uint32_t>(t);
     h->timeHi = static_cast<uint32_t>(t >> 32);
-    h->kind = kind;
-    h->delivered = delivered ? 1 : 0;
     h->rssi = rssi;
-    if (mac) {
-        memcpy(h->mac, mac, sizeof(h->mac));
-    } else {
-        memset(h->mac, 0, sizeof(h->mac));
-    }
-    if (len) memcpy(static_cast<uint8_t*>(slot) + sizeof(EventHeader), data, len);
+    memcpy(h->mac, mac, sizeof(h->mac));
+    memcpy(static_cast<uint8_t*>(slot) + sizeof(EventHeader), data, len);
     xRingbufferSendComplete(rb, slot);
+    wakeTask();
 }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
 void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     if (!info || len <= 0) return;
     int8_t rssi = info->rx_ctrl ? static_cast<int8_t>(info->rx_ctrl->rssi) : 0;
-    pushEvent(kEventReceived, info->src_addr, false, rssi, data, static_cast<size_t>(len));
+    pushReceived(info->src_addr, rssi, data, static_cast<size_t>(len));
 }
 #else
 void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
     if (!mac || len <= 0) return;
-    pushEvent(kEventReceived, mac, false, 0, data, static_cast<size_t>(len));
+    pushReceived(mac, 0, data, static_cast<size_t>(len));
 }
 #endif
 
@@ -180,7 +207,16 @@ void onSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
 #else
 void onSent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
-    pushEvent(kEventSent, mac, status == ESP_NOW_SEND_SUCCESS, 0, nullptr, 0);
+    CallbackGuard guard;
+    if (!s_events.load()) return;
+    if (mac) {
+        memcpy(s_sent.mac, mac, sizeof(s_sent.mac));
+    } else {
+        memset(s_sent.mac, 0, sizeof(s_sent.mac));
+    }
+    s_sent.delivered.store(status == ESP_NOW_SEND_SUCCESS, std::memory_order_relaxed);
+    s_sent.count.fetch_add(1, std::memory_order_release);
+    wakeTask();
 }
 
 }  // namespace
@@ -206,8 +242,13 @@ private:
 // Link implementation over esp_now_send(), with per-peer frame sizes.
 class EspNowTransport::RadioLink : public Link {
 public:
-    RadioLink(uint16_t defaultSize, bool autoAddPeers, PeerTable& peers, std::function<void(const Mac&)> added)
-        : defaultSize_(defaultSize), autoAddPeers_(autoAddPeers), peers_(peers), added_(std::move(added)) {}
+    RadioLink(uint16_t defaultSize, bool autoAddPeers, PeerTable& peers, SendTracker& tracker,
+              std::function<void(const Mac&)> added)
+        : defaultSize_(defaultSize),
+          autoAddPeers_(autoAddPeers),
+          peers_(peers),
+          tracker_(tracker),
+          added_(std::move(added)) {}
 
     Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override {
         if (autoAddPeers_ && !dst.isBroadcast()) {
@@ -218,8 +259,10 @@ public:
             }
             if (added && added_) added_(dst);  // apply the unicast rate to the new peer
         }
+        uint32_t reported = s_sent.count.load(std::memory_order_acquire);
         esp_err_t err = esp_now_send(dst.bytes, data, len);
         if (err == ESP_OK) {
+            tracker_.sent(dst, reported, nowMs());
             peers_.setInFlight(dst);
             return Status::Ok;
         }
@@ -253,6 +296,7 @@ private:
     uint16_t defaultSize_;
     bool autoAddPeers_;
     PeerTable& peers_;
+    SendTracker& tracker_;
     std::function<void(const Mac&)> added_;
     std::vector<std::pair<Mac, uint16_t>> sizes_;
 };
@@ -316,12 +360,16 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     if (config_.defaultMaxFrameSize < 32) config_.defaultMaxFrameSize = 32;
     if (config_.tickIntervalMs == 0) config_.tickIntervalMs = 1;
 
-    events_ = xRingbufferCreate(config_.eventBufferSize, RINGBUF_TYPE_NOSPLIT);
+    // Room for a few of the largest frames by default.
+    size_t ring = config_.eventBufferSize;
+    if (ring == 0) ring = std::max<size_t>(8 * 1024, 8 * ringItemSize(maxSupportedFrameSize()));
+    events_ = xRingbufferCreate(ring, RINGBUF_TYPE_NOSPLIT);
+    sendTracker_ = SendTracker();
     mutex_ = xSemaphoreCreateRecursiveMutex();
     taskExited_ = xSemaphoreCreateBinary();
     peerDriver_.reset(new PeerDriver(interface_));
     peerTable_.reset(new PeerTable(*peerDriver_));
-    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, *peerTable_,
+    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, *peerTable_, sendTracker_,
                               [this](const Mac& mac) { applyPeerRate(mac); }));
     engine_.reset(new Engine(*link_, config_.protocol, static_cast<uint16_t>(esp_random())));
     if (!events_ || !mutex_ || !taskExited_) {
@@ -388,6 +436,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     // Per-peer settings belong to a session: ESP-NOW forgets its peers on deinit.
     peerRates_.clear();
     explicitFrameSizes_.clear();
+    s_sent.count = 0;  // no callbacks registered yet
+    sentSeen_ = 0;
     s_events = events_;
     s_active = true;
     esp_now_register_recv_cb(onRecv);
@@ -425,6 +475,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
             cleanup();
             return Status::NoMemory;
         }
+        s_task = task_;
     }
     return Status::Ok;
 }
@@ -452,10 +503,11 @@ void EspNowTransport::end() {
     }
     esp_now_unregister_recv_cb();
     esp_now_unregister_send_cb();
-    s_events = nullptr;
+    waitForCallbacks();
 
     if (task_) {
         stopping_ = true;
+        xTaskNotifyGive(task_);
         xSemaphoreTake(taskExited_, portMAX_DELAY);
         task_ = nullptr;
     }
@@ -472,7 +524,7 @@ void EspNowTransport::cleanup() {
         esp_now_deinit();
         espNowInitialized_ = false;
     }
-    s_events = nullptr;
+    waitForCallbacks();  // before the event buffer goes
     s_active = false;
     // Services before what they run on.
     streams_.reset();
@@ -514,7 +566,8 @@ void EspNowTransport::taskEntry(void* arg) {
     EspNowTransport* self = static_cast<EspNowTransport*>(arg);
     TickType_t wait = pdMS_TO_TICKS(self->config_.tickIntervalMs);
     if (wait == 0) wait = 1;
-    while (!self->stopping_) self->processEvents(wait);
+    bool more = false;
+    while (!self->stopping_) more = self->processEvents(more ? 0 : wait);
     xSemaphoreGive(self->taskExited_);
     vTaskDelete(nullptr);
 }
@@ -524,29 +577,48 @@ void EspNowTransport::poll() {
     processEvents(0);
 }
 
-void EspNowTransport::processEvents(TickType_t wait) {
+// The latest "sent" callback, if it reports the frame the engine waits for.
+void EspNowTransport::checkSent() {
+    uint32_t count = s_sent.count.load(std::memory_order_acquire);
+    if (count == sentSeen_) return;
+    Mac mac = Mac::from(s_sent.mac);
+    bool delivered = s_sent.delivered.load(std::memory_order_relaxed);
+    if (s_sent.count.load(std::memory_order_acquire) != count) return;  // being written; it wakes us again
+    sentSeen_ = count;
+    notePeerSendResult(mac, delivered);
+    if (!sendTracker_.reports(count, mac)) return;  // a late report for a frame the engine gave up on
+    peerTable_->clearInFlight();
+    engine_->onFrameSent(delivered, nowMs());
+}
+
+bool EspNowTransport::processEvents(TickType_t wait) {
     size_t size = 0;
-    void* item = xRingbufferReceive(events_, &size, wait);
+    void* item = nullptr;
+    if (wait) {
+        if (task_ && xTaskGetCurrentTaskHandle() == task_) {
+            ulTaskNotifyTake(pdTRUE, wait);  // either callback wakes us, or the tick
+        } else {
+            // An application task (poll mode): its notifications aren't ours.
+            item = xRingbufferReceive(events_, &size, wait);
+        }
+    }
     lock();
+    checkSent();
     // Bounded batch so timers still run under a flood of frames.
-    for (int n = 0; item;) {
+    int n = 0;
+    while (n < 32 && (item || (item = xRingbufferReceive(events_, &size, 0)) != nullptr)) {
+        ++n;
         if (size >= sizeof(EventHeader)) {
             const EventHeader* h = static_cast<const EventHeader*>(item);
-            if (h->kind == kEventReceived) {
-                const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
-                Mac src = Mac::from(h->mac);
-                notePeerHeard(src);
-                uint64_t at = h->timeLo | (static_cast<uint64_t>(h->timeHi) << 32);
-                engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi, at);
-            } else if (h->kind == kEventSent) {
-                notePeerSendResult(Mac::from(h->mac), h->delivered != 0);
-                peerTable_->clearInFlight();
-                engine_->onFrameSent(h->delivered != 0, nowMs());
-            }
+            const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
+            Mac src = Mac::from(h->mac);
+            notePeerHeard(src);
+            uint64_t at = h->timeLo | (static_cast<uint64_t>(h->timeHi) << 32);
+            engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi, at);
         }
         vRingbufferReturnItem(events_, item);
-        if (++n >= 32) break;
-        item = xRingbufferReceive(events_, &size, 0);
+        item = nullptr;
+        checkSent();  // the next frame can go as soon as the last one is reported
     }
     uint32_t now = nowMs();
     engine_->tick(now);
@@ -562,6 +634,7 @@ void EspNowTransport::processEvents(TickType_t wait) {
     if (streams_) streams_->tick(now);
     tickLinkChecks(now);
     unlock();
+    return n >= 32;
 }
 
 Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {

@@ -14,6 +14,7 @@
 #include "discovery.h"
 #include "engine.h"
 #include "peer_table.h"
+#include "send_tracker.h"
 #include "radio.h"
 #include "security.h"
 #include "stream.h"
@@ -131,8 +132,12 @@ struct EspNowConfig {
     uint32_t taskStackSize = 4096;
     UBaseType_t taskPriority = 5;
     BaseType_t taskCore = tskNO_AFFINITY;
-    /// Bytes buffered between the Wi-Fi driver callbacks and the NowTP task.
-    size_t eventBufferSize = 8 * 1024;
+    /// Bytes buffered between the Wi-Fi driver's receive callback and the NowTP
+    /// task. 0: room for 8 frames of the largest size this ESP-NOW version
+    /// supports, at least 8 KB (about 12 KB with ESP-NOW v2). Frames that don't
+    /// fit are dropped and counted (stats().droppedEvents); reliable messages
+    /// recover them. Send results don't go through it.
+    size_t eventBufferSize = 0;
     /// How often timeouts and retransmissions are checked.
     uint32_t tickIntervalMs = 5;
 };
@@ -348,12 +353,15 @@ private:
     void notePeerHeard(const Mac& mac);
     void notePeerSendResult(const Mac& mac, bool delivered);
     bool hasExplicitFrameSize(const Mac& mac) const;
-    void processEvents(TickType_t wait);
+    bool processEvents(TickType_t wait);  // true if events are left
+    void checkSent();
     void lock() const;
     void unlock() const;
     void cleanup();
 
     EspNowConfig config_;
+    SendTracker sendTracker_;
+    uint32_t sentSeen_ = 0;
     std::unique_ptr<PeerDriver> peerDriver_;
     std::unique_ptr<PeerTable> peerTable_;  // ESP-NOW's 20 slots: LRU eviction of automatic peers
     std::unique_ptr<RadioLink> link_;
