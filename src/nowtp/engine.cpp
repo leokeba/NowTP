@@ -74,6 +74,9 @@ struct Engine::TxMessage {
     uint16_t count = 1;     // 1 = single frame
     uint16_t fragSize = 0;  // stream bytes per fragment when count > 1
     size_t streamLen = 0;   // payload, plus CRC-32 when count > 1
+    size_t trailerAt = 0;   // offset of the authentication trailer (with kFlagAuth)
+    bool hasBindBefore = false;
+    uint8_t bindBefore[kAckBindSize];  // the trailer's start before the last reseal()
     Bytes stream;
     uint16_t nextIndex = 0;  // next fragment of the first pass
     Bytes resend;            // bitmap of fragments to send again, allocated on first use
@@ -264,6 +267,7 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     if (trailer) {
         auth_->seal(dst, port, tx->flags, tx->stream.get(), len, tx->stream.get() + len);
         tx->flags = static_cast<uint8_t>(tx->flags | kFlagAuth);
+        tx->trailerAt = len;
     }
     if (count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
 
@@ -506,6 +510,20 @@ void Engine::flushCompletions() {
     flushing_ = false;
 }
 
+void Engine::reseal(const Mac& dst) {
+    if (!auth_) return;
+    for (auto& t : tx_) {
+        if (!(t->dst == dst) || !(t->flags & kFlagAuth) || !auth_->sealing(t->port)) continue;
+        uint8_t* trailer = t->stream.get() + t->trailerAt;
+        memcpy(t->bindBefore, trailer, kAckBindSize);  // an ack may still come for the old seal
+        t->hasBindBefore = true;
+        auth_->seal(dst, t->port, static_cast<uint8_t>(t->flags & (kFlagReliable | kFlagLatest)), t->stream.get(),
+                    t->trailerAt, trailer);
+        size_t payloadLen = t->trailerAt + kAuthTrailerSize;
+        if (t->count > 1) putU32(t->stream.get() + payloadLen, crc32(t->stream.get(), payloadLen));
+    }
+}
+
 void Engine::tick(uint32_t now) {
     if (inflight_.active && reached(now, inflight_.deadline)) {
         frameSent(false, now);  // the radio never reported back; treat as lost
@@ -690,8 +708,10 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
     bool ackRequest = reliable && (h.flags & kFlagAckRequest) != 0;
 
     // Also catches unreliable duplicates: the radio resends a frame whose MAC ack was lost.
-    if (isRecent(src, h.messageId, now)) {
-        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
+    if (const Recent* r = findRecent(src, h.messageId, now)) {
+        if (ackRequest) {
+            queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, r->bound ? r->bind : nullptr);
+        }
         return;
     }
     if (!hasListener(h.port)) {
@@ -713,8 +733,9 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
         }
         dropOlderLatest(src, h.port, h.messageId);
     }
-    remember(src, h.port, h.flags, h.messageId, now);
-    if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
+    const uint8_t* bind = authenticated ? payload + len : nullptr;  // the trailer follows the payload
+    remember(src, h.port, h.flags, h.messageId, bind, now);
+    if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, bind);
     deliver(src, h.port, h.flags, payload, len, rxRssi_, rxTimeUs_, authenticated);
 }
 
@@ -723,8 +744,10 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
     bool latest = (h.flags & kFlagLatest) != 0;
     bool ackRequest = reliable && (h.flags & kFlagAckRequest) != 0;
 
-    if (isRecent(src, h.messageId, now)) {
-        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr);
+    if (const Recent* r = findRecent(src, h.messageId, now)) {
+        if (ackRequest) {
+            queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, r->bound ? r->bind : nullptr);
+        }
         return;
     }
 
@@ -990,9 +1013,10 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
         stats_.messagesDropped++;
         return;
     }
-    remember(owned->src, owned->port, owned->flags, owned->id, now);
+    const uint8_t* bind = authenticated ? data + len : nullptr;  // the trailer follows the payload
+    remember(owned->src, owned->port, owned->flags, owned->id, bind, now);
     if (reliable) {
-        queueAck(owned->src, owned->port, owned->id, owned->flags, AckStatus::Complete, nullptr);
+        queueAck(owned->src, owned->port, owned->id, owned->flags, AckStatus::Complete, nullptr, bind);
     }
     deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated,
             owned->buf.release());
@@ -1026,7 +1050,8 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         }
         const uint8_t* frame = payload - kCommonHeaderSize;
         if (!auth_ || len < 1 + kAckTagSize ||
-            !auth_->openAck(src, frame, kCommonHeaderSize + len - kAckTagSize, payload + len - kAckTagSize)) {
+            !auth_->openAck(src, frame, kCommonHeaderSize + len - kAckTagSize, payload + len - kAckTagSize,
+                            tx->stream.get() + tx->trailerAt, tx->hasBindBefore ? tx->bindBefore : nullptr)) {
             stats_.authRejected++;
             return;
         }
@@ -1055,7 +1080,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
 }
 
 void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, AckStatus status,
-                      const RxMessage* missing) {
+                      const RxMessage* missing, const uint8_t* bind) {
     bool tagged = (flags & kFlagAuth) && auth_ && auth_->sealing(port);
     size_t mtu = link_.maxFrameSize(dst);
     if (mtu < kAckHeaderSize + kAckTagSize) return;
@@ -1092,7 +1117,7 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
         }
     }
     if (tagged) {
-        auth_->sealAck(dst, c.frame.get(), off, c.frame.get() + off);
+        auth_->sealAck(dst, c.frame.get(), off, bind, c.frame.get() + off);
         off += kAckTagSize;
     }
 
@@ -1118,8 +1143,10 @@ void Engine::popControl() {
 // ---------------------------------------------------------------------------
 // Recently completed messages: duplicate suppression and latest-only ordering
 
-void Engine::remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, uint32_t now) {
+void Engine::remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind, uint32_t now) {
     Recent& r = recent_[recentNext_];
+    r.bound = bind != nullptr;
+    if (bind) memcpy(r.bind, bind, sizeof(r.bind));
     recentNext_ = (recentNext_ + 1) % recent_.size();
     r.src = src;
     r.port = port;
@@ -1129,11 +1156,11 @@ void Engine::remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, 
     r.used = true;
 }
 
-bool Engine::isRecent(const Mac& src, uint16_t id, uint32_t now) const {
+const Engine::Recent* Engine::findRecent(const Mac& src, uint16_t id, uint32_t now) const {
     for (const Recent& r : recent_) {
-        if (r.used && r.messageId == id && r.src == src && !reached(now, r.at + config_.recentTtlMs)) return true;
+        if (r.used && r.messageId == id && r.src == src && !reached(now, r.at + config_.recentTtlMs)) return &r;
     }
-    return false;
+    return nullptr;
 }
 
 bool Engine::isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const {

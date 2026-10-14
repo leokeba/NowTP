@@ -41,6 +41,8 @@ constexpr size_t kAuthTrailerSize = 17;
 constexpr size_t kMaxFrameSize = 1470;  // ESP-NOW v2
 /// Tag appended to an ack for an authenticated message.
 constexpr size_t kAckTagSize = 8;
+/// Leading trailer bytes (epoch, sequence) a bound ack tag covers.
+constexpr size_t kAckBindSize = 8;
 
 struct Header {
     Type type = Type::Single;

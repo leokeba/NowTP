@@ -1975,6 +1975,143 @@ TEST(secure_old_epoch_is_not_replayable_after_reboot) {
     CHECK_EQ(inbox.messages.size(), 2u);
 }
 
+// A recorded message must not be accepted again: not after the receiver
+// reboots, and not after an old epoch's message forces a new challenge.
+TEST(secure_replay_after_receiver_reboot_is_refused) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(40), reliable()) == Status::Ok);
+    std::vector<uint8_t> m = rig.lastFrame(a, 1);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    rig.reboot(b, testKey());
+    rig.net.engine(b).listen(1, inbox.handler());
+    m[3] ^= 0x5A;  // another message id: not a duplicate for the engine
+    rig.net.inject(b, rig.net.mac(a), m);  // held back; b challenges a
+    rig.net.run(200);
+    CHECK_EQ(rig.sec[b]->counters().epochsVerified, 1u);
+    m[3] ^= 0x01;
+    rig.net.inject(b, rig.net.mac(a), m);
+    rig.net.run(10);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    CHECK(rig.sec[b]->counters().replaysRejected >= 1u);
+    // a's new messages still get through.
+    CHECK(rig.sendWait(a, b, 1, pattern(41), reliable()) == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 2u);
+}
+
+TEST(secure_forced_reverification_does_not_reopen_the_window) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(40), reliable()) == Status::Ok);
+    std::vector<uint8_t> oldEpoch = rig.lastFrame(a, 1);
+    rig.net.run(3000);
+    rig.reboot(a, testKey());
+    CHECK(rig.sendWait(a, b, 1, pattern(41, 7), reliable()) == Status::Ok);
+    std::vector<uint8_t> cur = rig.lastFrame(a, 1);
+    rig.net.run(2000);
+    for (int round = 0; round < 3; ++round) {
+        oldEpoch[3] ^= 0x11;
+        rig.net.inject(b, rig.net.mac(a), oldEpoch);  // old epoch: b challenges a again
+        rig.net.run(200);
+        cur[3] = static_cast<uint8_t>(cur[3] + 0x21);
+        size_t before = inbox.messages.size();
+        rig.net.inject(b, rig.net.mac(a), cur);
+        rig.net.run(1500);
+        CHECK_EQ(inbox.messages.size(), before);
+    }
+    CHECK(rig.sec[b]->counters().epochsVerified >= 3u);  // the challenges did happen
+    CHECK(rig.sendWait(a, b, 1, pattern(42), reliable()) == Status::Ok);
+}
+
+// An ack names the message it acknowledges (epoch and sequence), so a recorded
+// "complete" can't confirm a later message that reuses the id.
+TEST(secure_acks_are_bound_to_the_message) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    rig.net.engine(a).listen(1, [](const Message&) {});
+    rig.net.engine(b).listen(1, [](const Message&) {});
+    // Each verifies the other, learning its capabilities.
+    CHECK(rig.sendWait(a, b, 1, pattern(10), reliable()) == Status::Ok);
+    CHECK(rig.sendWait(b, a, 1, pattern(10), reliable()) == Status::Ok);
+
+    uint8_t frame[6];
+    wire::Header h;
+    h.type = wire::Type::Ack;
+    h.flags = wire::kFlagAuth;
+    h.port = 1;
+    h.messageId = 777;
+    wire::encodeHeader(h, frame);
+    const uint8_t first[8] = {1, 2, 3, 4, 5, 0, 0, 0};
+    const uint8_t later[8] = {1, 2, 3, 4, 9, 0, 0, 0};
+    uint8_t tag[wire::kAckTagSize];
+    Mac ma = rig.net.mac(a), mb = rig.net.mac(b);
+    for (uint8_t status : {uint8_t(wire::AckStatus::Complete), uint8_t(wire::AckStatus::Missing)}) {
+        frame[5] = status;
+        rig.sec[b]->sealAck(ma, frame, sizeof(frame), first, tag);
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, first, nullptr));
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, first));  // sealed again since
+        CHECK(!rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr));
+        // Unbound: accepted only for other statuses, from a receiver that binds.
+        rig.sec[b]->sealAck(ma, frame, sizeof(frame), nullptr, tag);
+        bool complete = status == uint8_t(wire::AckStatus::Complete);
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr) == !complete);
+    }
+}
+
+// A response without the capabilities extension, as from NowTP 0.5: the
+// sender won't seal its queued message again, so the receiver keeps the old
+// window rule and the held-back message still gets through.
+TEST(secure_older_senders_still_verify) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    // b's challenges never reach a; we answer them the old way instead.
+    rig.net.dropIf = [&](const sim::Frame& f) {
+        wire::Header fh;
+        size_t off;
+        return f.from == b && wire::decodeHeader(f.data.data(), f.data.size(), fh, off) &&
+               fh.port == kSecurityPort;
+    };
+    Outcome out;
+    auto msg = pattern(20);
+    rig.net.engine(a).send(rig.net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), rig.net.now());
+    rig.net.run(30);
+    CHECK(inbox.messages.empty());
+    std::vector<uint8_t> challenge = rig.lastFrame(b, kSecurityPort);
+    std::vector<uint8_t> m = rig.lastFrame(a, 1);
+    CHECK(challenge.size() >= wire::kCommonHeaderSize + 9 && m.size() > wire::kAuthTrailerSize);
+    const uint8_t* trailer = m.data() + m.size() - wire::kAuthTrailerSize;
+
+    std::vector<uint8_t> resp(1 + 8 + 4 + 4);
+    resp[0] = 2;
+    std::memcpy(&resp[1], &challenge[wire::kCommonHeaderSize + 1], 8);
+    std::memcpy(&resp[9], trailer, 8);  // a's epoch, and its current sequence: the held-back message's
+    uint8_t kc[32], full[32];
+    auto key = testKey();
+    crypto::hmacSha256(key.data(), key.size(), reinterpret_cast<const uint8_t*>("NowTP challenge"), 15, kc);
+    crypto::HmacSha256 t(kc, sizeof(kc));
+    t.update(rig.net.mac(a).bytes, 6);
+    t.update(rig.net.mac(b).bytes, 6);
+    t.update(&resp[1], 16);
+    t.finish(full);
+    resp.insert(resp.end(), full, full + 16);
+    wire::Header rh;
+    rh.port = kSecurityPort;
+    rh.messageId = 4321;
+    std::vector<uint8_t> f(wire::kCommonHeaderSize);
+    wire::encodeHeader(rh, f.data());
+    f.insert(f.end(), resp.begin(), resp.end());
+    rig.net.inject(b, rig.net.mac(a), f);
+    CHECK(rig.net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+}
+
 TEST(secure_forged_acks_are_ignored) {
     SecureRig rig;
     size_t a = rig.add(testKey()), b = rig.add(testKey());

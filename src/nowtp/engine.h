@@ -65,10 +65,14 @@ public:
     /// Checks a received message; `trailer` is null for an unauthenticated one.
     virtual Verdict open(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len,
                          const uint8_t* trailer, uint32_t nowMs) = 0;
-    /// Tags an ack frame (header included) sent to `dst`.
-    virtual void sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) = 0;
-    /// Verifies an ack frame from `src`.
-    virtual bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag) = 0;
+    /// Tags an ack frame (header included) sent to `dst`. `bind`, when the
+    /// acknowledged message is known, is its trailer's first kAckBindSize
+    /// bytes (epoch and sequence), so the ack can't stand for another message.
+    virtual void sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) = 0;
+    /// Verifies an ack frame from `src` for our message whose trailer starts
+    /// with `bind`, or with `bindBefore` (its seal before the last reseal()).
+    virtual bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
+                         const uint8_t* bindBefore) = 0;
 
     enum class Screen : uint8_t {
         Normal,
@@ -138,6 +142,10 @@ public:
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
     /// True when outgoing messages on `port` are authenticated (a key is installed).
     bool authenticates(uint8_t port) const { return auth_ && auth_->sealing(port); }
+    /// Seals the authenticated messages queued for `dst` again, with fresh
+    /// sequence numbers. Called by Security after answering dst's challenge:
+    /// dst then accepts only numbers above the one we reported.
+    void reseal(const Mac& dst);
 
     /// Fails every outgoing message with `reason` and drops partial incoming ones.
     void cancelAll(Status reason = Status::Cancelled);
@@ -186,6 +194,8 @@ private:
         uint16_t messageId;
         uint32_t at;
         bool used;
+        bool bound;  // `bind` holds the message's epoch and sequence
+        uint8_t bind[wire::kAckBindSize];
     };
 
     // A destination whose frames failed: served again only after `retryAt`
@@ -238,13 +248,13 @@ private:
     /// Largest reassembled stream accepted: message, trailer and CRC.
     size_t maxStream() const { return config_.maxMessageSize + wire::kAuthTrailerSize + wire::kCrcSize; }
 
-    void remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, uint32_t now);
-    bool isRecent(const Mac& src, uint16_t id, uint32_t now) const;
+    void remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind, uint32_t now);
+    const Recent* findRecent(const Mac& src, uint16_t id, uint32_t now) const;
     bool isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const;
     void dropOlderLatest(const Mac& src, uint8_t port, uint16_t id);
 
     void queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, wire::AckStatus status,
-                  const RxMessage* missing);
+                  const RxMessage* missing, const uint8_t* bind = nullptr);
     Control& control(size_t i) { return control_[(controlHead_ + i) % kMaxControlFrames]; }
     void popControl();
 

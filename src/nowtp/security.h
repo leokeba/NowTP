@@ -107,8 +107,9 @@ public:
     void seal(const Mac& dst, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, uint8_t* trailer) override;
     Verdict open(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, const uint8_t* trailer,
                  uint32_t nowMs) override;
-    void sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) override;
-    bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag) override;
+    void sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) override;
+    bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
+                 const uint8_t* bindBefore) override;
     Screen screen(const Mac& src, uint8_t port, uint8_t flags) const override;
 
 private:
@@ -135,6 +136,7 @@ private:
         uint8_t nonce[8];
         uint32_t challengeAt = 0;
         uint8_t tries = 0;
+        uint8_t caps = 0;  // from its authenticated response (kCap*)
     };
 
     struct Pairing {
@@ -171,6 +173,8 @@ private:
     void respond(const Mac& to, const uint8_t* nonce, uint32_t now);
     void verifyResponse(const Mac& from, const uint8_t* d, size_t len, uint32_t now);
     bool acceptSequence(Peer& p, uint32_t seq);
+    void ackTag(const Mac& acker, const Mac& ackee, const uint8_t* frame, size_t len, const uint8_t* bind,
+                uint8_t* out) const;
 
     // Pairing helpers (host lock not held unless noted).
     void randomBytes(uint8_t* out, size_t len);

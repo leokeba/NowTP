@@ -245,7 +245,7 @@ ESP-NOW only reaches nodes on the same channel. A node connected to an access po
 Trust by MAC address is weak on a shared channel: any device can send ESP-NOW frames from any address. With an *installation key* (16–32 bytes, shared by all nodes of an installation):
 
 - **What is authenticated.** Every message is authenticated: application ports, discovery, diagnostics, time sync and streams. The tag (HMAC-SHA256) covers the content, the sender, the destination and the port.
-- **Replays.** Recorded messages can't be replayed: messages carry a sequence number, and a sender's boot epoch is checked with a challenge the first time it is seen.
+- **Replays.** Recorded messages can't be replayed, even after the receiver reboots: messages carry a sequence number, and a sender's boot epoch is checked with a challenge the first time it is seen. Acks name the message they confirm. Against nodes running NowTP 0.5, the older, weaker rules apply (see docs/PROTOCOL.md).
 - **Acks.** Acks are authenticated too, so only a key holder can confirm a reliable message.
 - **What a key-holding node accepts.** With the default `security.requireAuthentication`, a node with a key drops everything else: messages from nodes without the key, with another key, tampered or replayed. Peers that aren't paired don't show up in discovery either. Set it to false to receive both kinds, and check `Message::authenticated`.
 - **Errors.** A reliable send to a node holding another key, or none, fails with `AuthFailed`.

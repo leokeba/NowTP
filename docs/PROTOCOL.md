@@ -152,14 +152,31 @@ A node with a key authenticates every message it sends, except those on port 253
 | 9 | 8 | Tag: the first 8 bytes of `HMAC-SHA256(Km, network id ‖ src MAC ‖ dst MAC ‖ port ‖ flags ‖ trailer[0..9] ‖ payload)` |
 
 - **What the tag covers.** `flags` are the message's reliable and latest-only bits. `dst MAC` is the receiver's own MAC for unicast, and `FF:FF:FF:FF:FF:FF` for broadcast, so a unicast message cannot be redirected to another node.
-- **Receiver checks.** The receiver checks the tag, then the sequence number against a 64-entry sliding window per sender and epoch. Repeats and numbers older than the window are rejected.
+- **Receiver checks.** The receiver checks the tag, then the sequence number against a 64-entry sliding window per sender and epoch. Repeats and numbers older than the window are dropped silently. A refusal could reach the real sender, which may have a message with that ID in flight.
 - **Unknown epochs.** A message from an epoch the receiver hasn't verified is held back. The receiver drops it without an ack, and challenges the sender:
   - **Challenge** (type 1): `type ‖ nonce (8)`.
-  - **Response** (type 2): `type ‖ nonce (8) ‖ epoch (4) ‖ current sequence (4) ‖ tag (16)`. The tag is the first 16 bytes of `HMAC(Kc, responder MAC ‖ challenger MAC ‖ nonce ‖ epoch ‖ sequence)`.
+  - **Response** (type 2): `type ‖ nonce (8) ‖ epoch (4) ‖ current sequence (4) ‖ tag (16) ‖ capabilities (1) ‖ capabilities tag (16)`.
+    - The tag is the first 16 bytes of `HMAC(Kc, responder MAC ‖ challenger MAC ‖ nonce ‖ epoch ‖ sequence)`.
+    - The capabilities tag is the first 16 bytes of `HMAC(Kc, "NowTP caps" ‖ responder MAC ‖ challenger MAC ‖ the 33 bytes from the nonce to the capabilities)`.
+    - Capability bits: `0x1` reseals (below), `0x2` checks bound acks (below).
+    - The two capability fields are optional. NowTP 0.5 and earlier neither send nor read them, so a response with them still verifies there.
 
-  A valid response makes that epoch the sender's verified epoch. The window then accepts, once each, numbers up to 64 below the reported sequence. A reliable sender's next probe gets through. A message whose epoch differs from one verified less than a second ago is a replay and is rejected outright. Responses are rate-limited to 20 per second.
+  A valid response makes that epoch the sender's verified epoch:
+  - **A new epoch** (or the first one heard from this sender):
+    - From a sender that reseals, the window then accepts only numbers above the reported sequence. Anything at or below it may be a recording, for example of messages the receiver accepted before it rebooted.
+    - From a sender without that capability, the window accepts, once each, numbers up to 64 below the reported sequence. This is the 0.5 behavior, kept for compatibility.
+  - **The epoch already verified** (a challenge forced by a message from another epoch): the window carries on unchanged. It is never reopened.
+
+  **Resealing.** After answering a challenge, a sender with capability `0x1` seals every authenticated message it has queued for the challenger again, with new sequence numbers above the one it reported, and recomputes their CRC. Its reliable retransmissions then get through. A message whose epoch differs from one verified less than a second ago is a replay and is dropped. Responses are rate-limited to 20 per second.
 - **Unauthenticated messages.** By default, a node with a key drops every message that is not authenticated, except on port 253. A reliable sender is told rejected.
-- **Acks.** An ack for an authenticated message carries flag `0x8` and ends with an 8-byte tag: `HMAC(Ka, acker MAC ‖ ackee MAC ‖ ack frame)`. The sender ignores untagged or wrongly tagged complete and missing acks. An untagged rejected ack means the receiver could not verify the message (another key, or none), and the send fails with `AuthFailed`.
+- **Acks.** An ack for an authenticated message carries flag `0x8` and ends with an 8-byte tag.
+  - **Unbound tag:** `HMAC(Ka, acker MAC ‖ ackee MAC ‖ ack frame)`.
+  - **Bound tag:** `HMAC(Ka, acker MAC ‖ ackee MAC ‖ ack frame ‖ epoch and sequence of the acknowledged message (8))`, the first 8 bytes of the message's trailer. It can't be replayed to confirm a later message that reuses the message ID.
+  - **Who binds.** A receiver binds its acks when it knows the message (complete, also for duplicates) and the sender announced capability `0x2`. Otherwise it uses the unbound tag.
+  - **What senders accept.** A sender accepts a bound tag for the message's current trailer, or for its trailer before the last reseal. It accepts an unbound tag too, except for a complete ack from a receiver that announced `0x2` itself.
+  - **Ignored and refused acks.** The sender ignores untagged or wrongly tagged complete, missing and busy acks. An untagged rejected ack means the receiver could not verify the message (another key, or none), and the send fails with `AuthFailed`.
+- **Compatibility.** Nodes running 0.5 and later versions interoperate with a shared key. Each side uses the stricter rules only with peers whose authenticated response announced them.
+- **Before reassembly.** A multi-frame message can only be verified once complete. A node with a key therefore refuses, at the first fragment, a multi-frame message without flag `0x8` when authentication is required. Senders whose epoch it hasn't verified share a single reassembly slot.
 
 Content is not encrypted. Any key holder can impersonate any other: the key proves membership of the installation, not the identity of a node.
 

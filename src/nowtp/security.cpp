@@ -17,6 +17,13 @@ namespace {
 
 constexpr size_t kTagSize = 8;            // in a message trailer
 constexpr size_t kResponseTagSize = 16;   // challenge responses and pairing
+constexpr size_t kResponseSize = 1 + 8 + 4 + 4 + kResponseTagSize;
+// Capabilities, appended to a response with their own tag (older verifiers
+// ignore the extra bytes, older responders don't send them).
+constexpr uint8_t kCapReseals = 0x1;    // reseals queued messages after answering a challenge
+constexpr uint8_t kCapBoundAcks = 0x2;  // verifies acks bound to the message's epoch and sequence
+constexpr uint8_t kLocalCaps = kCapReseals | kCapBoundAcks;
+constexpr size_t kCapsSize = 1 + kResponseTagSize;
 constexpr uint32_t kChallengeRetryMs = 300;
 constexpr uint8_t kChallengeTries = 5;
 constexpr uint32_t kChallengeBackoffMs = 2000;
@@ -240,15 +247,18 @@ Authenticator::Verdict Security::open(const Mac& src, uint8_t port, uint8_t flag
     uint32_t epoch = getU32(trailer);
     uint32_t seq = getU32(trailer + 4);
     Peer* p = peer(src, true, now);
+    // Replays are dropped silently: a refusal would reach the real sender,
+    // which may have a message with that id in flight (and it may be one
+    // sealed before our last challenge, which the sender has sealed again).
     if (p->verified && p->epoch == epoch) {
         if (acceptSequence(*p, seq)) return Verdict::Authentic;
         counters_.replaysRejected++;
-        return Verdict::Reject;
+        return Verdict::Retry;
     }
     if (p->verified && static_cast<int32_t>(now - p->verifiedAt) < static_cast<int32_t>(kFreshVerificationMs)) {
         // The sender just proved another epoch is its current one.
         counters_.replaysRejected++;
-        return Verdict::Reject;
+        return Verdict::Retry;
     }
     challenge(*p, now);
     return Verdict::Retry;
@@ -283,25 +293,45 @@ Authenticator::Screen Security::screen(const Mac& src, uint8_t port, uint8_t fla
     return Screen::Limited;
 }
 
-void Security::sealAck(const Mac& dst, const uint8_t* frame, size_t len, uint8_t* tag) {
+// HMAC(Ka, acker MAC | ackee MAC | ack frame [| message epoch and sequence]).
+// The bound form can't be replayed for another message that reuses the id.
+void Security::ackTag(const Mac& acker, const Mac& ackee, const uint8_t* frame, size_t len, const uint8_t* bind,
+                      uint8_t* out) const {
     crypto::HmacSha256 h(ackKey_, sizeof(ackKey_));
-    h.update(local_.bytes, 6);
-    h.update(dst.bytes, 6);
+    h.update(acker.bytes, 6);
+    h.update(ackee.bytes, 6);
     h.update(frame, len);
+    if (bind) h.update(bind, wire::kAckBindSize);
     uint8_t full[32];
     h.finish(full);
-    memcpy(tag, full, wire::kAckTagSize);
+    memcpy(out, full, wire::kAckTagSize);
 }
 
-bool Security::openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag) {
+void Security::sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) {
+    // Bound only for a sender that said it checks bound acks.
+    Peer* p = bind ? peer(dst, false, now_) : nullptr;
+    ackTag(local_, dst, frame, len, p && (p->caps & kCapBoundAcks) ? bind : nullptr, tag);
+}
+
+bool Security::openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
+                       const uint8_t* bindBefore) {
     if (key_.empty()) return false;
-    crypto::HmacSha256 h(ackKey_, sizeof(ackKey_));
-    h.update(src.bytes, 6);
-    h.update(local_.bytes, 6);
-    h.update(frame, len);
-    uint8_t full[32];
-    h.finish(full);
-    if (crypto::equal(full, tag, wire::kAckTagSize)) return true;
+    uint8_t expected[wire::kAckTagSize];
+    const uint8_t* binds[2] = {bind, bindBefore};
+    for (const uint8_t* b : binds) {
+        if (!b) continue;
+        ackTag(src, local_, frame, len, b, expected);
+        if (crypto::equal(expected, tag, wire::kAckTagSize)) return true;
+    }
+    // Unbound: from receivers that predate bound acks, and for acks other
+    // than "complete". A receiver that told us it binds must bind those.
+    Peer* p = peer(src, false, now_);
+    bool complete = len > wire::kCommonHeaderSize &&
+                    frame[wire::kCommonHeaderSize] == static_cast<uint8_t>(wire::AckStatus::Complete);
+    if (!(complete && p && p->verified && (p->caps & kCapBoundAcks))) {
+        ackTag(src, local_, frame, len, nullptr, expected);
+        if (crypto::equal(expected, tag, wire::kAckTagSize)) return true;
+    }
     counters_.forgeriesRejected++;
     return false;
 }
@@ -361,8 +391,8 @@ void Security::respond(const Mac& to, const uint8_t* nonce, uint32_t now) {
     if (responsesInWindow_ >= kMaxResponsesPerSecond) return;
     responsesInWindow_++;
 
-    // type | nonce (8) | epoch (4) | sequence (4) | tag (16)
-    uint8_t msg[1 + 8 + 4 + 4 + kResponseTagSize];
+    // type | nonce (8) | epoch (4) | sequence (4) | tag (16) | caps (1) | caps tag (16)
+    uint8_t msg[kResponseSize + kCapsSize];
     msg[0] = kResponse;
     memcpy(msg + 1, nonce, 8);
     putU32(msg + 9, epoch_);
@@ -374,12 +404,22 @@ void Security::respond(const Mac& to, const uint8_t* nonce, uint32_t now) {
     uint8_t full[32];
     h.finish(full);
     memcpy(msg + 17, full, kResponseTagSize);
+    msg[kResponseSize] = kLocalCaps;
+    crypto::HmacSha256 c(challengeKey_, sizeof(challengeKey_));
+    label(c, "NowTP caps");
+    c.update(local_.bytes, 6);
+    c.update(to.bytes, 6);
+    c.update(msg + 1, kResponseSize);  // nonce, epoch, sequence, tag, caps
+    c.finish(full);
+    memcpy(msg + kResponseSize + 1, full, kResponseTagSize);
     counters_.challengesAnswered++;
     engine_.send(to, kSecurityPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now);
+    // `to` now accepts only sequence numbers above the one we reported.
+    engine_.reseal(to);
 }
 
 void Security::verifyResponse(const Mac& from, const uint8_t* d, size_t len, uint32_t now) {
-    if (len < 17 + kResponseTagSize || key_.empty()) return;
+    if (len < kResponseSize || key_.empty()) return;
     Peer* p = peer(from, false, now);
     if (!p || !p->challenging || !crypto::equal(p->nonce, d + 1, sizeof(p->nonce))) return;
     crypto::HmacSha256 h(challengeKey_, sizeof(challengeKey_));
@@ -392,11 +432,33 @@ void Security::verifyResponse(const Mac& from, const uint8_t* d, size_t len, uin
         counters_.forgeriesRejected++;
         return;
     }
+    uint8_t caps = 0;
+    if (len >= kResponseSize + kCapsSize) {
+        crypto::HmacSha256 c(challengeKey_, sizeof(challengeKey_));
+        label(c, "NowTP caps");
+        c.update(from.bytes, 6);
+        c.update(local_.bytes, 6);
+        c.update(d + 1, kResponseSize);
+        c.finish(full);
+        if (crypto::equal(full, d + kResponseSize + 1, kResponseTagSize)) caps = d[kResponseSize];
+    }
+    uint32_t epoch = getU32(d + 9);
+    uint32_t seq = getU32(d + 13);
     p->challenging = false;
-    p->verified = true;
-    p->epoch = getU32(d + 9);
-    p->highest = getU32(d + 13);
-    p->window = 0;  // the last 64 sequence numbers may still arrive once each
+    if (p->verified && p->epoch == epoch) {
+        // Proven again (a challenge forced by an old epoch's message): the
+        // sequence window carries on, never reopened.
+        p->caps = static_cast<uint8_t>(p->caps | caps);
+    } else {
+        p->verified = true;
+        p->epoch = epoch;
+        p->highest = seq;
+        p->caps = caps;
+        // Numbers up to the reported one may be recordings (e.g. after we
+        // rebooted). A sender that reseals sends its queued messages again
+        // above it; with an older sender, the last 64 may arrive once each.
+        p->window = (caps & kCapReseals) ? ~static_cast<uint64_t>(0) : 0;
+    }
     p->verifiedAt = now;
     counters_.epochsVerified++;
     if (verifiedHandler_) {
