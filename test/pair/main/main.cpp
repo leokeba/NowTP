@@ -84,6 +84,9 @@ std::string macStr(const Mac& m) {
 // it. Nothing here is specific to a board.
 void applyLearnedPower() {
     float ceiling = nowtp::EspNowTransport::learnedTxPowerCeiling();
+#ifdef NOWTP_TEST_MAX_TX_DBM
+    if (ceiling <= 0 || ceiling > NOWTP_TEST_MAX_TX_DBM) ceiling = NOWTP_TEST_MAX_TX_DBM;
+#endif
     if (ceiling > 0) esp_wifi_set_max_tx_power(static_cast<int8_t>(ceiling * 4));
 }
 
@@ -349,6 +352,9 @@ nowtp::EspNowConfig baseConfig(const std::string& phase) {
     cfg.discovery.metadata.assign(phase.begin(), phase.end());
     cfg.discovery.announceIntervalMs = 300;
     cfg.discovery.peerTimeoutMs = 2000;
+#ifdef NOWTP_TEST_MAX_TX_DBM
+    cfg.radio.txPowerDbm = NOWTP_TEST_MAX_TX_DBM;  // this build's board can't sustain full power
+#endif
     return cfg;
 }
 
@@ -939,6 +945,9 @@ extern "C" void app_main() {
     g_probeSem = xSemaphoreCreateBinary();
     vTaskDelay(pdMS_TO_TICKS(1500));
     printf("\nNOWTP PAIR TEST\n");
+#ifdef NOWTP_TEST_MAX_TX_DBM
+    printf("INFO transmit power capped at %d dBm for this board\n", NOWTP_TEST_MAX_TX_DBM);
+#endif
 
     phaseAutoInit();
     if (g_pass > 0 && g_fail == 0) {

@@ -273,15 +273,27 @@ void sendAndWaitBehaviour() {
 
 void queueLimitsAndLatest() {
     std::vector<uint8_t> msg(3000, 2);
-    std::vector<Outcome> outs(9);
+    std::vector<Outcome> outs(10);
+    // At most 4 messages per destination (broadcast is one too), 8 in all.
     int accepted = 0;
     Status last = Status::Ok;
-    for (auto& o : outs) {
-        last = transport.send(Mac::broadcast(), 1, msg.data(), msg.size(), nowtp::SendOptions(), o.handler());
+    std::vector<bool> queued(outs.size(), false);
+    for (int i = 0; i < 5; ++i) {
+        last = transport.send(Mac::broadcast(), 1, msg.data(), msg.size(), nowtp::SendOptions(), outs[i].handler());
+        queued[i] = last == Status::Ok;
+        if (last == Status::Ok) accepted++;
+    }
+    report("queue_full_per_destination", accepted == 4 && last == Status::QueueFull);
+    for (int i = 5; i < 10; ++i) {
+        Mac absent = {{0x02, 0x4e, 0x54, 0x50, 0x00, static_cast<uint8_t>(i)}};
+        last = transport.send(absent, 1, msg.data(), msg.size(), nowtp::SendOptions(), outs[i].handler());
+        queued[i] = last == Status::Ok;
         if (last == Status::Ok) accepted++;
     }
     report("queue_full_after_8", accepted == 8 && last == Status::QueueFull);
-    for (int i = 0; i < accepted; ++i) outs[i].wait(3000);
+    for (size_t i = 0; i < outs.size(); ++i) {
+        if (queued[i]) outs[i].wait(3000);
+    }
 
     nowtp::SendOptions latest;
     latest.latestOnly = true;
@@ -300,7 +312,7 @@ void queueLimitsAndLatest() {
 }
 
 void endCancelsAndRestart() {
-    std::vector<uint8_t> msg(8000, 3);
+    std::vector<uint8_t> msg(5000, 3);  // 4 of them fit one destination's 24 KB
     std::vector<Outcome> outs(4);
     for (auto& o : outs) transport.send(Mac::broadcast(), 1, msg.data(), msg.size(), nowtp::SendOptions(), o.handler());
     transport.end();
@@ -468,7 +480,8 @@ void radioSettingsRestored() {
     wifi_ps_type_t ps = WIFI_PS_MAX_MODEM;
     esp_wifi_get_ps(&ps);
     report("radio_settings_applied",
-           st == Status::Ok && r.txPowerDbm > 8.9f && r.txPowerDbm <= 10 && r.longRange && strncmp(country, "JP", 2) == 0 && ps == WIFI_PS_NONE,
+           // The driver rounds down, by up to 1.5 dB on a classic ESP32 (10 -> 8.5 dBm).
+           st == Status::Ok && r.txPowerDbm >= 8.4f && r.txPowerDbm <= 10 && r.longRange && strncmp(country, "JP", 2) == 0 && ps == WIFI_PS_NONE,
            fmt("(%s, power %.2f dBm, LR %d, country %s, ps %d)", nowtp::toString(st), r.txPowerDbm, r.longRange,
                country, ps));
 
