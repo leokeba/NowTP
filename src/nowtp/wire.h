@@ -29,6 +29,7 @@ enum class AckStatus : uint8_t {
     Complete = 0,  ///< Whole message received; payload is empty.
     Missing = 1,   ///< Payload lists missing fragment indices (uint16 LE each).
     Rejected = 2,  ///< Receiver will not accept this message.
+    Busy = 3,      ///< No room to reassemble it now: back off, then probe again.
 };
 
 constexpr size_t kCommonHeaderSize = 5;    // control, network id, port, message id

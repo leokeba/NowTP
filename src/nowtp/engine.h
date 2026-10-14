@@ -171,7 +171,9 @@ private:
     enum class Place : uint8_t { Ok, Invalid, TooLarge, NoMemory };
     Place placeFragment(RxMessage& rx, uint16_t index, const uint8_t* payload, size_t len);
     Place allocateRxBuffer(RxMessage& rx, uint16_t fragSize);
-    bool reserveRx(size_t bytes, const RxMessage* keep);
+    enum class Admission : uint8_t { Yes, Busy, Never };
+    Admission admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, uint32_t now);
+    bool reserveRx(size_t bytes);
     RxMessage* findRx(const Mac& src, uint16_t id);
     void dropRx(RxMessage* rx, bool countAsDropped = true);
     void completeRx(RxMessage* rx, uint32_t now);

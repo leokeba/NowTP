@@ -323,7 +323,7 @@ Every message is sent to a port (0–239; ports 240–255 are reserved, and `sen
 
 `reliable` and `latestOnly` can be combined.
 
-For unicast, ESP-NOW already acknowledges and retries each frame in hardware. Default mode is therefore quite dependable between two boards in range. `reliable` covers what remains: frames dropped in the receiver's queues, reassembly evicted for memory, and acks lost on the way back.
+For unicast, ESP-NOW already acknowledges and retries each frame in hardware. Default mode is therefore quite dependable between two boards in range. `reliable` covers what remains: frames dropped in the receiver's queues, reassembly refused for memory, and acks lost on the way back.
 
 ### Threading
 
@@ -358,7 +358,8 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 |---|---|---|
 | `protocol.maxMessageSize` | 16 KB | Largest message accepted, sending or receiving |
 | `protocol.maxTxMessages` / `maxTxBytes` | 8 / 32 KB | Send queue limits (`QueueFull` beyond) |
-| `protocol.maxRxMessages` / `maxRxBytes` | 4 / 32 KB | Messages being reassembled at once, and their memory |
+| `protocol.maxRxMessages` / `maxRxBytes` | 4 / 32 KB | Messages being reassembled at once, and their memory. Beyond them a new message is refused (the sender backs off and retries), never one in progress. |
+| `protocol.maxRxMessagesPerSender` | 2 | Of those, from one sender |
 | `protocol.sendTimeoutMs` | 2000 | Default deadline for a whole message (`SendOptions::timeoutMs` overrides it) |
 | `protocol.ackTimeoutMs` | 100 | Reliable mode: wait before probing the receiver again |
 | `protocol.rxTimeoutMs` | 1000 | A partial incoming message is dropped after this long without progress |

@@ -112,8 +112,13 @@ struct Config {
     uint8_t maxTxMessages = 8;
     /// Total payload bytes held by queued outgoing messages.
     size_t maxTxBytes = 32 * 1024;
-    /// Messages being reassembled at once.
+    /// Messages being reassembled at once. When full (or over maxRxBytes), a
+    /// new message replaces one idle for 3 x ackTimeoutMs, or else is refused
+    /// (a reliable sender is told to back off and retry). A message in
+    /// progress is never evicted.
     uint8_t maxRxMessages = 4;
+    /// Of those, from a single sender (so one sender cannot take every slot).
+    uint8_t maxRxMessagesPerSender = 2;
     /// Total bytes held by reassembly buffers.
     size_t maxRxBytes = 32 * 1024;
     /// A partial message is dropped after this long without a new fragment.
@@ -148,6 +153,11 @@ struct Stats {
     uint32_t retransmissions = 0;
     /// Messages dropped because authentication failed or was missing.
     uint32_t authRejected = 0;
+    /// New multi-frame messages refused for lack of reassembly room (the
+    /// sender retries). Also counted in messagesDropped.
+    uint32_t reassemblyRefused = 0;
+    /// Our messages the receiver had no room for yet; each backs off and retries.
+    uint32_t receiverBusy = 0;
 };
 
 }  // namespace nowtp

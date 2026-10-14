@@ -52,6 +52,7 @@ Port and message ID repeat the values of the message being acknowledged. Status 
 - `0` complete: the whole message was received, verified and delivered (or was already delivered earlier).
 - `1` missing: the payload lists missing fragment indices, 2 bytes each, in increasing order. The list may be cut short to fit one frame.
 - `2` rejected: the receiver will never accept this message, because it has no handler on the port or the message is too large.
+- `3` busy: the receiver has no room to reassemble this message right now. The sender stops sending it, waits one to two and a half ack timeouts (spread by message ID), then probes (step 5 below). Receivers send it for the first fragment and for ack-requests of a message they refuse. Senders that predate this status ignore it and simply probe after their ack timeout.
 
 ## Sending
 
@@ -72,9 +73,12 @@ Port and message ID repeat the values of the message being acknowledged. Status 
 3. When a message completes, the receiver also sends complete without being asked.
 4. On missing, the sender resends the listed fragments and sets ack-request on the last of them.
 5. If no ack arrives within the ack timeout, the sender resends the last fragment with ack-request as a probe. This also works if the receiver has dropped its partial state: it rebuilds the state from the probe and reports the rest as missing.
+   - On busy, the sender probes the same way after its backoff.
 6. The message fails with `Timeout` when its overall deadline passes.
 
-ESP-NOW already acknowledges and retries each unicast frame in hardware. Reliable mode covers the remaining losses: frames dropped in the receiver's queues, reassembly evicted for memory, and acks lost on the way back.
+ESP-NOW already acknowledges and retries each unicast frame in hardware. Reliable mode covers the remaining losses: frames dropped in the receiver's queues, reassembly refused for memory, and acks lost on the way back.
+
+**Reassembly admission.** A receiver reassembles a bounded number of messages, and bytes, at once, and only a few from any one sender. When a new message doesn't fit, the receiver evicts a partial message that has had no fragment for three ack timeouts (the most idle first), since a live sender would have probed by then. If none is that idle, the newcomer is refused (busy), and messages in progress are never evicted. Evicting the least recently active message instead starves everyone once more senders interleave than there are slots.
 
 ## Duplicates and latest-only
 

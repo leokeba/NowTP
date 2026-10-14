@@ -316,7 +316,8 @@ void Engine::frameSent(bool delivered, uint32_t now) {
 
     tx->frameFailures = 0;
     if (f.firstPass) {
-        tx->nextIndex = static_cast<uint16_t>(f.index + 1);
+        // Not backwards: a Busy ack may have ended the first pass meanwhile.
+        tx->nextIndex = std::max(tx->nextIndex, static_cast<uint16_t>(f.index + 1));
     } else {
         auto it = std::find(tx->resend.begin(), tx->resend.end(), f.index);
         if (it != tx->resend.end()) tx->resend.erase(it);
@@ -324,8 +325,10 @@ void Engine::frameSent(bool delivered, uint32_t now) {
 
     if (tx->hasPendingFrame()) return;
     if (tx->reliable()) {
-        tx->awaitingAck = true;
-        tx->ackDeadline = now + config_.ackTimeoutMs;
+        if (!tx->awaitingAck) {  // already set by a Busy ack: keep its backoff
+            tx->awaitingAck = true;
+            tx->ackDeadline = now + config_.ackTimeoutMs;
+        }
     } else {
         finish(tx, Status::Ok);
     }
@@ -594,16 +597,21 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
         }
 
         size_t bitmapBytes = (static_cast<size_t>(h.count) + 7) / 8;
-        if (rx_.size() >= config_.maxRxMessages && !rx_.empty()) {
-            // Make room by evicting the least recently active message.
-            RxMessage* oldest = rx_.front().get();
-            for (auto& r : rx_) {
-                if (static_cast<int32_t>(r->lastActivity - oldest->lastActivity) < 0) oldest = r.get();
-            }
-            dropRx(oldest);
-        }
-        if (config_.maxRxMessages == 0 || !reserveRx(bitmapBytes, nullptr)) {
+        Admission admission = admitRx(src, h.index, h.count, len, now);
+        if (admission == Admission::Never) {
             stats_.messagesDropped++;
+            if (reliable) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
+            return;
+        }
+        if (admission == Admission::Busy || !reserveRx(bitmapBytes)) {
+            // Refuse the newcomer rather than evict a message in progress: with
+            // senders interleaving, the evicted one is always the next to need
+            // its slot. Answer the first fragment and probes; the sender backs off.
+            if (h.index == 0 || ackRequest) {
+                stats_.messagesDropped++;
+                stats_.reassemblyRefused++;
+                if (reliable) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Busy, nullptr);
+            }
             return;
         }
         std::unique_ptr<RxMessage> created(new (std::nothrow) RxMessage());
@@ -631,6 +639,9 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
             if (result == Place::Invalid) stats_.framesInvalid++;
             if (result == Place::TooLarge && reliable) {
                 queueAck(src, h.port, h.messageId, h.flags, AckStatus::Rejected, nullptr);
+            }
+            if (result == Place::NoMemory && ackRequest) {
+                queueAck(src, h.port, h.messageId, h.flags, AckStatus::Busy, nullptr);
             }
             dropRx(rx);  // on NoMemory a reliable sender retries later
             return;
@@ -664,7 +675,7 @@ Engine::Place Engine::placeFragment(RxMessage& rx, uint16_t index, const uint8_t
 
     rx.lastLen = len;
     if (rx.fragSize == 0) {
-        if (!reserveRx(len, &rx)) return Place::NoMemory;
+        if (!reserveRx(len)) return Place::NoMemory;
         rx.reserved += len;
         rx.stashedLast.assign(payload, payload + len);
         return Place::Ok;
@@ -681,7 +692,7 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
     if (minStream > maxStream()) return Place::TooLarge;
 
     size_t capacity = static_cast<size_t>(rx.count) * fragSize;
-    if (!reserveRx(capacity, &rx)) return Place::NoMemory;
+    if (!reserveRx(capacity)) return Place::NoMemory;
     rx.reserved += capacity;
     rx.buf = allocBytes(capacity);
     if (!rx.buf) return Place::NoMemory;
@@ -695,16 +706,49 @@ Engine::Place Engine::allocateRxBuffer(RxMessage& rx, uint16_t fragSize) {
     return Place::Ok;
 }
 
-bool Engine::reserveRx(size_t bytes, const RxMessage* keep) {
-    while (rxBytes_ + bytes > config_.maxRxBytes) {
+// Makes room for a new message by evicting only idle ones: a live sender
+// sends again within its ack timeout (a probe at worst), so a partial message
+// idle for longer is abandoned, or waits on a sender busy elsewhere.
+Engine::Admission Engine::admitRx(const Mac& src, uint16_t index, uint16_t count, size_t len, uint32_t now) {
+    if (config_.maxRxMessages == 0 || config_.maxRxMessagesPerSender == 0) return Admission::Never;
+    // Room for its whole buffer, so admitted messages can finish. A last
+    // fragment arriving first (a probe) doesn't tell the fragment size:
+    // assume full frames from this peer, at most the whole budget.
+    size_t frag = len;
+    bool last = index + 1 == count;
+    if (last) {
+        size_t mtu = link_.maxFrameSize(src);
+        if (mtu > kFragmentHeaderSize) frag = std::max(frag, mtu - kFragmentHeaderSize);
+    }
+    size_t need = std::min(static_cast<size_t>(count) * frag, maxStream() + frag) + (count + 7u) / 8;
+    if (need > config_.maxRxBytes) {
+        if (!last) return Admission::Never;
+        need = config_.maxRxBytes;
+    }
+
+    uint32_t idleMs = 3 * config_.ackTimeoutMs;
+    for (;;) {
+        size_t fromSrc = 0;
+        for (const auto& r : rx_) {
+            if (r->src == src) fromSrc++;
+        }
+        bool perSender = fromSrc >= config_.maxRxMessagesPerSender;
+        if (!perSender && rx_.size() < config_.maxRxMessages && rxBytes_ + need <= config_.maxRxBytes) {
+            return Admission::Yes;
+        }
         RxMessage* victim = nullptr;
         for (auto& r : rx_) {
-            if (r.get() == keep) continue;
+            if (perSender && !(r->src == src)) continue;
+            if (!reached(now, r->lastActivity + idleMs)) continue;
             if (!victim || static_cast<int32_t>(r->lastActivity - victim->lastActivity) < 0) victim = r.get();
         }
-        if (!victim) return false;
+        if (!victim) return Admission::Busy;
         dropRx(victim);
     }
+}
+
+bool Engine::reserveRx(size_t bytes) {
+    if (rxBytes_ + bytes > config_.maxRxBytes) return false;
     rxBytes_ += bytes;
     return true;
 }
@@ -775,7 +819,6 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
 }
 
 void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
-    (void)now;
     if (len < 1) {
         stats_.framesInvalid++;
         return;
@@ -816,6 +859,16 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         case AckStatus::Missing:
             for (size_t i = 1; i + 1 < len; i += 2) tx->addResend(getU16(payload + i));
             if (tx->hasPendingFrame()) tx->awaitingAck = false;
+            break;
+        case AckStatus::Busy:
+            // No room at the receiver: stop sending, then probe with the last
+            // fragment, which reopens reassembly once there is room. Spread
+            // by message id so refused senders don't return in step.
+            stats_.receiverBusy++;
+            tx->resend.clear();
+            tx->nextIndex = tx->count;
+            tx->awaitingAck = true;
+            tx->ackDeadline = now + config_.ackTimeoutMs + config_.ackTimeoutMs * (tx->id % 4u) / 2;
             break;
         default: stats_.framesInvalid++; break;
     }

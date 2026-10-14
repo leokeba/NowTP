@@ -723,12 +723,91 @@ TEST(reassembly_memory_is_bounded) {
         auto frames = fragmentsOf(pattern(3000, s), 0, 1, 1);
         net.inject(b, src, frames[0]);
     }
-    // A complete message still gets through.
+    // Messages in progress are not evicted for a newcomer...
     Mac src = {{0x02, 7, 7, 7, 7, 7}};
     auto msg = pattern(1500, 99);
     for (auto& f : fragmentsOf(msg, 0, 1, 1)) net.inject(b, src, f);
+    CHECK(inbox.messages.empty());
+    CHECK(net.engine(b).stats().reassemblyRefused >= 1u);
+    // ...but abandoned ones are, once idle for a few ack timeouts.
+    net.run(3 * cfg.ackTimeoutMs);
+    for (auto& f : fragmentsOf(msg, 0, 1, 1)) net.inject(b, src, f);
     CHECK_EQ(inbox.messages.size(), 1u);
     CHECK(inbox.messages[0] == msg);
+}
+
+TEST(reassembly_slots_are_shared_between_senders) {
+    sim::Network net;
+    size_t b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    // One sender starts four messages; it gets maxRxMessagesPerSender slots.
+    Mac greedy = {{0x02, 8, 8, 8, 8, 8}};
+    for (uint16_t id = 1; id <= 4; ++id) net.inject(b, greedy, fragmentsOf(pattern(1000), 0, 1, id)[0]);
+    CHECK_EQ(net.engine(b).stats().reassemblyRefused, 2u);
+    // Two others still fit.
+    for (uint8_t s = 0; s < 2; ++s) {
+        Mac src = {{0x02, 7, 7, 7, 7, s}};
+        for (auto& f : fragmentsOf(pattern(1000, s), 0, 1, 1)) net.inject(b, src, f);
+    }
+    CHECK_EQ(inbox.messages.size(), 2u);
+}
+
+TEST(reassembly_rejects_what_can_never_fit) {
+    sim::Network net;
+    Config small;
+    small.maxRxBytes = 4000;
+    size_t a = net.addNode(), b = net.addNode(small);
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    auto msg = pattern(6000);
+    Outcome out;
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Rejected);  // not Busy until the deadline
+    CHECK(net.now() < 100u);
+}
+
+// More senders than reassembly slots or bytes: evicting the least recently
+// active message used to starve all of them (every message timed out).
+TEST(reassembly_survives_more_senders_than_slots) {
+    struct Case {
+        size_t senders;
+        size_t bytes;
+    };
+    for (Case c : {Case{5, 4000}, Case{8, 4000}, Case{3, 12000}, Case{6, 12000}}) {
+        sim::Network net;
+        size_t r = net.addNode();
+        std::vector<size_t> tx;
+        for (size_t i = 0; i < c.senders; ++i) tx.push_back(net.addNode());
+        Inbox in;
+        net.engine(r).listen(1, in.handler());
+        std::vector<Outcome> outs(c.senders);
+        for (size_t i = 0; i < c.senders; ++i) {
+            auto msg = pattern(c.bytes, static_cast<uint8_t>(i));
+            net.engine(tx[i]).send(net.mac(r), 1, msg.data(), msg.size(), reliable(), outs[i].handler(), net.now());
+        }
+        uint32_t t0 = net.now();
+        CHECK(net.runUntil([&] {
+            for (auto& o : outs) {
+                if (!o.done) return false;
+            }
+            return true;
+        }));
+        uint32_t retx = 0, busy = 0;
+        for (size_t i = 0; i < c.senders; ++i) {
+            CHECK(outs[i].status == Status::Ok);
+            retx += net.engine(tx[i]).stats().retransmissions;
+            busy += net.engine(tx[i]).stats().receiverBusy;
+        }
+        CHECK_EQ(in.messages.size(), c.senders);
+        // Refused senders resend their message once, plus a probe per backoff.
+        size_t frames = (c.bytes + 4) / 241 + 1;
+        CHECK(retx <= c.senders * frames + 4 * busy);
+        CHECK(busy > 0u);
+        std::printf("    %zu x %zu B: %u ms, %u retransmissions, %u busy\n", c.senders, c.bytes, net.now() - t0,
+                    retx, busy);
+    }
 }
 
 TEST(random_frames_do_not_crash) {
