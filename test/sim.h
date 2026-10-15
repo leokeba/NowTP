@@ -12,13 +12,30 @@
 #include <thread>
 #include <vector>
 
-#include "heap_limit.h"
 #include "nowtp/diagnostics.h"
 #include "nowtp/engine.h"
 #include "nowtp/peer_table.h"
 #include "nowtp/radio.h"
 
+#if defined(NOWTP_HEAP_HOOKS)
+#include "heap_limit.h"
+#endif
+
 namespace sim {
+
+// The heap limit's scopes on the host (test/heap_limit.h); nothing on a chip
+// (test/hardware runs this simulator too).
+#if defined(NOWTP_HEAP_HOOKS)
+typedef nowtp::testing::HeapExempt Exempt;
+typedef nowtp::testing::HeapCounted Counted;
+#else
+struct Exempt {
+    Exempt() {}
+};
+struct Counted {
+    Counted() {}
+};
+#endif
 
 using nowtp::Mac;
 using nowtp::Status;
@@ -201,7 +218,7 @@ public:
     std::vector<Frame> log;
 
     Status transmit(size_t from, const Mac& dst, const uint8_t* data, size_t len) {
-        nowtp::testing::HeapExempt air;  // the radio's buffers, not NowTP's
+        Exempt air;  // the radio's buffers, not NowTP's
         SimLink& link = nodes_[from]->link;
         if (link.inFlight) {
             std::fprintf(stderr, "engine violated one-frame-in-flight\n");
@@ -258,8 +275,7 @@ public:
     // The simulation's own memory isn't counted against a heap limit; what
     // NowTP takes while handling an event is.
     void step() {
-        using nowtp::testing::HeapCounted;
-        nowtp::testing::HeapExempt sim;
+        Exempt own;
         now_++;
         while (!events_.empty() && events_.front().time <= now_) {
             Event e = events_.front();
@@ -267,16 +283,16 @@ public:
             Node& n = *nodes_[e.node];
             if (e.kind == Event::SendDone) {
                 n.link.inFlight = false;
-                HeapCounted nowtp;
+                Counted counted;
                 n.link.peers.clearInFlight();
                 n.engine.onFrameSent(e.ok, now_);
             } else if (n.online) {
-                HeapCounted nowtp;
+                Counted counted;
                 n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,
                                          n.clockUs(now_));
             }
         }
-        HeapCounted nowtp;
+        Counted counted;
         for (auto& n : nodes_) n->engine.tick(now_);
         for (auto& t : tickers) t(now_);
     }
@@ -433,7 +449,7 @@ inline void Scheduler::run(const std::vector<std::function<void()>>& procedures)
     std::vector<std::thread> threads;
     for (const auto& fn : procedures) {
         threads.emplace_back([this, fn] {
-            nowtp::testing::HeapExempt app;  // the application's procedure; the network it drives is counted
+            Exempt app;  // the application's procedure; the network it drives is counted
             {
                 std::unique_lock<std::mutex> l(m_);
                 cv_.wait(l, [this] { return !turnTaken_; });
