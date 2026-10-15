@@ -46,12 +46,6 @@ static Bytes allocZeroed(size_t n) {
 constexpr size_t Engine::kMaxControlFrames;
 constexpr uint16_t Engine::kSeenBlocks;
 
-template <class T>
-Engine::Owned<T> Engine::create() {
-    void* p = heap::allocate(sizeof(T));
-    return Owned<T>(p ? new (p) T() : nullptr);
-}
-
 const char* toString(Status s) {
     switch (s) {
         case Status::Ok: return "Ok";
@@ -256,7 +250,7 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
         stream = allocBytes(streamLen);
         if (stream && len > 0) memcpy(stream.get(), data, len);
     }
-    Owned<TxMessage> tx = create<TxMessage>();
+    Owned<TxMessage> tx = heap::make<TxMessage>();
     if (!stream || !tx) {
         flushCompletions();
         return Status::NoMemory;
@@ -849,7 +843,7 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
             }
             return;
         }
-        Owned<RxMessage> created = create<RxMessage>();
+        Owned<RxMessage> created = heap::make<RxMessage>();
         Bytes bitmap = allocZeroed(bitmapBytes);
         if (!created || !bitmap) {
             rxBytes_ -= bitmapBytes;

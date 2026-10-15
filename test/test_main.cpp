@@ -2821,10 +2821,13 @@ struct StreamRig {
 };
 
 StreamAcceptor collectInto(Received& r, bool accept = true, size_t failAt = SIZE_MAX) {
+    // The application's memory, not NowTP's.
     return [&r, accept, failAt](const StreamInfo& info, StreamSink& sink) {
+        testing::HeapExempt app;
         r.info = info;
         if (!accept) return false;
         sink.write = [&r, failAt](uint32_t offset, const uint8_t* d, size_t n) {
+            testing::HeapExempt app;
             if (offset != r.data.size() || r.data.size() + n > failAt) return false;
             r.data.insert(r.data.end(), d, d + n);
             return true;
@@ -3169,6 +3172,47 @@ TEST(heap_diagnostics_survives_any_heap_size) {
             // The responder's radio is back to normal.
             CHECK(rig.net.node(b).radio.bcast == PhyRate::Default);
             CHECK(rig.net.node(b).radio.power == 20.0f);
+        }
+        CHECK_EQ(testing::heapUsed(), before);
+    }
+}
+
+TEST(heap_streams_survive_any_heap_size) {
+    std::vector<uint8_t> data = pattern(30000, 4);
+    auto reader = [&](uint32_t offset, uint8_t* buf, size_t n) {
+        memcpy(buf, data.data() + offset, n);
+        return true;
+    };
+    StreamOptions o;
+    o.chunkSize = 2000;
+    o.window = 3;  // chunks arrive early and are held
+    o.header = pattern(50);
+    o.progress = [](uint32_t, uint32_t) {};
+    for (size_t above = 0; above <= kHeapSweepMax; above += kHeapSweepStep) {
+        size_t before = testing::heapUsed();
+        {
+            testing::HeapExempt test;
+            StreamRig rig;
+            rig.net.airLoss = 0.03;
+            rig.net.appLoss = 0.05;  // a chunk left incomplete while the next one completes
+            size_t a = rig.add(), b = rig.add();
+            {
+                testing::HeapLimit limit(above);
+                Received& r = rig.receiver();
+                rig.st[b]->onIncoming(collectInto(r));
+                Outcome& out = rig.outcome();
+                rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()), reader, out.handler(), o,
+                                rig.net.now());
+                rig.net.runUntil([&] { return out.done; }, 20000);
+            }
+            Received& r = rig.receiver();
+            rig.st[b]->onIncoming(collectInto(r));
+            Outcome& out = rig.outcome();
+            CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()), reader, out.handler(), o,
+                                  rig.net.now()) == Status::Ok);
+            CHECK(rig.net.runUntil([&] { return out.done; }, 60000));
+            CHECK(out.status == Status::Ok);
+            CHECK(r.data == data);
         }
         CHECK_EQ(testing::heapUsed(), before);
     }

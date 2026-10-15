@@ -87,7 +87,7 @@ public:
     /// Aborts an outgoing stream; its `done` runs with Cancelled.
     Status cancel(uint32_t id, uint32_t nowMs);
     /// Sets the handler deciding about incoming streams (none: all rejected).
-    void onIncoming(StreamAcceptor acceptor) { acceptor_ = std::move(acceptor); }
+    void onIncoming(StreamAcceptor acceptor) { acceptor_.set(std::move(acceptor)); }
 
     size_t outgoing() const { return out_.size(); }
     size_t incoming() const { return in_.size(); }
@@ -110,7 +110,7 @@ private:
     Out* findOut(uint32_t id);
     In* findIn(const Mac& src, uint32_t id);
     Status sendOffer(uint32_t id);
-    void chunkDone(uint32_t id, uint32_t offset, Status status);
+    void chunkDone(uint32_t key, Status status);
     void pump(uint32_t id);
     void finishOut(uint32_t id, Status status);
     void finishIn(const Mac& src, uint32_t id, Status status);
@@ -119,9 +119,10 @@ private:
 
     Engine& engine_;
     std::function<uint32_t()> random_;
-    StreamAcceptor acceptor_;
-    std::vector<std::unique_ptr<Out>> out_;
-    std::vector<std::unique_ptr<In>> in_;
+    Callback<bool(const StreamInfo&, StreamSink&)> acceptor_;
+    std::vector<std::unique_ptr<Out>> out_;  // created by send(), in the application's task
+    std::vector<heap::Owned<In>> in_;        // created for a peer: malloc()ed
+    uint16_t nextTag_ = 0;
     bool running_ = false;
     uint32_t now_ = 0;
 };

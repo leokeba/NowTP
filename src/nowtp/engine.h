@@ -177,17 +177,7 @@ private:
     // Objects from malloc, like Bytes: `new (std::nothrow)` aborts on a short
     // heap with exceptions off.
     template <class T>
-    struct FreeObject {
-        void operator()(T* p) const {
-            if (!p) return;
-            p->~T();
-            heap::release(p);
-        }
-    };
-    template <class T>
-    using Owned = std::unique_ptr<T, FreeObject<T>>;
-    template <class T>
-    static Owned<T> create();
+    using Owned = heap::Owned<T>;
 
     static constexpr size_t kMaxControlFrames = 8;
 

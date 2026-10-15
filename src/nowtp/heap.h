@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #include <cstdlib>
+#include <memory>
+#include <new>
 
 namespace nowtp {
 
@@ -58,6 +60,25 @@ inline void* allocate(size_t n) { return std::malloc(n); }
 inline void* reallocate(void* p, size_t n) { return std::realloc(p, n); }
 inline void release(void* p) { std::free(p); }
 #endif
+
+/// An object in malloc()ed memory, for state a peer makes us create: `new`
+/// (even `new (std::nothrow)`, in libstdc++) aborts on a short heap with
+/// exceptions off. make() returns null instead.
+template <class T>
+struct Deleter {
+    void operator()(T* p) const {
+        if (!p) return;
+        p->~T();
+        release(p);
+    }
+};
+template <class T>
+using Owned = std::unique_ptr<T, Deleter<T>>;
+template <class T>
+Owned<T> make() {
+    void* p = allocate(sizeof(T));
+    return Owned<T>(p ? new (p) T() : nullptr);
+}
 
 }  // namespace heap
 }  // namespace nowtp

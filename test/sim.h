@@ -433,6 +433,7 @@ inline void Scheduler::run(const std::vector<std::function<void()>>& procedures)
     std::vector<std::thread> threads;
     for (const auto& fn : procedures) {
         threads.emplace_back([this, fn] {
+            nowtp::testing::HeapExempt app;  // the application's procedure; the network it drives is counted
             {
                 std::unique_lock<std::mutex> l(m_);
                 cv_.wait(l, [this] { return !turnTaken_; });

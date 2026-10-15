@@ -42,29 +42,46 @@ constexpr uint32_t Streams::kIdleTimeoutMs;
 struct Streams::Out {
     struct Chunk {
         uint32_t offset;
-        std::vector<uint8_t> frame;  // data message, kept until acknowledged
+        Bytes frame;  // data message, kept until acknowledged; malloc()ed
+        size_t len;   // of the data in it
         uint8_t attempts;
         bool queued;
     };
     uint32_t id = 0;
+    // Names it in chunk completions, with the chunk's index: they capture no
+    // more than std::function holds without heap (8 bytes on a 32-bit ESP32).
+    uint16_t tag = 0;
     Mac dst;
     uint32_t size = 0;
     StreamReader read;
     StreamDone done;
     StreamOptions options;
+    Callback<void(uint32_t, uint32_t)> progress;
     enum Phase : uint8_t { Offering, Sending } phase = Offering;
     std::vector<uint8_t> offer;
     uint8_t offerAttempts = 0;
     uint32_t next = 0;       // next offset to read
     uint32_t confirmed = 0;  // bytes acknowledged
     uint32_t crc = 0;        // over the bytes read so far
-    std::vector<Chunk> chunks;
+    std::vector<Chunk> chunks;  // at most `window`, reserved
     bool endQueued = false;
     uint8_t endAttempts = 0;
     uint32_t deadline = 0;
 };
 
 struct Streams::In {
+    // A chunk that arrived early: the message's reassembly buffer, taken
+    // over, or a copy of a single-frame one. `block` is malloc()ed.
+    struct Held {
+        uint32_t offset;
+        uint8_t* block;
+        const uint8_t* data;
+        size_t len;
+    };
+    ~In() {
+        for (size_t i = 0; i < heldCount; ++i) heap::release(held[i].block);
+        heap::release(held);
+    }
     Mac src;
     uint32_t id = 0;
     uint32_t size = 0;
@@ -73,11 +90,14 @@ struct Streams::In {
     uint32_t expected = 0;
     uint32_t crc = 0;
     StreamSink sink;
-    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> held;  // chunks that arrived early
+    Held* held = nullptr;  // window - 1 entries, malloc()ed
+    size_t heldCount = 0;
     uint32_t lastActivity = 0;
 };
 
 Streams::Streams(Engine& engine, std::function<uint32_t()> random) : engine_(engine), random_(std::move(random)) {
+    out_.reserve(kMaxOutgoing);
+    in_.reserve(kMaxIncoming);
     if (!random_) random_ = [] { return 1u; };
 }
 
@@ -138,11 +158,21 @@ Status Streams::send(const Mac& dst, uint32_t size, StreamReader read, StreamDon
     do {
         o->id = random_();
     } while (o->id == 0 || findOut(o->id));
+    do {
+        o->tag = ++nextTag_;
+    } while (o->tag == 0 || [this, &o] {
+        for (const auto& x : out_) {
+            if (x->tag == o->tag) return true;
+        }
+        return false;
+    }());
     o->dst = dst;
     o->size = size;
     o->read = std::move(read);
     o->done = std::move(done);
     o->options = options;
+    o->progress.set(options.progress);
+    o->chunks.reserve(options.window);
 
     o->offer.resize(kOfferFixed + options.header.size());
     o->offer[0] = kOffer;
@@ -195,19 +225,22 @@ Status Streams::cancel(uint32_t id, uint32_t now) {
     return Status::Ok;
 }
 
-void Streams::chunkDone(uint32_t id, uint32_t offset, Status s) {
-    Out* o = findOut(id);
+// `key`: the stream's tag, then the chunk's index (both 16 bits; only
+// `window` chunks are in flight, so the index can't be mistaken).
+void Streams::chunkDone(uint32_t key, Status s) {
+    Out* o = nullptr;
+    for (auto& x : out_) {
+        if (x->tag == key >> 16) o = x.get();
+    }
     if (!o) return;
+    uint32_t id = o->id;
     size_t i = 0;
-    while (i < o->chunks.size() && o->chunks[i].offset != offset) ++i;
+    while (i < o->chunks.size() && ((o->chunks[i].offset / o->options.chunkSize) & 0xFFFF) != (key & 0xFFFF)) ++i;
     if (i == o->chunks.size()) return;
     if (s == Status::Ok) {
-        o->confirmed += static_cast<uint32_t>(o->chunks[i].frame.size() - kDataHeader);
+        o->confirmed += static_cast<uint32_t>(o->chunks[i].len);
         o->chunks.erase(o->chunks.begin() + static_cast<std::ptrdiff_t>(i));
-        if (o->options.progress) {
-            StreamProgress p = o->options.progress;
-            p(o->confirmed, o->size);
-        }
+        if (o->progress) o->progress(o->confirmed, o->size);
     } else if (s == Status::Rejected || s == Status::Cancelled || s == Status::AuthFailed ||
                o->chunks[i].attempts >= kAttempts) {
         control(o->dst, kAbort, id);
@@ -273,29 +306,32 @@ void Streams::pump(uint32_t id) {
             uint32_t len = std::min(o->options.chunkSize, o->size - o->next);
             Out::Chunk fresh;
             fresh.offset = o->next;
+            fresh.len = len;
             fresh.attempts = 0;
             fresh.queued = false;
-            fresh.frame.resize(kDataHeader + len);
+            fresh.frame.reset(static_cast<uint8_t*>(heap::allocate(kDataHeader + len)));
+            if (!fresh.frame) return;  // short heap: tick() tries again
             fresh.frame[0] = kData;
-            putU32(fresh.frame.data() + 1, id);
-            putU32(fresh.frame.data() + 5, o->next);
-            if (!o->read(o->next, fresh.frame.data() + kDataHeader, len)) {
+            putU32(fresh.frame.get() + 1, id);
+            putU32(fresh.frame.get() + 5, o->next);
+            if (!o->read(o->next, fresh.frame.get() + kDataHeader, len)) {
                 control(o->dst, kAbort, id);
                 finishOut(id, Status::Cancelled);
                 return;
             }
             o = findOut(id);  // the reader may have cancelled the stream
             if (!o) return;
-            o->crc = wire::crc32(fresh.frame.data() + kDataHeader, len, o->crc);
+            o->crc = wire::crc32(fresh.frame.get() + kDataHeader, len, o->crc);
             o->next += len;
-            o->chunks.push_back(std::move(fresh));
+            o->chunks.push_back(std::move(fresh));  // within the reserved window
             continue;
         }
 
         uint32_t offset = c->offset;
-        Status st = engine_.send(o->dst, kStreamPort, c->frame.data(), c->frame.size(),
-                                 reliableWithin(o->options.timeoutMs),
-                                 [this, id, offset](Status s) { chunkDone(id, offset, s); }, now_);
+        uint32_t key = static_cast<uint32_t>(o->tag) << 16 | ((offset / o->options.chunkSize) & 0xFFFF);
+        Status st = engine_.send(o->dst, kStreamPort, c->frame.get(), kDataHeader + c->len,
+                                 reliableWithin(o->options.timeoutMs), [this, key](Status s) { chunkDone(key, s); },
+                                 now_);
         if (st == Status::QueueFull) return;  // tick() retries
         o = findOut(id);
         if (!o) return;
@@ -335,7 +371,7 @@ bool Streams::deliverChunk(In& in, const uint8_t* data, size_t len) {
 void Streams::finishIn(const Mac& src, uint32_t id, Status status) {
     for (size_t i = 0; i < in_.size(); ++i) {
         if (in_[i]->id != id || in_[i]->src != src) continue;
-        std::unique_ptr<In> s = std::move(in_[i]);
+        heap::Owned<In> s = std::move(in_[i]);
         in_.erase(in_.begin() + static_cast<std::ptrdiff_t>(i));
         if (s->sink.done) s->sink.done(status);
         return;
@@ -353,30 +389,45 @@ void Streams::handle(const Message& m) {
                 control(m.src, kAccept, id);  // our accept was lost
                 return;
             }
+            uint32_t chunk = getU32(d + 9);
+            uint8_t window = d[14];
+            size_t headerLen = m.len - kOfferFixed;
+            if (chunk == 0 || window == 0 || chunk + kDataHeader > engine_.config().maxMessageSize ||
+                static_cast<size_t>(window - 1) * chunk > kMaxHeldBytes || headerLen > kMaxHeader) {
+                control(m.src, kReject, id, kTooLarge, true);
+                return;
+            }
+            if (!acceptor_) {
+                control(m.src, kReject, id, kRefused, true);
+                return;
+            }
+            // Its state first, from malloc(); StreamInfo's header is a
+            // std::vector, from operator new. Without the memory: busy.
+            heap::Owned<In> in = heap::make<In>();
+            if (in && window > 1) {
+                in->held = static_cast<In::Held*>(heap::allocate((window - 1u) * sizeof(In::Held)));
+                if (!in->held) in.reset();
+            }
+            if (in_.size() >= kMaxIncoming || !in || !heap::fits(headerLen)) {
+                control(m.src, kReject, id, kBusy, true);
+                return;
+            }
             StreamInfo info;
             info.peer = m.src;
             info.id = id;
             info.size = getU32(d + 5);
-            uint32_t chunk = getU32(d + 9);
             info.topic = d[13];
-            uint8_t window = d[14];
             info.header.assign(d + kOfferFixed, d + m.len);
-            if (chunk == 0 || window == 0 || chunk + kDataHeader > engine_.config().maxMessageSize ||
-                static_cast<size_t>(window - 1) * chunk > kMaxHeldBytes) {
-                control(m.src, kReject, id, kTooLarge, true);
-                return;
-            }
-            if (in_.size() >= kMaxIncoming) {
-                control(m.src, kReject, id, kBusy, true);
-                return;
-            }
             StreamSink sink;
-            StreamAcceptor acceptor = acceptor_;
-            if (!acceptor || !acceptor(info, sink)) {
+            if (!acceptor_(info, sink)) {
                 control(m.src, kReject, id, kRefused, true);
                 return;
             }
-            std::unique_ptr<In> in(new In());
+            if (in_.size() >= kMaxIncoming || findIn(m.src, id)) {  // the acceptor re-entered
+                control(m.src, kReject, id, kBusy, true);
+                if (sink.done) sink.done(Status::Cancelled);
+                return;
+            }
             in->src = m.src;
             in->id = id;
             in->size = info.size;
@@ -384,7 +435,7 @@ void Streams::handle(const Message& m) {
             in->window = window;
             in->sink = std::move(sink);
             in->lastActivity = now_;
-            in_.push_back(std::move(in));
+            in_.push_back(std::move(in));  // within the reserved capacity
             control(m.src, kAccept, id);
             return;
         }
@@ -418,26 +469,42 @@ void Streams::handle(const Message& m) {
             size_t len = m.len - kDataHeader;
             if (len == 0 || len > in->chunk || offset < in->expected) return;  // duplicate
             if (offset > in->expected) {
-                bool known = false;
-                for (const auto& h : in->held) known = known || h.first == offset;
-                if (known) return;
-                if (in->held.size() + 1 >= in->window) {
+                for (size_t i = 0; i < in->heldCount; ++i) {
+                    if (in->held[i].offset == offset) return;
+                }
+                if (in->heldCount + 1 >= in->window) {
                     control(m.src, kAbort, id);
                     finishIn(m.src, id, Status::Rejected);
                     return;
                 }
-                in->held.push_back(std::make_pair(offset, std::vector<uint8_t>(data, data + len)));
+                In::Held h;
+                h.offset = offset;
+                h.len = len;
+                h.data = data;
+                h.block = m.buffer;  // a reassembled message's buffer: kept, not copied
+                if (h.block) {
+                    m.buffer = nullptr;
+                } else {
+                    h.block = static_cast<uint8_t*>(heap::allocate(len));
+                    if (!h.block) {
+                        m.refused = true;  // no memory to hold it: the sender sends it again
+                        return;
+                    }
+                    memcpy(h.block, data, len);
+                    h.data = h.block;
+                }
+                in->held[in->heldCount++] = h;
                 return;
             }
             bool ok = deliverChunk(*in, data, len);
             for (bool progress = ok; progress && ok;) {
                 progress = false;
-                for (size_t i = 0; i < in->held.size(); ++i) {
-                    if (in->held[i].first != in->expected) continue;
-                    std::vector<uint8_t> chunk;
-                    chunk.swap(in->held[i].second);
-                    in->held.erase(in->held.begin() + static_cast<std::ptrdiff_t>(i));
-                    ok = deliverChunk(*in, chunk.data(), chunk.size());
+                for (size_t i = 0; i < in->heldCount; ++i) {
+                    if (in->held[i].offset != in->expected) continue;
+                    In::Held h = in->held[i];
+                    in->held[i] = in->held[--in->heldCount];
+                    ok = deliverChunk(*in, h.data, h.len);
+                    heap::release(h.block);
                     progress = true;
                     break;
                 }
