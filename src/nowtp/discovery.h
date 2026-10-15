@@ -114,14 +114,14 @@ public:
         uint8_t moveTo = 0;   ///< Channel of a moving notice, else 0.
     };
     static bool parse(const uint8_t* data, size_t len, Announcement& out);
+    /// parse() without copying the name (left empty: see nameData), which may take heap.
+    static bool view(const uint8_t* data, size_t len, Announcement& out);
     static bool parseAnnouncement(const uint8_t* data, size_t len, std::string& name, uint16_t& maxFrameSize);
 
 private:
     enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04, kMoving = 0x08 };
     enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02 };
 
-    /// parse() without the copy of the name, which may take heap.
-    static bool view(const uint8_t* data, size_t len, Announcement& out);
     void handle(const Message& m);
     bool announce(uint8_t flags, uint8_t moveTo = 0);
     void emit(PeerEvent event, const PeerInfo& peer);

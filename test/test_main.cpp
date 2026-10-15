@@ -3143,6 +3143,37 @@ TEST(heap_discovery_survives_any_heap_size) {
     }
 }
 
+// The responder answers whatever a peer asks; the procedures are the
+// application's (not counted), but what they do on received frames is.
+TEST(heap_diagnostics_survives_any_heap_size) {
+    for (size_t above = 0; above <= kHeapSweepMax; above += kHeapSweepStep) {
+        size_t before = testing::heapUsed();
+        {
+            testing::HeapExempt test;
+            DiagRig rig;
+            size_t a = rig.add(), b = rig.add();
+            rig.startDiscovery();
+            std::vector<ProbeStep> steps = {ProbeStep(PhyRate::B1M, 0), ProbeStep(PhyRate::G24M, 15)};
+            {
+                testing::HeapLimit limit(above);
+                std::vector<ProbeResult> fwd, rev;
+                rig.diag[a]->ping(rig.net.mac(b));
+                rig.diag[a]->measure(rig.net.mac(b), steps, 5, &fwd, &rev);
+                rig.net.run(500);
+            }
+            CHECK(rig.diag[a]->ping(rig.net.mac(b)) == Status::Ok);
+            std::vector<ProbeResult> fwd, rev;
+            CHECK(rig.diag[a]->measure(rig.net.mac(b), steps, 5, &fwd, &rev) == Status::Ok);
+            CHECK_EQ(rev.size(), 2u);
+            CHECK_EQ(rev[0].received, 5);
+            // The responder's radio is back to normal.
+            CHECK(rig.net.node(b).radio.bcast == PhyRate::Default);
+            CHECK(rig.net.node(b).radio.power == 20.0f);
+        }
+        CHECK_EQ(testing::heapUsed(), before);
+    }
+}
+
 // NOWTP_HEAP_SWEEP=1: runs each test at several heap limits, counting only
 // what NowTP takes while the simulator drives it (received frames, sent
 // frames, ticks), and prints every distinct place where operator new went

@@ -20,8 +20,8 @@ namespace {
 const float kFallbackPowers[] = {15, 11, 8, 5};
 constexpr uint8_t kAttempts = 5;
 constexpr uint32_t kAttemptWaitMs = 400;
-constexpr size_t kMaxSteps = 64;
 constexpr size_t kMaxCounters = 4;
+constexpr size_t kMaxScanNodes = 32;  // nodes a deep discovery reports
 constexpr float kCeilingRatio = 0.8f;
 
 inline int8_t toQuarter(float dbm) {
@@ -96,8 +96,12 @@ const char* toString(IssueKind kind) {
     return "Unknown";
 }
 
+constexpr size_t Diagnostics::kMaxSteps;
+constexpr size_t Diagnostics::kMaxPendingReplies;
+constexpr size_t Diagnostics::kMaxReport;
+
 Diagnostics::Diagnostics(Engine& engine, RadioControl& radio, DiagnosticsHost& host, const DiagnosticsConfig& config)
-    : engine_(engine), radio_(radio), host_(host), config_(config) {
+    : engine_(engine), radio_(radio), host_(host), config_(config), counters_(kMaxCounters) {
     if (config_.probeBytes < 8) config_.probeBytes = 8;
 }
 
@@ -126,29 +130,28 @@ float Diagnostics::powerForAttempt(uint8_t attempt, float current) const {
     return std::min(current, kFallbackPowers[i]);
 }
 
+// `steps` <= kMaxSteps. Null without memory for a new counter: the
+// requester then reads nothing received.
 Diagnostics::Counter* Diagnostics::counter(const Mac& src, uint16_t session, size_t steps, bool create) {
     Counter* found = nullptr;
     for (Counter& c : counters_) {
         if (c.session == session && c.src == src) found = &c;
     }
     if (!found && create) {
-        if (counters_.size() >= kMaxCounters) {
+        if (counters_.full()) {
             size_t oldest = 0;
             for (size_t i = 1; i < counters_.size(); ++i) {
                 if (static_cast<int32_t>(counters_[i].lastUse - counters_[oldest].lastUse) < 0) oldest = i;
             }
-            counters_.erase(counters_.begin() + static_cast<std::ptrdiff_t>(oldest));
+            counters_.erase(oldest);
         }
-        counters_.push_back(Counter());
-        found = &counters_.back();
-        found->src = src;
-        found->session = session;
+        Counter fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        fresh.src = src;
+        fresh.session = session;
+        found = counters_.add(fresh);
     }
-    if (found && found->received.size() < steps) {
-        found->received.resize(steps, 0);
-        found->rssiSum.resize(steps, 0);
-        found->rssiCount.resize(steps, 0);
-    }
+    if (found && found->steps < steps) found->steps = static_cast<uint8_t>(steps);
     if (found) found->lastUse = now_;
     return found;
 }
@@ -167,31 +170,48 @@ void Diagnostics::countBurst(const Message& m) {
     }
 }
 
-void Diagnostics::reply(const Mac& to, uint8_t attempt, const uint8_t* data, size_t len) {
-    // Answers go out at 1 Mbps and, on retries, with less power.
-    float current = radio_.txPower();
-    float power = powerForAttempt(attempt, current);
-    bool lowered = power < current - 0.01f;
-    if (lowered) {
-        if (replyPowerOverrides_++ == 0) replySavedPower_ = current;
-        radio_.setTxPower(power);
+// `data` (at most kMaxReport bytes) is modified: byte 3 gets the power used.
+void Diagnostics::reply(const Mac& to, uint8_t attempt, uint8_t* data, size_t len) {
+    // Answers go out at 1 Mbps and, on retries, with less power. What that
+    // changed is restored once the answer has gone out; the completion only
+    // names its slot, so that it fits std::function's own small buffer.
+    size_t slot = 0;
+    while (slot < kMaxPendingReplies && pending_[slot].used) ++slot;
+    PendingReply p;
+    if (slot < kMaxPendingReplies) {  // otherwise answer with the settings as they are
+        float current = radio_.txPower();
+        float power = powerForAttempt(attempt, current);
+        p.lowered = power < current - 0.01f;
+        if (p.lowered) {
+            if (replyPowerOverrides_++ == 0) replySavedPower_ = current;
+            radio_.setTxPower(power);
+        }
+        p.to = to;
+        p.savedRate = radio_.peerRate(to);
+        p.rateChanged = p.savedRate != PhyRate::Default && p.savedRate != PhyRate::B1M &&
+                        radio_.setPeerRate(to, PhyRate::B1M) == Status::Ok;
+        p.used = true;
+        pending_[slot] = p;
     }
-    PhyRate savedRate = radio_.peerRate(to);
-    bool rateChanged = savedRate != PhyRate::Default && savedRate != PhyRate::B1M &&
-                       radio_.setPeerRate(to, PhyRate::B1M) == Status::Ok;
 
-    std::vector<uint8_t> buf(data, data + len);
-    if (buf.size() >= 4) buf[3] = static_cast<uint8_t>(toQuarter(radio_.txPower()));  // power actually used
-    Status st = engine_.send(to, kDiagnosticsPort, buf.data(), buf.size(), SendOptions(),
-                             [this, lowered, rateChanged, to, savedRate](Status) {
-                                 if (lowered && --replyPowerOverrides_ == 0) radio_.setTxPower(replySavedPower_);
-                                 if (rateChanged) radio_.setPeerRate(to, savedRate);
-                             },
-                             now_);
-    if (st != Status::Ok) {
-        if (lowered && --replyPowerOverrides_ == 0) radio_.setTxPower(replySavedPower_);
-        if (rateChanged) radio_.setPeerRate(to, savedRate);
+    if (len >= 4) data[3] = static_cast<uint8_t>(toQuarter(radio_.txPower()));  // power actually used
+    CompletionHandler done;
+    if (slot < kMaxPendingReplies) {
+        uint8_t i = static_cast<uint8_t>(slot);
+        done = [this, i](Status) { restore(i); };
     }
+    if (engine_.send(to, kDiagnosticsPort, data, len, SendOptions(), std::move(done), now_) != Status::Ok &&
+        slot < kMaxPendingReplies) {
+        restore(slot);
+    }
+}
+
+void Diagnostics::restore(size_t slot) {
+    PendingReply p = pending_[slot];
+    pending_[slot] = PendingReply();
+    if (!p.used) return;
+    if (p.lowered && --replyPowerOverrides_ == 0) radio_.setTxPower(replySavedPower_);
+    if (p.rateChanged) radio_.setPeerRate(p.to, p.savedRate);
 }
 
 void Diagnostics::handle(const Message& m) {
@@ -203,7 +223,7 @@ void Diagnostics::handle(const Message& m) {
     // Answers to our own requests.
     if (type == kReport || type == kBurstAck || type == kApplyAck || type == kPong || type == kBurstDone) {
         for (Reply& r : replies_) {
-            if (!r.got && r.type == type && r.session == session && r.src == m.src) {
+            if (!r.got && r.type == type && r.session == session && r.src == m.src && heap::fits(m.len)) {
                 r.got = true;
                 r.data.assign(d, d + m.len);
             }
@@ -225,19 +245,20 @@ void Diagnostics::handle(const Message& m) {
         }
         case kCollect: {
             Counter* c = counter(m.src, session, 0, false);
-            size_t n = c ? c->received.size() : 0;
-            std::vector<uint8_t> out;
-            out.push_back(kReport);
-            out.push_back(d[1]);
-            out.push_back(d[2]);
-            out.push_back(0);  // power, filled by reply()
-            out.push_back(static_cast<uint8_t>(n));
+            size_t n = c ? c->steps : 0;
+            uint8_t out[kMaxReport];
+            size_t len = 0;
+            out[len++] = kReport;
+            out[len++] = d[1];
+            out[len++] = d[2];
+            out[len++] = 0;  // power, filled by reply()
+            out[len++] = static_cast<uint8_t>(n);
             for (size_t i = 0; i < n; ++i) {
-                out.push_back(c->received[i]);
+                out[len++] = c->received[i];
                 int8_t rssi = static_cast<int8_t>(c->rssiCount[i] ? c->rssiSum[i] / c->rssiCount[i] : 0);
-                out.push_back(static_cast<uint8_t>(rssi));
+                out[len++] = static_cast<uint8_t>(rssi);
             }
-            reply(m.src, attempt, out.data(), out.size());
+            reply(m.src, attempt, out, len);
             break;
         }
         case kBurstRequest: {
@@ -255,19 +276,22 @@ void Diagnostics::handle(const Message& m) {
             bool same = burst_.active && burst_.session == session && burst_.requester == m.src;
             if (!same) {
                 if (burst_.active) finishBurst();
+                Bytes buffer(static_cast<uint8_t*>(heap::allocate(2 * n + config_.probeBytes)));
+                if (!buffer) {
+                    // No memory for it now: busy, and the requester tries again.
+                    uint8_t busy[6] = {kBurstAck, d[1], d[2], 0, static_cast<uint8_t>(toQuarter(radio_.txPowerLimit())),
+                                       1};
+                    reply(m.src, attempt, busy, sizeof(busy));
+                    break;
+                }
+                memcpy(buffer.get(), d + 6, 2 * n);
                 burst_ = OutgoingBurst();
                 burst_.active = true;
                 burst_.requester = m.src;
                 burst_.session = session;
                 burst_.perStep = perStep;
-                for (size_t i = 0; i < n; ++i) {
-                    ProbeStep s;
-                    s.rate = static_cast<PhyRate>(d[6 + 2 * i]);
-                    s.txPowerDbm = fromQuarter(static_cast<int8_t>(d[7 + 2 * i]));
-                    // Never substitute another rate: the requester would misread the result.
-                    burst_.skip.push_back(!isValid(s.rate) || !radio_.rateUsable(s.rate));
-                    burst_.steps.push_back(s);
-                }
+                burst_.stepCount = n;
+                burst_.buffer = std::move(buffer);
                 burst_.savedPower = radio_.txPower();
                 burst_.savedRate = radio_.broadcastRate();
                 burst_.startedAt = now_;
@@ -299,6 +323,7 @@ void Diagnostics::finishBurst() {
     radio_.setTxPower(burst_.savedPower);
     radio_.setBroadcastRate(burst_.savedRate);
     burst_.active = false;
+    burst_.buffer.reset();
 }
 
 void Diagnostics::tick(uint32_t now) {
@@ -311,7 +336,7 @@ void Diagnostics::tick(uint32_t now) {
     if (replyPowerOverrides_ > 0) return;  // let the acknowledgement go out first
 
     if (!burst_.stepReady) {
-        if (burst_.step >= burst_.steps.size()) {
+        if (burst_.step >= burst_.stepCount) {
             Mac requester = burst_.requester;
             uint8_t out[4] = {kBurstDone, static_cast<uint8_t>(burst_.session),
                               static_cast<uint8_t>(burst_.session >> 8), 0};
@@ -319,25 +344,28 @@ void Diagnostics::tick(uint32_t now) {
             reply(requester, 0, out, sizeof(out));
             return;
         }
-        if (burst_.skip[burst_.step]) {
+        PhyRate rate = static_cast<PhyRate>(burst_.buffer[2 * burst_.step]);
+        float dbm = fromQuarter(static_cast<int8_t>(burst_.buffer[2 * burst_.step + 1]));
+        if (!isValid(rate) || !radio_.rateUsable(rate)) {
+            // Never substitute another rate: the requester would misread the result.
             burst_.step++;
             return;
         }
-        const ProbeStep& s = burst_.steps[burst_.step];
-        if (s.txPowerDbm >= 2) radio_.setTxPower(std::min(s.txPowerDbm, radio_.txPowerLimit()));
-        radio_.setBroadcastRate(s.rate);
+        if (dbm >= 2) radio_.setTxPower(std::min(dbm, radio_.txPowerLimit()));
+        radio_.setBroadcastRate(rate);
         burst_.stepReady = true;
         burst_.sent = burst_.completed = 0;
     }
 
-    std::vector<uint8_t> frame(config_.probeBytes, 0);
+    uint8_t* frame = burst_.buffer.get() + 2 * burst_.stepCount;
+    memset(frame, 0, config_.probeBytes);
     frame[0] = kBurst;
-    putU16(frame.data() + 1, burst_.session);
+    putU16(frame + 1, burst_.session);
     frame[3] = static_cast<uint8_t>(burst_.step);
     uint16_t session = burst_.session;
     while (burst_.sent < burst_.perStep && burst_.sent - burst_.completed < 2) {
         frame[4] = burst_.sent;
-        Status st = engine_.send(Mac::broadcast(), kDiagnosticsPort, frame.data(), frame.size(), SendOptions(),
+        Status st = engine_.send(Mac::broadcast(), kDiagnosticsPort, frame, config_.probeBytes, SendOptions(),
                                  [this, session](Status) {
                                      if (burst_.active && burst_.session == session) burst_.completed++;
                                  },
@@ -578,7 +606,7 @@ Status Diagnostics::measure(const Mac& peer, const std::vector<ProbeStep>& steps
                 ProbeResult pr;
                 pr.step = steps[i];
                 pr.sent = framesPerStep;
-                if (c && i < c->received.size()) {
+                if (c && i < c->steps) {
                     pr.received = std::min(c->received[i], framesPerStep);
                     pr.rssi = static_cast<int8_t>(c->rssiCount[i] ? c->rssiSum[i] / c->rssiCount[i] : 0);
                 }
@@ -889,6 +917,11 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         std::vector<bool> heardWithoutLr;
     };
     std::shared_ptr<Scan> scan(new Scan());
+    // The observer runs on received frames: it takes no memory, and nodes
+    // past these are left out of the report.
+    scan->nodes.reserve(kMaxScanNodes);
+    scan->foreign.reserve(kMaxScanNodes);
+    scan->stated.reserve(kMaxScanNodes);
     const uint8_t ourNetwork = engine_.config().networkId;
 
     host_.lock();
@@ -900,7 +933,8 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
     scan->home = home;
     engine_.setFrameObserver([scan](const FrameInfo& f) {
         if (!f.nowtp) {
-            if (std::find(scan->foreign.begin(), scan->foreign.end(), f.src) == scan->foreign.end()) {
+            if (scan->foreign.size() < scan->foreign.capacity() &&
+                std::find(scan->foreign.begin(), scan->foreign.end(), f.src) == scan->foreign.end()) {
                 scan->foreign.push_back(f.src);
             }
             return;
@@ -912,6 +946,7 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         bool onHome = scan->channel == scan->home;
         bool stated = std::find(scan->stated.begin(), scan->stated.end(), f.src) != scan->stated.end();
         if (!n) {
+            if (scan->nodes.size() >= scan->nodes.capacity()) return;
             scan->nodes.push_back(DiscoveredNode());
             n = &scan->nodes.back();
             n->mac = f.src;
@@ -936,13 +971,15 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
         n->networkId = f.header.networkId;
         if (f.header.type == wire::Type::Single && f.header.port == kDiscoveryPort) {
             Discovery::Announcement a;
-            if (Discovery::parse(f.payload, f.payloadLen, a)) {
-                n->name = a.name;
+            if (Discovery::view(f.payload, f.payloadLen, a)) {
+                if (n->name.compare(0, std::string::npos, a.nameData, a.nameLen) != 0 && heap::fits(a.nameLen)) {
+                    n->name.assign(a.nameData, a.nameLen);
+                }
                 n->maxFrameSize = a.maxFrameSize;
                 if (a.channel != 0) {
                     // Nodes since 0.5 say which channel they are on.
                     n->channel = a.channel;
-                    if (!stated) scan->stated.push_back(f.src);
+                    if (!stated && scan->stated.size() < scan->stated.capacity()) scan->stated.push_back(f.src);
                 }
             }
         }

@@ -149,7 +149,7 @@ struct DiscoveredNode {
 
 struct DeepDiscoveryReport {
     uint8_t homeChannel = 0;
-    std::vector<DiscoveredNode> nodes;
+    std::vector<DiscoveredNode> nodes;  ///< At most 32.
     std::vector<Issue> issues;
 };
 
@@ -226,13 +226,29 @@ private:
         kBurstDone = 10,
     };
 
+    // Responder state takes memory from malloc() (in Tables and Bytes) or
+    // none: a peer's request must not reach an operator new.
+    static constexpr size_t kMaxSteps = 64;
+    static constexpr size_t kMaxPendingReplies = 4;
+    static constexpr size_t kMaxReport = 5 + 2 * kMaxSteps;  // type, session, power, count, 2 bytes per step
+
     struct Counter {
         Mac src;
-        uint16_t session = 0;
-        uint32_t lastUse = 0;
-        std::vector<uint8_t> received;
-        std::vector<int32_t> rssiSum;
-        std::vector<uint8_t> rssiCount;
+        uint16_t session;
+        uint32_t lastUse;
+        uint8_t steps;  // counted so far
+        uint8_t received[kMaxSteps];
+        int32_t rssiSum[kMaxSteps];
+        uint8_t rssiCount[kMaxSteps];
+    };
+
+    // Radio settings a reply changed, restored once it has gone out.
+    struct PendingReply {
+        bool used = false;
+        bool lowered = false;
+        bool rateChanged = false;
+        Mac to;
+        PhyRate savedRate = PhyRate::Default;
     };
 
     struct Reply {
@@ -247,10 +263,10 @@ private:
         bool active = false;
         Mac requester;
         uint16_t session = 0;
-        std::vector<ProbeStep> steps;
         uint8_t perStep = 0;
+        size_t stepCount = 0;
         size_t step = 0;
-        std::vector<bool> skip;  // steps this radio cannot send (e.g. LR without Long Range)
+        Bytes buffer;  // the steps as requested (rate, quarter dBm), then the probe frame
         uint8_t sent = 0;
         uint8_t completed = 0;
         bool stepReady = false;
@@ -263,7 +279,8 @@ private:
     /// May `m` change our radio settings? With a key installed, only if authenticated.
     bool trusted(const Message& m) const { return m.authenticated || !engine_.authenticates(kDiagnosticsPort); }
     void countBurst(const Message& m);
-    void reply(const Mac& to, uint8_t attempt, const uint8_t* data, size_t len);
+    void reply(const Mac& to, uint8_t attempt, uint8_t* data, size_t len);
+    void restore(size_t slot);
     Counter* counter(const Mac& src, uint16_t session, size_t steps, bool create);
     void finishBurst();
 
@@ -301,9 +318,10 @@ private:
     bool running_ = false;
     uint32_t now_ = 0;
 
-    std::vector<Counter> counters_;
+    Table<Counter> counters_;
     std::vector<Reply> replies_;  // expected replies of the running procedure
     OutgoingBurst burst_;
+    PendingReply pending_[kMaxPendingReplies];
     int replyPowerOverrides_ = 0;
     int localProcedures_ = 0;   // dropped to 0 while yielding to a peer
     int activeProcedures_ = 0;  // never dropped
