@@ -222,11 +222,12 @@ On a board with a distorted transmitter at fast rates, the optimizer settled on 
 ### Discovery
 
 With `enableDiscovery`, a node announces itself by broadcast on reserved port 255.
-- **Announcements.** Each one carries `discovery.name` (up to 32 bytes), `discovery.metadata` (up to 160 bytes of app data, for example a role to filter on) and the largest frame the node can receive. Nodes announce every `announceIntervalMs` (2 s by default).
+- **Announcements.** Each one carries `discovery.name` (up to 32 bytes), `discovery.metadata` (up to 160 bytes of app data, for example a role to filter on), the largest frame the node can receive, and the largest message it accepts (`protocol.maxMessageSize`). Nodes announce every `announceIntervalMs` (2 s by default).
 - **Queries.** `begin()` and `discover()` ask every node in range to answer promptly, after a random delay of up to `replyJitterMs`. A node that joins late is found within about 100 ms instead of a full interval.
-- **Peer events.** `onPeerEvent()` reports peers as they are found, change their name, metadata or frame size, or are lost. A peer is lost when it says goodbye in `end()`, or after `peerTimeoutMs` (7 s by default) of silence.
+- **Peer events.** `onPeerEvent()` reports peers as they are found, change their name, metadata, frame size or message limit, or are lost. A peer is lost when it says goodbye in `end()`, or after `peerTimeoutMs` (7 s by default) of silence.
 - **Reading and updating.** `peers()` returns the current list, and `setDiscoveryMetadata()` changes what this node announces.
 - **Frame size.** With `negotiateFrameSize` (on by default), unicast to a discovered peer uses the largest frame both sides support. That's 1470 bytes between two ESP-NOW v2 nodes, and 250 as soon as either side is v1.
+- **Message limit.** `send()` to a discovered peer refuses a message larger than the peer accepts with `TooLarge`, at once, rather than after the peer rejects it. Nodes on one network can then have different limits, with applications sizing what they send each peer. `PeerInfo::maxMessageSize` and `peerMaxMessageSize(mac)` give a peer's limit, and `maxMessageSize()` gives this node's. A peer running NowTP 0.5 or earlier doesn't announce one (0: unknown, no limit applied).
 
 ### Channel following
 
@@ -404,7 +405,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 |---|---|
 | `Ok` | Accepted / delivered |
 | `QueueFull` | The send queue is full. Retry later |
-| `TooLarge` | Larger than `maxMessageSize` |
+| `TooLarge` | Larger than `maxMessageSize`, or than the destination announced it accepts |
 | `InvalidArgument` | For example, `reliable` to broadcast |
 | `InvalidState` | Not started, or `sendAndWait()` called where it would deadlock |
 | `SendFailed` | The radio could not deliver a frame (peer unreachable) |

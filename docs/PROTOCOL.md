@@ -102,11 +102,12 @@ Discovery messages are ordinary single-frame broadcast messages, unreliable and 
 | 5 | N | Name (UTF-8) |
 | 5+N | 1 | Metadata length `M` (≤ 160) |
 | 6+N | M | Application metadata |
-| 6+N+M | 1 | Extension flags: `0x1` anchor (the sender's channel is fixed), `0x2` time reference |
+| 6+N+M | 1 | Extension flags: `0x1` anchor (the sender's channel is fixed), `0x2` time reference, `0x4` message limit follows |
 | 7+N+M | 1 | The sender's Wi-Fi channel |
 | 8+N+M | 1 | Moving notices only: the channel the sender moves to |
+| next | 4 | With flag `0x4`: the largest message the sender accepts (its maximum message size), little-endian |
 
-The last three fields arrived with NowTP 0.5. Older nodes neither send nor read them. A receiver treats a missing extension as channel 0 (unknown) with no flags.
+The extension flags, the channel and the move-to channel arrived with NowTP 0.5. Older nodes neither send nor read them. A receiver treats a missing extension as channel 0 (unknown) with no flags. The message limit came after 0.5, which reads no further than the move-to channel and so ignores it. Without flag `0x4`, a peer's limit is unknown.
 
 - **Announcing.** Nodes announce periodically, with ±10% jitter so nodes that booted together don't stay in step.
 - **Answering queries.** A node that receives a query answers with its own announcement after a random delay. Any announcement it sends in the meantime counts as the answer.
@@ -114,6 +115,7 @@ The last three fields arrived with NowTP 0.5. Older nodes neither send nor read 
 - **Moving.** Flag `0x8` (always with goodbye, `0x4`) announces that the sender is about to switch to the channel in the extension. It's sent three times, and not latest-only, since broadcast has no retries. Older nodes see a plain goodbye. Nodes that follow (see below) switch to that channel.
 - **Anchors and channel following.** An anchor is a node whose channel an access point fixes (its station is connected, or it runs a soft-AP), or one configured as an anchor. A node free to change its channel follows moving notices. Once anchors are known, it only follows anchors. When every anchor it knew has gone silent, it searches: on each channel in turn it sends a query and listens for a dwell time (250 ms by default), and it stops on the first channel where an anchor answers. If none does, it returns to its original channel and tries again later. A node that hears an anchor state a channel other than its own (adjacent-channel leakage) moves to the stated channel.
 - **Frame size.** A sender uses `min(local maximum, peer's advertised maximum)` as the frame size for unicast to that peer.
+- **Message limit.** A sender refuses, at once, to send a peer a message larger than the limit it announced, since the peer would reject it. The limit is forgotten when the peer is lost. Like the rest of discovery, it is only as trustworthy as the announcements: without a key, a forged announcement could lower it.
 
 ## Diagnostics (port 254)
 

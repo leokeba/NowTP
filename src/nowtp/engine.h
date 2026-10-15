@@ -170,6 +170,15 @@ public:
     /// Largest message on `port` that fits in a single frame to `dst`.
     size_t singleFramePayload(const Mac& dst, uint8_t port = 0) const;
 
+    /// The largest message `peer` accepts (its Config::maxMessageSize, as it
+    /// announces it), so that send() refuses a larger one with TooLarge at
+    /// once, instead of the receiver rejecting it. 0 forgets it. Discovery
+    /// sets it; at most kMaxPeerLimits peers are known at once.
+    void setPeerMessageLimit(const Mac& peer, size_t maxMessageSize);
+    /// 0 if unknown (no limit is applied then).
+    size_t peerMessageLimit(const Mac& peer) const;
+    static constexpr size_t kMaxPeerLimits = 32;
+
 private:
     struct TxMessage;
     struct RxMessage;
@@ -211,6 +220,11 @@ private:
         uint32_t last;  // last delivery
         uint32_t bits[kSeenBlocks];
         uint32_t at[kSeenBlocks];  // last delivery in each block
+    };
+
+    struct PeerLimit {
+        Mac peer;
+        size_t maxMessageSize;
     };
 
     // A destination whose frames failed: served again only after `retryAt`
@@ -298,6 +312,7 @@ private:
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
     Table<Seen> seen_;  // memory per sender heard, not reserved for recentSenders
+    Table<PeerLimit> limits_;
     std::vector<std::pair<uint8_t, Callback<void(const Message&)>>> listeners_;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;

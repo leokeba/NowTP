@@ -1279,6 +1279,14 @@ std::vector<PeerInfo> EspNowTransport::peers() const {
     return copy;
 }
 
+size_t EspNowTransport::peerMaxMessageSize(const Mac& peer) const {
+    if (!started_) return 0;
+    lock();
+    size_t limit = engine_->peerMessageLimit(peer);
+    unlock();
+    return limit;
+}
+
 Status EspNowTransport::setDiscoveryMetadata(const void* data, size_t len) {
     if (len > Discovery::kMaxMetadata || (data == nullptr && len > 0)) return Status::InvalidArgument;
     if (!started_ || !discovery_) return Status::InvalidState;  // before begin(), use EspNowConfig::discovery

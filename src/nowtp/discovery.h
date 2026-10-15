@@ -16,6 +16,9 @@ struct PeerInfo {
     std::string name;
     std::vector<uint8_t> metadata;
     uint16_t maxFrameSize = 250;  ///< Largest frame the peer's driver can receive.
+    /// Largest message it accepts (its Config::maxMessageSize); 0 if it does
+    /// not say (NowTP 0.5 and earlier). send() refuses larger ones to it.
+    uint32_t maxMessageSize = 0;
     int8_t rssi = 0;              ///< Signal strength of its last announcement, dBm.
     uint32_t firstSeenMs = 0;
     uint32_t lastSeenMs = 0;
@@ -112,6 +115,7 @@ public:
         uint8_t channel = 0;  ///< 0 when the sender does not say.
         uint8_t extFlags = 0;
         uint8_t moveTo = 0;   ///< Channel of a moving notice, else 0.
+        uint32_t maxMessageSize = 0;  ///< 0 when the sender does not say.
     };
     static bool parse(const uint8_t* data, size_t len, Announcement& out);
     /// parse() without copying the name (left empty: see nameData), which may take heap.
@@ -120,7 +124,7 @@ public:
 
 private:
     enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04, kMoving = 0x08 };
-    enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02 };
+    enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02, kExtMaxMessage = 0x04 };
 
     void handle(const Message& m);
     bool announce(uint8_t flags, uint8_t moveTo = 0);

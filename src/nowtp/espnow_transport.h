@@ -212,6 +212,13 @@ public:
     Status discover();
     /// Peers currently known to discovery.
     std::vector<PeerInfo> peers() const;
+    /// The largest message this node accepts (EspNowConfig::protocol.maxMessageSize),
+    /// which discovery announces.
+    size_t maxMessageSize() const { return config_.protocol.maxMessageSize; }
+    /// The largest message `peer` accepts, as its announcements say; 0 if
+    /// unknown (no discovery, or NowTP 0.5 and earlier). send() refuses a
+    /// larger message to it with TooLarge.
+    size_t peerMaxMessageSize(const Mac& peer) const;
     /// Changes the metadata this node announces and announces it right away.
     Status setDiscoveryMetadata(const void* data, size_t len);
 

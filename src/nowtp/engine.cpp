@@ -45,6 +45,7 @@ static Bytes allocZeroed(size_t n) {
 
 constexpr size_t Engine::kMaxControlFrames;
 constexpr uint16_t Engine::kSeenBlocks;
+constexpr size_t Engine::kMaxPeerLimits;
 
 const char* toString(Status s) {
     switch (s) {
@@ -147,7 +148,7 @@ struct Engine::RxMessage {
 };
 
 Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
-    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders) {
+    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders), limits_(kMaxPeerLimits) {
     if (config_.recentEntries == 0) config_.recentEntries = 1;
     if (config_.sendTimeoutMs == 0) config_.sendTimeoutMs = 1;
     recent_.resize(config_.recentEntries);
@@ -168,6 +169,28 @@ size_t Engine::singleFramePayload(const Mac& dst, uint8_t port) const {
     size_t mtu = link_.maxFrameSize(dst);
     size_t overhead = kCommonHeaderSize + (auth_ && auth_->sealing(port) ? kAuthTrailerSize : 0);
     return mtu > overhead ? mtu - overhead : 0;
+}
+
+void Engine::setPeerMessageLimit(const Mac& peer, size_t maxMessageSize) {
+    for (size_t i = 0; i < limits_.size(); ++i) {
+        if (!(limits_[i].peer == peer)) continue;
+        if (maxMessageSize) {
+            limits_[i].maxMessageSize = maxMessageSize;
+        } else {
+            limits_.erase(i);
+        }
+        return;
+    }
+    if (!maxMessageSize || peer.isBroadcast()) return;
+    PeerLimit l = {peer, maxMessageSize};
+    limits_.add(l);  // full or no memory: unknown, as before
+}
+
+size_t Engine::peerMessageLimit(const Mac& peer) const {
+    for (const PeerLimit& l : limits_) {
+        if (l.peer == peer) return l.maxMessageSize;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +214,8 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
                      const SendOptions& options, CompletionHandler done, uint32_t now) {
     if (options.reliable && dst.isBroadcast()) return Status::InvalidArgument;
     if (len > config_.maxMessageSize) return Status::TooLarge;
+    size_t peerLimit = peerMessageLimit(dst);
+    if (peerLimit && len > peerLimit) return Status::TooLarge;  // the receiver would reject it
 
     size_t mtu = link_.maxFrameSize(dst);
     if (mtu <= kFragmentHeaderSize) return Status::InvalidArgument;

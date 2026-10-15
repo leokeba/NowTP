@@ -12,10 +12,12 @@ namespace {
 //   type (1) = kHello | flags (1) | max frame size (2, LE)
 //   | name length (1) | name | metadata length (1) | metadata
 //   | extension flags (1) | channel (1) | [move-to channel (1), moving notices only]
-// The extension is optional: earlier versions neither send nor read it.
+//   | [largest message accepted (4, LE), with extension flag kExtMaxMessage]
+// The extension is optional: earlier versions neither send nor read it, and
+// 0.5 reads no further than the move-to channel.
 constexpr uint8_t kHello = 1;
 constexpr size_t kFixedSize = 6;  // type, flags, frame size, two length bytes
-constexpr size_t kExtSize = 3;
+constexpr size_t kExtSize = 7;
 
 inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
@@ -57,6 +59,7 @@ void Discovery::stop(uint32_t now) {
     engine_.listen(kDiscoveryPort, ReceiveHandler());
     running_ = false;
     replyDue_ = queryDue_ = false;
+    for (const PeerInfo& p : peers_) engine_.setPeerMessageLimit(p.mac, 0);
     peers_.clear();
 }
 
@@ -129,9 +132,12 @@ bool Discovery::announce(uint8_t flags, uint8_t moveTo) {
     buf[n++] = static_cast<uint8_t>(config_.metadata.size());
     if (!config_.metadata.empty()) memcpy(buf + n, config_.metadata.data(), config_.metadata.size());
     n += config_.metadata.size();
-    buf[n++] = extFlags_;
+    buf[n++] = static_cast<uint8_t>(extFlags_ | kExtMaxMessage);
     buf[n++] = channel_;
     if (flags & kMoving) buf[n++] = moveTo;
+    size_t limit = engine_.config().maxMessageSize;
+    wire::putU32(buf + n, static_cast<uint32_t>(std::min<size_t>(limit, 0xFFFFFFFFu)));
+    n += 4;
 
     SendOptions opts;
     opts.latestOnly = (flags & kMoving) == 0;  // a queued announcement is replaced by a fresher one
@@ -196,7 +202,12 @@ bool Discovery::view(const uint8_t* p, size_t len, Announcement& out) {
     if (len >= ext + 2) {
         out.extFlags = p[ext];
         out.channel = p[ext + 1];
-        if ((out.flags & kMoving) && len >= ext + 3) out.moveTo = p[ext + 2];
+        size_t at = ext + 2;
+        if (out.flags & kMoving) {
+            if (len >= ext + 3) out.moveTo = p[ext + 2];
+            at++;
+        }
+        if ((out.extFlags & kExtMaxMessage) && len >= at + 4) out.maxMessageSize = wire::getU32(p + at);
     }
     return true;
 }
@@ -275,6 +286,7 @@ void Discovery::handle(const Message& m) {
         fresh.name.assign(a.nameData, a.nameLen);
         fresh.metadata.assign(a.metadata, a.metadata + a.metadataLen);
         fresh.maxFrameSize = a.maxFrameSize;
+        fresh.maxMessageSize = a.maxMessageSize;
         fresh.rssi = m.rssi;
         fresh.firstSeenMs = fresh.lastSeenMs = now_;
         fresh.channel = a.channel;
@@ -289,7 +301,7 @@ void Discovery::handle(const Message& m) {
     peer->lastSeenMs = now_;
     peer->rssi = m.rssi;
     bool changed = peer->name.size() != a.nameLen || peer->name.compare(0, a.nameLen, a.nameData, a.nameLen) != 0 ||
-                   peer->maxFrameSize != a.maxFrameSize ||
+                   peer->maxFrameSize != a.maxFrameSize || peer->maxMessageSize != a.maxMessageSize ||
                    peer->metadata.size() != a.metadataLen ||
                    !std::equal(peer->metadata.begin(), peer->metadata.end(), a.metadata) ||
                    peer->channel != a.channel || peer->anchor != anchor || peer->timeReference != timeReference ||
@@ -298,6 +310,7 @@ void Discovery::handle(const Message& m) {
         peer->name.assign(a.nameData, a.nameLen);
         peer->metadata.assign(a.metadata, a.metadata + a.metadataLen);
         peer->maxFrameSize = a.maxFrameSize;
+        peer->maxMessageSize = a.maxMessageSize;
         peer->channel = a.channel;
         peer->anchor = anchor;
         peer->timeReference = timeReference;
@@ -308,6 +321,8 @@ void Discovery::handle(const Message& m) {
 }
 
 void Discovery::emit(PeerEvent event, const PeerInfo& peer) {
+    // What the peer takes, so send() refuses more at once (0: unknown, none).
+    engine_.setPeerMessageLimit(peer.mac, event == PeerEvent::Lost ? 0 : peer.maxMessageSize);
     if (handler_) handler_(event, peer);  // the handler may replace itself
 }
 

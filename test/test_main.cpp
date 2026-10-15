@@ -2663,6 +2663,68 @@ TEST(discovery_reads_announcements_without_extension) {
     CHECK(Discovery::parse(p.data(), p.size(), a));
     CHECK_EQ(a.channel, 11);
     CHECK_EQ(a.extFlags, 1);
+    CHECK_EQ(a.maxMessageSize, 0u);  // 0.5: no message limit
+    // The limit follows the move-to channel, which 0.5 reads no further than.
+    std::vector<uint8_t> moving = {1, 0x0C, 0xFA, 0, 0, 0, 0x04, 11, 6, 0x00, 0x10, 0, 0};
+    CHECK(Discovery::parse(moving.data(), moving.size(), a));
+    CHECK_EQ(a.moveTo, 6);
+    CHECK_EQ(a.maxMessageSize, 4096u);
+    moving[6] = 0;  // without the flag the bytes mean nothing
+    CHECK(Discovery::parse(moving.data(), moving.size(), a));
+    CHECK_EQ(a.maxMessageSize, 0u);
+}
+
+// A node announces the largest message it accepts; send() to it refuses a
+// larger one at once instead of waiting for the receiver to reject it.
+TEST(discovery_shares_message_limits) {
+    sim::Network net;
+    Config smallCfg;
+    smallCfg.maxMessageSize = 4096;
+    size_t small = net.addNode(smallCfg), big = net.addNode();
+    std::mt19937 rng(3);
+    auto random = [&rng] { return static_cast<uint32_t>(rng()); };
+    DiscoveryConfig dc;
+    dc.name = "small";
+    Discovery ds(net.engine(small), dc, 250, random);
+    dc.name = "big";
+    Discovery db(net.engine(big), dc, 250, random);
+    net.tickers.push_back([&](uint32_t now) {
+        ds.tick(now);
+        db.tick(now);
+    });
+    ds.start(net.now());
+    db.start(net.now());
+    net.run(100);
+    const PeerInfo* p = db.find(net.mac(small));
+    CHECK(p != nullptr);
+    CHECK_EQ(p->maxMessageSize, 4096u);
+    CHECK_EQ(ds.find(net.mac(big))->maxMessageSize, 16384u);
+    CHECK_EQ(net.engine(big).peerMessageLimit(net.mac(small)), 4096u);
+
+    Inbox inbox;
+    net.engine(small).listen(1, inbox.handler());
+    auto tooBig = pattern(5000), fits = pattern(4096);
+    CHECK(net.engine(big).send(net.mac(small), 1, tooBig.data(), tooBig.size(), reliable(), nullptr, net.now()) ==
+          Status::TooLarge);
+    uint8_t* buffer = static_cast<uint8_t*>(std::malloc(tooBig.size()));
+    CHECK(net.engine(big).sendBuffer(net.mac(small), 1, buffer, tooBig.size(), tooBig.size(), reliable(), nullptr,
+                                     net.now()) == Status::TooLarge);  // and freed
+    Outcome out;
+    net.engine(big).send(net.mac(small), 1, fits.data(), fits.size(), reliable(), out.handler(), net.now());
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    // Broadcast isn't limited by any one peer.
+    CHECK(net.engine(big).send(Mac::broadcast(), 1, tooBig.data(), tooBig.size(), SendOptions(), nullptr,
+                               net.now()) == Status::Ok);
+
+    // Gone: no limit is known any more.
+    ds.stop(net.now());
+    net.run(20);
+    CHECK(db.find(net.mac(small)) == nullptr);
+    CHECK_EQ(net.engine(big).peerMessageLimit(net.mac(small)), 0u);
+    CHECK_EQ(net.engine(small).peerMessageLimit(net.mac(big)), 0u);  // its own stop() forgot them
+    net.tickers.clear();
 }
 
 // ---------------------------------------------------------------------------
