@@ -36,15 +36,19 @@ constexpr uint32_t kBackoffMaxMs = 800;
 }  // namespace
 
 // Message and control frame buffers (Bytes, engine.h): null on a short heap.
-static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(std::malloc(n == 0 ? 1 : n))); }
-static Bytes allocZeroed(size_t n) { return Bytes(static_cast<uint8_t*>(std::calloc(n == 0 ? 1 : n, 1))); }
+static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(heap::allocate(n == 0 ? 1 : n))); }
+static Bytes allocZeroed(size_t n) {
+    Bytes b = allocBytes(n);
+    if (b) memset(b.get(), 0, n == 0 ? 1 : n);
+    return b;
+}
 
 constexpr size_t Engine::kMaxControlFrames;
 constexpr uint16_t Engine::kSeenBlocks;
 
 template <class T>
 Engine::Owned<T> Engine::create() {
-    void* p = std::malloc(sizeof(T));
+    void* p = heap::allocate(sizeof(T));
     return Owned<T>(p ? new (p) T() : nullptr);
 }
 
@@ -242,7 +246,7 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
         if (capacity >= streamLen) {
             stream = std::move(owned);
         } else {
-            uint8_t* grown = static_cast<uint8_t*>(std::realloc(owned.get(), streamLen));
+            uint8_t* grown = static_cast<uint8_t*>(heap::reallocate(owned.get(), streamLen));
             if (grown) {
                 owned.release();  // moved into `grown`
                 stream.reset(grown);
@@ -593,13 +597,13 @@ void Engine::listen(uint8_t port, ReceiveHandler handler) {
     for (size_t i = 0; i < listeners_.size(); ++i) {
         if (listeners_[i].first != port) continue;
         if (handler) {
-            listeners_[i].second = std::move(handler);
+            listeners_[i].second.set(std::move(handler));
         } else {
             listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
         }
         return;
     }
-    if (handler) listeners_.push_back(std::make_pair(port, std::move(handler)));
+    if (handler) listeners_.push_back(std::make_pair(port, Callback<void(const Message&)>(std::move(handler))));
 }
 
 bool Engine::hasListener(uint8_t port) const {
@@ -614,10 +618,10 @@ bool Engine::hasListener(uint8_t port) const {
 Engine::Delivery Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len,
                                  int8_t rssi, uint64_t timestampUs, bool authenticated, uint8_t* buffer) {
     Bytes owned(buffer);
-    ReceiveHandler handler;
+    Callback<void(const Message&)> handler;
     for (const auto& l : listeners_) {
         if (l.first == port) {
-            handler = l.second;  // copy: the handler may replace itself via listen()
+            handler = l.second;  // shared, not copied: the handler may replace itself via listen()
             break;
         }
     }
@@ -637,7 +641,7 @@ Engine::Delivery Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, co
     m.timestampUs = timestampUs;
     m.buffer = owned.release();
     handler(m);
-    std::free(m.buffer);
+    heap::release(m.buffer);
     if (m.refused) {
         stats_.messagesRefused++;
         stats_.messagesDropped++;
@@ -724,8 +728,7 @@ void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, ui
         size_t start = decoded ? off : (info.nowtp ? anyOff : 0);
         info.payload = data + start;
         info.payloadLen = len - start;
-        FrameObserver o = observer_;
-        o(info);
+        observer_(info);
     }
     if (!decoded) {
         stats_.framesInvalid++;

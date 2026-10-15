@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "heap_limit.h"
 #include "nowtp/diagnostics.h"
 #include "nowtp/engine.h"
 #include "nowtp/peer_table.h"
@@ -200,6 +201,7 @@ public:
     std::vector<Frame> log;
 
     Status transmit(size_t from, const Mac& dst, const uint8_t* data, size_t len) {
+        nowtp::testing::HeapExempt air;  // the radio's buffers, not NowTP's
         SimLink& link = nodes_[from]->link;
         if (link.inFlight) {
             std::fprintf(stderr, "engine violated one-frame-in-flight\n");
@@ -253,7 +255,11 @@ public:
         nodes_[to]->engine.onFrameReceived(src, frame.data(), frame.size(), now_);
     }
 
+    // The simulation's own memory isn't counted against a heap limit; what
+    // NowTP takes while handling an event is.
     void step() {
+        using nowtp::testing::HeapCounted;
+        nowtp::testing::HeapExempt sim;
         now_++;
         while (!events_.empty() && events_.front().time <= now_) {
             Event e = events_.front();
@@ -261,13 +267,16 @@ public:
             Node& n = *nodes_[e.node];
             if (e.kind == Event::SendDone) {
                 n.link.inFlight = false;
+                HeapCounted nowtp;
                 n.link.peers.clearInFlight();
                 n.engine.onFrameSent(e.ok, now_);
             } else if (n.online) {
+                HeapCounted nowtp;
                 n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,
                                          n.clockUs(now_));
             }
         }
+        HeapCounted nowtp;
         for (auto& n : nodes_) n->engine.tick(now_);
         for (auto& t : tickers) t(now_);
     }

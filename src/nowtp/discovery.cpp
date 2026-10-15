@@ -145,7 +145,7 @@ void Discovery::tick(uint32_t now) {
     // Peers that went quiet.
     for (size_t i = 0; i < peers_.size();) {
         if (reached(now, peers_[i].lastSeenMs + config_.peerTimeoutMs)) {
-            PeerInfo lost = peers_[i];
+            PeerInfo lost = std::move(peers_[i]);
             peers_.erase(i);
             emit(PeerEvent::Lost, lost);
             continue;
@@ -174,6 +174,12 @@ void Discovery::tick(uint32_t now) {
 }
 
 bool Discovery::parse(const uint8_t* p, size_t len, Announcement& out) {
+    if (!view(p, len, out)) return false;
+    out.name.assign(out.nameData, out.nameLen);
+    return true;
+}
+
+bool Discovery::view(const uint8_t* p, size_t len, Announcement& out) {
     if (len < kFixedSize || p[0] != kHello) return false;
     size_t nameLen = p[4];
     if (nameLen > kMaxName || kFixedSize + nameLen > len) return false;
@@ -182,7 +188,8 @@ bool Discovery::parse(const uint8_t* p, size_t len, Announcement& out) {
     out = Announcement();
     out.flags = p[1];
     out.maxFrameSize = wire::getU16(p + 2);
-    out.name.assign(reinterpret_cast<const char*>(p + 5), nameLen);
+    out.nameData = reinterpret_cast<const char*>(p + 5);
+    out.nameLen = nameLen;
     out.metadata = p + kFixedSize + nameLen;
     out.metadataLen = metaLen;
     size_t ext = kFixedSize + nameLen + metaLen;
@@ -202,20 +209,22 @@ bool Discovery::parseAnnouncement(const uint8_t* p, size_t len, std::string& nam
     return true;
 }
 
+// The name and metadata of a new or changed peer take heap through the
+// public std::string and std::vector, from operator new, which can't fail
+// softly: on a short heap the announcement is ignored (it comes again).
 void Discovery::handle(const Message& m) {
     Announcement a;
-    if (!parse(m.data, m.len, a)) return;
+    if (!view(m.data, m.len, a)) return;
+    // Held twice: in the table, and in the copy an event carries.
+    size_t need = 2 * (a.nameLen + 1 + a.metadataLen);
 
     if (a.flags & kGoodbye) {
         for (size_t i = 0; i < peers_.size(); ++i) {
             if (peers_[i].mac != m.src) continue;
-            PeerInfo lost = peers_[i];
+            PeerInfo lost = std::move(peers_[i]);
             peers_.erase(i);
             emit(PeerEvent::Lost, lost);
-            if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) {
-                MoveHandler h = moveHandler_;
-                h(lost, a.moveTo);
-            }
+            if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) moveHandler_(lost, a.moveTo);
             break;
         }
         return;
@@ -233,6 +242,7 @@ void Discovery::handle(const Message& m) {
     bool anchor = (a.extFlags & kExtAnchor) != 0;
     bool timeReference = (a.extFlags & kExtTimeReference) != 0;
     if (!peer) {
+        if (!heap::fits(need)) return;
         if (peers_.full()) {
             // Full: a peer that missed an announcement gives way, the one heard
             // least recently first, so a burst of (possibly spoofed)
@@ -251,7 +261,7 @@ void Discovery::handle(const Message& m) {
                 }
             }
             if (victim == peers_.size()) return;
-            PeerInfo lost = peers_[victim];
+            PeerInfo lost = std::move(peers_[victim]);
             peers_.erase(victim);
             emit(PeerEvent::Lost, lost);
             // The handler may have re-entered; look again.
@@ -262,7 +272,7 @@ void Discovery::handle(const Message& m) {
         }
         PeerInfo fresh;
         fresh.mac = m.src;
-        fresh.name = a.name;
+        fresh.name.assign(a.nameData, a.nameLen);
         fresh.metadata.assign(a.metadata, a.metadata + a.metadataLen);
         fresh.maxFrameSize = a.maxFrameSize;
         fresh.rssi = m.rssi;
@@ -278,13 +288,14 @@ void Discovery::handle(const Message& m) {
 
     peer->lastSeenMs = now_;
     peer->rssi = m.rssi;
-    bool changed = peer->name != a.name || peer->maxFrameSize != a.maxFrameSize ||
+    bool changed = peer->name.size() != a.nameLen || peer->name.compare(0, a.nameLen, a.nameData, a.nameLen) != 0 ||
+                   peer->maxFrameSize != a.maxFrameSize ||
                    peer->metadata.size() != a.metadataLen ||
                    !std::equal(peer->metadata.begin(), peer->metadata.end(), a.metadata) ||
                    peer->channel != a.channel || peer->anchor != anchor || peer->timeReference != timeReference ||
                    peer->authenticated != m.authenticated;
-    if (changed) {
-        peer->name = a.name;
+    if (changed && heap::fits(need)) {
+        peer->name.assign(a.nameData, a.nameLen);
         peer->metadata.assign(a.metadata, a.metadata + a.metadataLen);
         peer->maxFrameSize = a.maxFrameSize;
         peer->channel = a.channel;
@@ -297,10 +308,7 @@ void Discovery::handle(const Message& m) {
 }
 
 void Discovery::emit(PeerEvent event, const PeerInfo& peer) {
-    if (handler_) {
-        PeerHandler h = handler_;  // the handler may replace itself
-        h(event, peer);
-    }
+    if (handler_) handler_(event, peer);  // the handler may replace itself
 }
 
 }  // namespace nowtp

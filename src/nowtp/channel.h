@@ -75,7 +75,7 @@ public:
     bool searching() const { return searching_; }
 
     /// Called after the follower moved the radio to another channel.
-    void onChannelChange(ChannelHandler handler) { handler_ = std::move(handler); }
+    void onChannelChange(ChannelHandler handler) { handler_.set(std::move(handler)); }
 
 private:
     struct Tracked {
@@ -94,7 +94,7 @@ private:
     Discovery& discovery_;
     RadioControl& radio_;
     ChannelConfig config_;
-    ChannelHandler handler_;
+    Callback<void(uint8_t)> handler_;
     std::vector<Tracked> peers_;
     bool running_ = false;
     bool suspended_ = false;

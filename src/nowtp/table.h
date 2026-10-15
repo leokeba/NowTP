@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 #include <new>
+
+#include "heap.h"
 #include <utility>
 #include <vector>
 
@@ -30,7 +32,7 @@ public:
     /// Adds `value` at the end; null if full or out of memory.
     T* add(T value) {
         if (full()) return nullptr;
-        void* p = std::malloc(sizeof(T));
+        void* p = heap::allocate(sizeof(T));
         if (!p) return nullptr;
         T* item = new (p) T(std::move(value));
         items_.push_back(item);  // within the reserved capacity
@@ -66,7 +68,7 @@ public:
 private:
     static void destroy(T* item) {
         item->~T();
-        std::free(item);
+        heap::release(item);
     }
 
     size_t limit_;

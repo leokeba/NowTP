@@ -367,7 +367,7 @@ private:
     std::unique_ptr<Engine> engine_;
     std::unique_ptr<Discovery> discovery_;
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
-    PeerHandler peerHandler_;
+    Callback<void(PeerEvent, const PeerInfo&)> peerHandler_;
     std::vector<Mac> explicitFrameSizes_;
     std::vector<std::pair<Mac, PhyRate>> peerRates_;
     std::vector<LinkHealth> linkHealth_;
@@ -378,7 +378,7 @@ private:
     std::unique_ptr<TimeSync> timeSync_;
     std::unique_ptr<Streams> streams_;
     StreamAcceptor streamAcceptor_;
-    std::function<void(uint8_t)> channelHandler_;
+    Callback<void(uint8_t)> channelHandler_;
     uint32_t lastChannelPoll_ = 0;
     uint8_t pendingChannel_ = 0;
     uint32_t pendingChannelSince_ = 0;

@@ -340,7 +340,7 @@ Sending works the other way round. `send()` copies the payload, so a large messa
 
 ### Memory
 
-The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
+The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. Where the public API holds a `std::string` or `std::vector` (a discovered peer's name and metadata, for instance), NowTP first checks that the heap's largest free block leaves 4 KB to spare. If it doesn't, NowTP does without, for example by ignoring an announcement until the next one: with exceptions off, a failed `operator new` aborts. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
 
 The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 2 KB of tables and a frame buffer (plus about 150 bytes per peer), and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
 
@@ -469,6 +469,7 @@ The tests use a simulated network with configurable loss in three places: on air
 - **Channels.** Following moves, and searching for a roaming anchor.
 - **Network time.** Accuracy and drift.
 - **Streams.** Transfers under loss.
+- **Short heaps.** The engine, security and discovery run at every heap size from 0 to 24 KB above what they hold, in 512-byte steps. [test/heap_limit.h](test/heap_limit.h) gives the tests a heap with a size: past it, `operator new` aborts, as it does on ESP-IDF, and NowTP's `malloc()` returns null. The tests then check that traffic recovers and that no memory is left behind. `NOWTP_HEAP_SWEEP=1 ./build/nowtp_tests [filter]` runs every test at several heap sizes and prints each place where NowTP's `operator new` would have aborted.
 
 [test/hardware](test/hardware) is an ESP-IDF test firmware that needs only one board. It runs the engine on the chip and checks the ESP-NOW adapter: start and stop, frame counts, throughput, failure reporting, queue limits, cancellation, poll mode, and leaks across restarts. It prints `PASS`/`FAIL` lines on the serial console:
 

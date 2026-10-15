@@ -25,10 +25,12 @@ set_target_properties(nowtp_core PROPERTIES CXX_STANDARD 11 CXX_STANDARD_REQUIRE
 target_compile_options(nowtp_core PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
 
 if(NOWTP_BUILD_TESTS)
+    # Lets the tests count NowTP's malloc() and make it fail (test/heap_limit.h).
+    target_compile_definitions(nowtp_core PUBLIC NOWTP_HEAP_HOOKS)
     enable_testing()
     find_package(Threads REQUIRED)
     add_executable(nowtp_tests test/test_main.cpp)
-    target_link_libraries(nowtp_tests PRIVATE nowtp_core Threads::Threads)
+    target_link_libraries(nowtp_tests PRIVATE nowtp_core Threads::Threads ${CMAKE_DL_LIBS})
     set_target_properties(nowtp_tests PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
     target_compile_options(nowtp_tests PRIVATE -Wall -Wextra)
     if(NOWTP_SANITIZE)

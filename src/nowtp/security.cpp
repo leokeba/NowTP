@@ -473,10 +473,7 @@ void Security::verifyResponse(const Mac& from, const uint8_t* d, size_t len, uin
     }
     p->verifiedAt = now;
     counters_.epochsVerified++;
-    if (verifiedHandler_) {
-        std::function<void(const Mac&)> handler = verifiedHandler_;
-        handler(from);
-    }
+    if (verifiedHandler_) verifiedHandler_(from);
 }
 
 void Security::tick(uint32_t now) {

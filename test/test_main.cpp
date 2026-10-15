@@ -1,10 +1,17 @@
 // Host-side tests for the NowTP protocol engine.
+#include <dlfcn.h>
+#include <execinfo.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
 #include <vector>
+
+// Before sim.h, which includes the declarations.
+#define NOWTP_HEAP_LIMIT_IMPLEMENTATION
+#include "heap_limit.h"
 
 #include "nowtp/channel.h"
 #include "nowtp/crypto.h"
@@ -90,6 +97,7 @@ struct Inbox {
 
     ReceiveHandler handler() {
         return [this](const Message& m) {
+            testing::HeapExempt app;  // the application's memory
             messages.emplace_back(m.data, m.data + m.len);
             meta.push_back(m);
             meta.back().data = nullptr;
@@ -2545,7 +2553,8 @@ TEST(channel_followers_find_roaming_anchor) {
     size_t master = rig.add(1, true), b = rig.add(1, false), c = rig.add(1, false);
     rig.start();
     rig.net.run(1000);
-    CHECK(rig.disc[b]->find(rig.net.mac(master))->anchor);
+    const PeerInfo* anchor = rig.disc[b]->find(rig.net.mac(master));
+    CHECK(anchor && anchor->anchor);
 
     // The master's station roams to an access point on channel 9, without notice.
     rig.net.node(master).radio.chan = 9;
@@ -2777,10 +2786,30 @@ TEST(timesync_rejects_outliers_and_follows_a_jump) {
 
 namespace {
 
+struct Received {
+    std::vector<uint8_t> data;
+    bool done = false;
+    Status status = Status::Ok;
+    StreamInfo info;
+};
+
 struct StreamRig {
     sim::Network net{13};
     std::mt19937 rng{2};
+    // Before `st`: a stream still open when a test returns reports to its
+    // receiver and sender as the Streams go.
+    std::deque<Received> receivers;
+    std::deque<Outcome> outcomes;
     std::vector<std::unique_ptr<Streams>> st;
+
+    Received& receiver() {
+        receivers.emplace_back();
+        return receivers.back();
+    }
+    Outcome& outcome() {
+        outcomes.emplace_back();
+        return outcomes.back();
+    }
 
     size_t add(Config cfg = Config()) {
         size_t i = net.addNode(cfg);
@@ -2789,13 +2818,6 @@ struct StreamRig {
         net.tickers.push_back([this, i](uint32_t now) { st[i]->tick(now); });
         return i;
     }
-};
-
-struct Received {
-    std::vector<uint8_t> data;
-    bool done = false;
-    Status status = Status::Ok;
-    StreamInfo info;
 };
 
 StreamAcceptor collectInto(Received& r, bool accept = true, size_t failAt = SIZE_MAX) {
@@ -2822,7 +2844,7 @@ TEST(stream_transfers_large_data_under_loss) {
     size_t a = rig.add(), b = rig.add();
     rig.net.airLoss = 0.05;
     rig.net.appLoss = 0.02;
-    Received r;
+    Received& r = rig.receiver();
     rig.st[b]->onIncoming(collectInto(r));
     std::vector<uint8_t> data = pattern(300 * 1024, 11);
     uint32_t lastRead = 0;
@@ -2832,7 +2854,7 @@ TEST(stream_transfers_large_data_under_loss) {
     o.topic = 7;
     o.header = {1, 2, 3};
     o.progress = [&](uint32_t, uint32_t) { progressCalls++; };
-    Outcome out;
+    Outcome& out = rig.outcome();
     CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
                           [&](uint32_t offset, uint8_t* buf, size_t n) {
                               inOrder = inOrder && offset == lastRead;
@@ -2864,16 +2886,16 @@ TEST(stream_refused_or_aborted_by_receiver) {
         memcpy(buf, data.data() + offset, n);
         return true;
     };
-    Received refused;
+    Received& refused = rig.receiver();
     rig.st[b]->onIncoming(collectInto(refused, false));
-    Outcome out;
+    Outcome& out = rig.outcome();
     rig.st[a]->send(rig.net.mac(b), 20000, reader, out.handler(), StreamOptions(), rig.net.now());
     CHECK(rig.net.runUntil([&] { return out.done; }));
     CHECK(out.status == Status::Rejected);
 
-    Received failing;
+    Received& failing = rig.receiver();
     rig.st[b]->onIncoming(collectInto(failing, true, 9000));  // e.g. a flash write error
-    Outcome out2;
+    Outcome& out2 = rig.outcome();
     rig.st[a]->send(rig.net.mac(b), 20000, reader, out2.handler(), StreamOptions(), rig.net.now());
     CHECK(rig.net.runUntil([&] { return out2.done; }));
     CHECK(out2.status == Status::Rejected);
@@ -2882,7 +2904,7 @@ TEST(stream_refused_or_aborted_by_receiver) {
 
     // Nobody listening for streams at all.
     rig.st[b]->stop();
-    Outcome out3;
+    Outcome& out3 = rig.outcome();
     rig.st[a]->send(rig.net.mac(b), 100, reader, out3.handler(), StreamOptions(), rig.net.now());
     CHECK(rig.net.runUntil([&] { return out3.done; }));
     CHECK(out3.status == Status::Rejected);
@@ -2896,9 +2918,9 @@ TEST(stream_cancel_and_vanishing_peers) {
         memcpy(buf, data.data() + offset, n);
         return true;
     };
-    Received r;
+    Received& r = rig.receiver();
     rig.st[b]->onIncoming(collectInto(r));
-    Outcome out;
+    Outcome& out = rig.outcome();
     uint32_t id = 0;
     rig.st[a]->send(rig.net.mac(b), 100000, reader, out.handler(), StreamOptions(), rig.net.now(), &id);
     rig.net.run(100);
@@ -2909,9 +2931,9 @@ TEST(stream_cancel_and_vanishing_peers) {
     CHECK(r.status == Status::Cancelled);
 
     // The receiver disappears halfway.
-    Received r2;
+    Received& r2 = rig.receiver();
     rig.st[b]->onIncoming(collectInto(r2));
-    Outcome out2;
+    Outcome& out2 = rig.outcome();
     rig.st[a]->send(rig.net.mac(b), 100000, reader, out2.handler(), StreamOptions(), rig.net.now());
     rig.net.runUntil([&] { return r2.data.size() > 30000; });
     rig.net.node(b).online = false;
@@ -2937,6 +2959,10 @@ TEST(stream_validates_options) {
 TEST(stream_over_secured_link) {
     SecureRig rig;
     size_t a = rig.add(testKey()), b = rig.add(testKey());
+    // Before the Streams, which report to them as they go.
+    Received r;
+    std::vector<uint8_t> data = pattern(50000, 5);
+    Outcome out;
     Streams sa(rig.net.engine(a), [] { return 77u; }), sb(rig.net.engine(b), [] { return 78u; });
     sa.start();
     sb.start();
@@ -2944,10 +2970,7 @@ TEST(stream_over_secured_link) {
         sa.tick(now);
         sb.tick(now);
     });
-    Received r;
     sb.onIncoming(collectInto(r));
-    std::vector<uint8_t> data = pattern(50000, 5);
-    Outcome out;
     sa.send(rig.net.mac(b), 50000,
             [&](uint32_t offset, uint8_t* buf, size_t n) {
                 memcpy(buf, data.data() + offset, n);
@@ -2976,8 +2999,223 @@ TEST(engine_reports_receive_timestamps) {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Short heaps. Each test runs a scenario at every heap size from 0 to 24 KB
+// above what is held, in 512-byte steps. Only what NowTP takes counts; the
+// simulator and the test's own memory are exempt. An operator new past the
+// limit aborts the test program, as it would abort the device; NowTP's
+// malloc() fails softly there and must be handled. Afterwards the limit is
+// lifted, traffic must flow again, and everything NowTP took must be back.
+
+namespace {
+
+constexpr size_t kHeapSweepMax = 24 * 1024;
+constexpr size_t kHeapSweepStep = 512;
+
+// NowTP's work on behalf of the test (send(), service ticks) is counted.
+template <class F>
+void counted(F f) {
+    testing::HeapCounted nowtp;
+    f();
+}
+
+}  // namespace
+
+TEST(heap_engine_survives_any_heap_size) {
+    size_t refusals = testing::heapRefusals();
+    for (size_t above = 0; above <= kHeapSweepMax; above += kHeapSweepStep) {
+        size_t before = testing::heapUsed();
+        {
+            testing::HeapExempt test;
+            sim::Network net(static_cast<uint32_t>(above));
+            net.airLoss = 0.05;
+            Config cfg;
+            cfg.maxMessageSize = 4096;
+            size_t a = net.addNode(cfg), b = net.addNode(cfg), c = net.addNode(cfg);
+            Inbox inbox;
+            net.engine(b).listen(1, inbox.handler());
+            // Captures past std::function's own buffer: copying it would take heap.
+            uint64_t state[6] = {};
+            net.engine(b).listen(2, [state](const Message& m) { m.refused = m.len % 2 == state[0]; });
+            auto big = pattern(3000), small = pattern(100), medium = pattern(600), odd = pattern(601);
+            {
+                testing::HeapLimit limit(above);
+                for (int round = 0; round < 6; ++round) {
+                    const std::vector<uint8_t>& refusedOrNot = round % 2 ? odd : medium;
+                    counted([&] {
+                        for (size_t from : {a, c}) {
+                            Engine& e = net.engine(from);
+                            e.send(net.mac(b), 1, big.data(), big.size(), reliable(), nullptr, net.now());
+                            e.send(net.mac(b), 1, small.data(), small.size(), reliable(), nullptr, net.now());
+                            e.send(net.mac(b), 1, medium.data(), medium.size(), latest(), nullptr, net.now());
+                            e.send(net.mac(b), 2, refusedOrNot.data(), refusedOrNot.size(), reliable(), nullptr,
+                                   net.now());
+                            e.send(Mac::broadcast(), 1, medium.data(), medium.size(), SendOptions(), nullptr,
+                                   net.now());
+                        }
+                    });
+                    net.run(250);
+                }
+                net.run(2500);  // everything queued finishes or times out
+            }
+            Outcome out;
+            net.engine(a).send(net.mac(b), 1, big.data(), big.size(), reliable(), out.handler(), net.now());
+            CHECK(net.runUntil([&] { return out.done; }));
+            CHECK(out.status == Status::Ok);
+        }
+        CHECK_EQ(testing::heapUsed(), before);
+    }
+    CHECK(testing::heapRefusals() > refusals);
+}
+
+TEST(heap_security_survives_any_heap_size) {
+    for (size_t above = 0; above <= kHeapSweepMax; above += kHeapSweepStep) {
+        size_t before = testing::heapUsed();
+        {
+            testing::HeapExempt test;
+            SecureRig rig;
+            size_t a = rig.add(testKey()), b = rig.add(testKey()), stranger = rig.add(pattern(32, 3));
+            Inbox inbox;
+            rig.net.engine(b).listen(1, inbox.handler());
+            auto big = pattern(3000), small = pattern(100);
+            {
+                testing::HeapLimit limit(above);
+                for (int round = 0; round < 4; ++round) {
+                    counted([&] {
+                        for (size_t from : {a, stranger}) {
+                            Engine& e = rig.net.engine(from);
+                            e.send(rig.net.mac(b), 1, big.data(), big.size(), reliable(), nullptr, rig.net.now());
+                            e.send(rig.net.mac(b), 1, small.data(), small.size(), reliable(), nullptr,
+                                   rig.net.now());
+                            e.send(Mac::broadcast(), 1, small.data(), small.size(), SendOptions(), nullptr,
+                                   rig.net.now());
+                        }
+                    });
+                    rig.net.run(300);
+                }
+                rig.net.run(2500);
+            }
+            CHECK(rig.sendWait(a, b, 1, big, reliable()) == Status::Ok);
+            CHECK(inbox.meta.back().authenticated);
+        }
+        CHECK_EQ(testing::heapUsed(), before);
+    }
+}
+
+TEST(heap_discovery_survives_any_heap_size) {
+    for (size_t above = 0; above <= kHeapSweepMax; above += kHeapSweepStep) {
+        size_t before = testing::heapUsed();
+        {
+            testing::HeapExempt test;
+            DiscoveryRig rig;
+            DiscoveryConfig cfg;
+            cfg.announceIntervalMs = 300;
+            cfg.peerTimeoutMs = 1000;
+            for (int i = 0; i < 4; ++i) {
+                cfg.metadata = pattern(40 + 30 * static_cast<size_t>(i), static_cast<uint32_t>(i));
+                rig.add("a node with a long name " + std::to_string(i), cfg);  // past std::string's own buffer
+            }
+            auto drive = [&](uint32_t ms) {
+                for (uint32_t t = 0; t < ms; ++t) {
+                    rig.net.step();
+                    counted([&] {
+                        for (auto& d : rig.nodes) d->tick(rig.net.now());
+                    });
+                }
+            };
+            {
+                testing::HeapLimit limit(above);
+                // start() and stop() are the application's set-up, not counted;
+                // what the others do on hearing them is.
+                for (auto& d : rig.nodes) d->start(rig.net.now());
+                drive(1500);
+                uint8_t meta[100] = {9};
+                rig.nodes[1]->setMetadata(meta, sizeof(meta), rig.net.now());
+                rig.nodes[2]->stop(rig.net.now());
+                drive(500);
+                rig.nodes[2]->start(rig.net.now());
+                drive(1500);
+            }
+            drive(1500);
+            for (auto& d : rig.nodes) CHECK_EQ(d->peers().size(), 3u);
+        }
+        CHECK_EQ(testing::heapUsed(), before);
+    }
+}
+
+// NOWTP_HEAP_SWEEP=1: runs each test at several heap limits, counting only
+// what NowTP takes while the simulator drives it (received frames, sent
+// frames, ticks), and prints every distinct place where operator new went
+// past the limit: on ESP-IDF, each would abort. Checks failing for lack of
+// memory are expected there and not reported.
+namespace sweep {
+
+constexpr int kDepth = 24;
+constexpr size_t kMaxSites = 64;
+size_t g_sites[kMaxSites];
+size_t g_siteCount = 0;
+size_t g_overruns = 0;
+
+bool startsWith(const char* s, const char* prefix) { return std::strncmp(s, prefix, std::strlen(prefix)) == 0; }
+
+// The innermost caller outside the standard library is NowTP's own code, not
+// the test's or the simulator's (an application's handler allocating is its
+// own business). Unknown without symbols: reported.
+bool nowtpSite(void* const* frames, int n) {
+    for (int i = 2; i < n; ++i) {
+        Dl_info info;
+        if (!dladdr(frames[i], &info) || !info.dli_sname) return true;
+        const char* s = info.dli_sname;
+        if (*s == '_' && startsWith(s + 1, "_Z")) ++s;  // Mach-O's extra underscore
+        if (startsWith(s, "_ZNSt") || startsWith(s, "_ZNKSt") || startsWith(s, "_ZSt") || startsWith(s, "_Znw") ||
+            startsWith(s, "_Zna") || startsWith(s, "_ZN5nowtp7testing")) {
+            continue;
+        }
+        return startsWith(s, "_ZN5nowtp") || startsWith(s, "_ZNK5nowtp") || startsWith(s, "_ZZN5nowtp") ||
+               startsWith(s, "_ZZNK5nowtp");
+    }
+    return true;
+}
+
+void exceeded(size_t bytes, size_t used, size_t limit) {
+    void* frames[kDepth];
+    int n = backtrace(frames, kDepth);
+    if (!nowtpSite(frames, n)) return;
+    g_overruns++;
+    size_t h = 1469598103934665603ull;
+    for (int i = 2; i < n; ++i) h = (h ^ reinterpret_cast<size_t>(frames[i])) * 1099511628211ull;
+    for (size_t i = 0; i < g_siteCount; ++i) {
+        if (g_sites[i] == h) return;
+    }
+    if (g_siteCount < kMaxSites) g_sites[g_siteCount++] = h;
+    std::fprintf(stderr, "  operator new(%zu) past the limit (%zu held of %zu):\n", bytes, used, limit);
+    backtrace_symbols_fd(frames + 2, n - 2, 2);
+}
+
+int run(const char* filter) {
+    void* warm[1];
+    backtrace(warm, 1);  // loads what backtrace() needs before any limit
+    testing::onExceeded(exceeded);
+    for (const TestCase& t : registry()) {
+        if (filter && std::strstr(t.name, filter) == nullptr) continue;
+        size_t before = g_overruns;
+        for (size_t above : {0, 128, 512, 2048, 8192, 32768}) {
+            testing::HeapExempt test;  // only the simulator counts, while it drives NowTP
+            testing::HeapLimit limit(above);
+            t.fn();
+        }
+        std::printf("[%s] %s: %zu operator new past the limit\n", g_overruns == before ? " OK " : "NEW ", t.name,
+                    g_overruns - before);
+    }
+    std::printf("\n%zu distinct sites\n", g_siteCount);
+    return g_siteCount == 0 ? 0 : 1;
+}
+
+}  // namespace sweep
+
 int main(int argc, char** argv) {
     const char* filter = argc > 1 ? argv[1] : nullptr;
+    if (std::getenv("NOWTP_HEAP_SWEEP")) return sweep::run(filter);
     int run = 0;
     for (const TestCase& t : registry()) {
         if (filter && std::strstr(t.name, filter) == nullptr) continue;

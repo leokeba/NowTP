@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "callback.h"
+#include "heap.h"
 #include "link.h"
 #include "table.h"
 #include "types.h"
@@ -18,7 +20,7 @@ namespace nowtp {
 // (std::nothrow)` doesn't: with exceptions off (ESP-IDF), libstdc++'s nothrow
 // operator new calls the throwing one, whose throw aborts.
 struct FreeBytes {
-    void operator()(uint8_t* p) const { std::free(p); }
+    void operator()(uint8_t* p) const { heap::release(p); }
 };
 typedef std::unique_ptr<uint8_t[], FreeBytes> Bytes;
 
@@ -145,7 +147,7 @@ public:
 
     /// Sees every received frame before filtering (other network ids, other
     /// protocol versions, non-NowTP ESP-NOW traffic). For diagnostics; one at a time.
-    void setFrameObserver(FrameObserver observer) { observer_ = std::move(observer); }
+    void setFrameObserver(FrameObserver observer) { observer_.set(std::move(observer)); }
 
     /// Authenticates outgoing messages and checks incoming ones (null: none).
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
@@ -179,7 +181,7 @@ private:
         void operator()(T* p) const {
             if (!p) return;
             p->~T();
-            std::free(p);
+            heap::release(p);
         }
     };
     template <class T>
@@ -306,7 +308,7 @@ private:
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
     Table<Seen> seen_;  // memory per sender heard, not reserved for recentSenders
-    std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
+    std::vector<std::pair<uint8_t, Callback<void(const Message&)>>> listeners_;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;
     Bytes frame_;  // the frame being built, malloc'd at the largest size used
@@ -323,7 +325,7 @@ private:
     bool flushing_ = false;
     int8_t rxRssi_ = 0;  // RSSI of the frame being processed
     uint64_t rxTimeUs_ = 0;
-    FrameObserver observer_;
+    Callback<void(const FrameInfo&)> observer_;
     Authenticator* auth_ = nullptr;
 };
 

@@ -93,8 +93,8 @@ public:
     /// What this node announces about its radio; announced right away when it changes.
     void setChannelInfo(uint8_t channel, bool anchor, uint32_t nowMs);
     void setTimeReference(bool reference, uint32_t nowMs);
-    void onPeerEvent(PeerHandler handler) { handler_ = std::move(handler); }
-    void onPeerMoved(MoveHandler handler) { moveHandler_ = std::move(handler); }
+    void onPeerEvent(PeerHandler handler) { handler_.set(std::move(handler)); }
+    void onPeerMoved(MoveHandler handler) { moveHandler_.set(std::move(handler)); }
 
     /// A copy of the peers tracked.
     std::vector<PeerInfo> peers() const;
@@ -105,6 +105,8 @@ public:
         uint8_t flags = 0;
         uint16_t maxFrameSize = 0;
         std::string name;
+        const char* nameData = nullptr;  ///< The name in the payload, `nameLen` bytes.
+        size_t nameLen = 0;
         const uint8_t* metadata = nullptr;
         size_t metadataLen = 0;
         uint8_t channel = 0;  ///< 0 when the sender does not say.
@@ -118,6 +120,8 @@ private:
     enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04, kMoving = 0x08 };
     enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02 };
 
+    /// parse() without the copy of the name, which may take heap.
+    static bool view(const uint8_t* data, size_t len, Announcement& out);
     void handle(const Message& m);
     bool announce(uint8_t flags, uint8_t moveTo = 0);
     void emit(PeerEvent event, const PeerInfo& peer);
@@ -126,8 +130,8 @@ private:
     DiscoveryConfig config_;
     uint16_t localMaxFrameSize_;
     std::function<uint32_t()> random_;
-    PeerHandler handler_;
-    MoveHandler moveHandler_;
+    Callback<void(PeerEvent, const PeerInfo&)> handler_;
+    Callback<void(const PeerInfo&, uint8_t)> moveHandler_;
     Table<PeerInfo> peers_;  // memory per peer heard, not reserved for maxPeers
     uint8_t channel_ = 0;
     uint8_t extFlags_ = 0;

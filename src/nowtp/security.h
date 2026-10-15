@@ -81,7 +81,7 @@ public:
     void onKeyChanged(KeyHandler handler) { keyHandler_ = std::move(handler); }
     /// Called (engine context) when a peer proved a new boot epoch. Messages it
     /// sent before were held back: e.g. ask for announcements again.
-    void onPeerVerified(std::function<void(const Mac&)> handler) { verifiedHandler_ = std::move(handler); }
+    void onPeerVerified(std::function<void(const Mac&)> handler) { verifiedHandler_.set(std::move(handler)); }
 
     // --- Blocking procedures (application task, never a NowTP callback) -------
 
@@ -189,7 +189,7 @@ private:
     Mac local_;
     SecurityConfig config_;
     KeyHandler keyHandler_;
-    std::function<void(const Mac&)> verifiedHandler_;
+    Callback<void(const Mac&)> verifiedHandler_;
     bool running_ = false;
     uint32_t now_ = 0;
 

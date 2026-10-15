@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_now.h"
@@ -352,6 +353,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     if (started_ || s_active) return Status::InvalidState;
 
     config_ = config;
+    // Where NowTP can only allocate with operator new, it first checks this.
+    heap::probe() = [] { return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT); };
     Status radio = prepareRadio();
     if (radio != Status::Ok) return radio;
 
@@ -395,10 +398,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
         follower_.reset(new ChannelFollower(*discovery_, *this, config_.channel));
         follower_->onChannelChange([this](uint8_t ch) {
             ESP_LOGI(kTag, "followed peers to channel %u", ch);
-            if (channelHandler_) {
-                std::function<void(uint8_t)> h = channelHandler_;
-                h(ch);
-            }
+            if (channelHandler_) channelHandler_(ch);
         });
         discovery_->onPeerMoved([this](const PeerInfo& p, uint8_t ch) { follower_->onPeerMoved(p, ch, nowMs()); });
         // A new peer's first announcement waits for its epoch to be verified: ask again at once.
@@ -1250,10 +1250,7 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
         }
         link_->setFrameSize(peer.mac, size);
     }
-    if (peerHandler_) {
-        PeerHandler h = peerHandler_;
-        h(event, peer);
-    }
+    if (peerHandler_) peerHandler_(event, peer);
 }
 
 bool EspNowTransport::hasExplicitFrameSize(const Mac& mac) const {
@@ -1262,7 +1259,7 @@ bool EspNowTransport::hasExplicitFrameSize(const Mac& mac) const {
 
 void EspNowTransport::onPeerEvent(PeerHandler handler) {
     if (started_) lock();
-    peerHandler_ = std::move(handler);
+    peerHandler_.set(std::move(handler));
     if (started_) unlock();
 }
 
@@ -1541,10 +1538,7 @@ void EspNowTransport::pollChannel(uint32_t now) {
     radio_.stationConnected = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && stationConnected();
     if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor || fixed, now);
     if (follower_) follower_->onChannelChanged(ch, now);
-    if (channelHandler_) {
-        std::function<void(uint8_t)> h = channelHandler_;
-        h(ch);
-    }
+    if (channelHandler_) channelHandler_(ch);
 }
 
 Status EspNowTransport::appTaskReady() const {
@@ -1605,7 +1599,7 @@ Status EspNowTransport::searchChannels() {
 
 void EspNowTransport::onChannelChange(std::function<void(uint8_t channel)> handler) {
     if (started_) lock();
-    channelHandler_ = std::move(handler);
+    channelHandler_.set(std::move(handler));
     if (started_) unlock();
 }
 

@@ -15,6 +15,8 @@ inline bool reached(uint32_t now, uint32_t deadline) {
 ChannelFollower::ChannelFollower(Discovery& discovery, RadioControl& radio, const ChannelConfig& config)
     : discovery_(discovery), radio_(radio), config_(config) {
     if (config_.dwellMs == 0) config_.dwellMs = 1;
+    // Searching starts from radio events: nothing to allocate then.
+    plan_.reserve((config_.channels.empty() ? 13 : config_.channels.size()) + 1);
 }
 
 void ChannelFollower::start(uint32_t now) {
@@ -109,10 +111,7 @@ void ChannelFollower::moveTo(uint8_t channel, uint32_t now) {
     if (radio_.setChannel(channel) != Status::Ok) return;
     okSince_ = now;
     discovery_.discover(now);
-    if (handler_) {
-        ChannelHandler h = handler_;
-        h(channel);
-    }
+    if (handler_) handler_(channel);
 }
 
 Status ChannelFollower::search(uint32_t now) {
@@ -127,12 +126,10 @@ void ChannelFollower::beginSearch(bool anyPeer, uint32_t now) {
     searchAny_ = anyPeer;
     origin_ = radio_.channel();
     plan_.clear();
-    std::vector<uint8_t> all = config_.channels;
-    if (all.empty()) {
-        for (uint8_t c = 1; c <= 13; ++c) all.push_back(c);
-    }
-    for (uint8_t c : all) {
-        if (c != origin_) plan_.push_back(c);
+    size_t count = config_.channels.empty() ? 13 : config_.channels.size();
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t c = config_.channels.empty() ? static_cast<uint8_t>(i + 1) : config_.channels[i];
+        if (c != origin_) plan_.push_back(c);  // within the reserved capacity
     }
     plan_.push_back(origin_);  // end where we started: the peers may come back there
     step_ = 0;
@@ -162,10 +159,7 @@ void ChannelFollower::endSearch(bool found, uint32_t now) {
     searching_ = false;
     okSince_ = now;
     if (found) {
-        if (radio_.channel() != origin_ && handler_) {
-            ChannelHandler h = handler_;
-            h(radio_.channel());
-        }
+        if (radio_.channel() != origin_ && handler_) handler_(radio_.channel());
         return;
     }
     if (radio_.channel() != origin_) radio_.setChannel(origin_);
