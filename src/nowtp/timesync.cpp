@@ -9,6 +9,7 @@ namespace nowtp {
 namespace {
 
 constexpr size_t kMaxSamples = 8;
+constexpr size_t kMaxReferences = 8;  // peers announcing themselves as references, tracked
 constexpr uint32_t kRoundGraceMs = 300;   // wait for late responses after the last request
 constexpr uint32_t kFastRounds = 3;       // first rounds run every second
 constexpr uint32_t kFastIntervalMs = 1000;
@@ -38,6 +39,9 @@ bool lessMac(const Mac& a, const Mac& b) {
 TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& config)
     : engine_(engine), clock_(std::move(localClockUs)), config_(config) {
     if (config_.samples == 0) config_.samples = 1;
+    // Both grow on what the network does: reserved here, never grown.
+    samples_.reserve(kMaxSamples);
+    announced_.reserve(kMaxReferences);
     if (config_.intervalMs < kFastIntervalMs) config_.intervalMs = kFastIntervalMs;
 }
 
@@ -71,7 +75,9 @@ void TimeSync::onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_t now) 
         }
         break;
     }
-    if (!listed && event != PeerEvent::Lost && peer.timeReference) announced_.push_back(peer.mac);
+    if (!listed && event != PeerEvent::Lost && peer.timeReference && announced_.size() < kMaxReferences) {
+        announced_.push_back(peer.mac);
+    }
     chooseReference(now);
 }
 

@@ -12,11 +12,14 @@ inline bool reached(uint32_t now, uint32_t deadline) {
 
 }  // namespace
 
+constexpr size_t ChannelFollower::kMaxAnchors;
+
 ChannelFollower::ChannelFollower(Discovery& discovery, RadioControl& radio, const ChannelConfig& config)
     : discovery_(discovery), radio_(radio), config_(config) {
     if (config_.dwellMs == 0) config_.dwellMs = 1;
-    // Searching starts from radio events: nothing to allocate then.
+    // Searching and tracking follow radio and peer events: nothing to allocate then.
     plan_.reserve((config_.channels.empty() ? 13 : config_.channels.size()) + 1);
+    peers_.reserve(kMaxAnchors);
 }
 
 void ChannelFollower::start(uint32_t now) {
@@ -50,13 +53,15 @@ void ChannelFollower::setSuspended(bool suspended, uint32_t now) {
     okSince_ = now;  // whatever happened meanwhile, start counting afresh
 }
 
+// Only anchors matter, and a few at most: the list is reserved, never grown.
 void ChannelFollower::track(const PeerInfo& peer) {
-    for (Tracked& t : peers_) {
-        if (t.mac != peer.mac) continue;
-        t.anchor = peer.anchor;
+    for (size_t i = 0; i < peers_.size(); ++i) {
+        if (peers_[i].mac != peer.mac) continue;
+        if (!peer.anchor) peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
         return;
     }
-    Tracked t = {peer.mac, peer.anchor};
+    if (!peer.anchor || peers_.size() >= kMaxAnchors) return;
+    Tracked t = {peer.mac, true};
     peers_.push_back(t);
 }
 

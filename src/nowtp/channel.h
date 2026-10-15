@@ -95,7 +95,8 @@ private:
     RadioControl& radio_;
     ChannelConfig config_;
     Callback<void(uint8_t)> handler_;
-    std::vector<Tracked> peers_;
+    static constexpr size_t kMaxAnchors = 8;  // anchors tracked
+    std::vector<Tracked> peers_;  // anchors heard
     bool running_ = false;
     bool suspended_ = false;
     bool hadAnchor_ = false;
