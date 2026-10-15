@@ -83,6 +83,9 @@ ESP-NOW already acknowledges and retries each unicast frame in hardware. Reliabl
 ## Duplicates and latest-only
 
 - **Duplicates.** Receivers remember recently completed messages (sender and message ID) for a few seconds and ignore repeats. If a repeat carries ack-request, the receiver answers complete.
+  - **Per sender.** Each sender gets a window over its latest message IDs: four blocks of 32 IDs, ending with the block of the newest ID delivered (97 to 128 IDs). A repeat is recognized however many other senders' messages arrived in between. An ID newer than the window moves it forward. An ID older than the window is treated as new, unless the receiver's short list of the last completed messages (shared by all senders) still holds it.
+  - **Expiry.** A block forgets its IDs a few seconds after its last delivery, and a sender's whole window after its last delivery. So a sender that restarts with IDs inside its old window loses messages only for those few seconds, as before.
+  - **Sender IDs.** A sender numbers all its messages in one sequence, broadcast and every destination alike. A receiver therefore sees gaps, and a window covers 128 IDs of the sender's traffic in total, not only those sent to it. That is two seconds (the default deadline) at 64 messages per second.
 - **Latest-only on the sender.** A new latest-only message cancels queued or partly sent latest-only messages to the same destination and port.
 - **Latest-only on the receiver.** A latest-only message from a sender drops any partial older latest-only message on the same port. It also causes late fragments of older messages to be ignored. "Older" means up to 256 message IDs behind; anything further back is treated as a sender that restarted.
 
@@ -172,7 +175,7 @@ A node with a key authenticates every message it sends, except those on port 253
 - **Acks.** An ack for an authenticated message carries flag `0x8` and ends with an 8-byte tag.
   - **Unbound tag:** `HMAC(Ka, acker MAC ‖ ackee MAC ‖ ack frame)`.
   - **Bound tag:** `HMAC(Ka, acker MAC ‖ ackee MAC ‖ ack frame ‖ epoch and sequence of the acknowledged message (8))`, the first 8 bytes of the message's trailer. It can't be replayed to confirm a later message that reuses the message ID.
-  - **Who binds.** A receiver binds its acks when it knows the message (complete, also for duplicates) and the sender announced capability `0x2`. Otherwise it uses the unbound tag.
+  - **Who binds.** A receiver binds its acks when it knows the message (complete, also for duplicates) and the sender announced capability `0x2`. Otherwise it uses the unbound tag. A duplicate known only from its sender's window (its epoch and sequence no longer remembered) gets an unbound complete, which such a sender ignores: it times out rather than take a reused ID as delivered.
   - **What senders accept.** A sender accepts a bound tag for the message's current trailer, or for its trailer before the last reseal. It accepts an unbound tag too, except for a complete ack from a receiver that announced `0x2` itself.
   - **Ignored and refused acks.** The sender ignores untagged or wrongly tagged complete, missing and busy acks. An untagged rejected ack means the receiver could not verify the message (another key, or none), and the send fails with `AuthFailed`.
 - **Compatibility.** Nodes running 0.5 and later versions interoperate with a shared key. Each side uses the stricter rules only with peers whose authenticated response announced them.

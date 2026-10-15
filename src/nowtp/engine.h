@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "link.h"
+#include "table.h"
 #include "types.h"
 #include "wire.h"
 
@@ -198,6 +199,20 @@ private:
         uint8_t bind[wire::kAckBindSize];
     };
 
+    // Message ids delivered from one sender, so a duplicate is recognized
+    // however many other senders' messages arrived since. Ids fall in
+    // kSeenBlocks blocks of 32 (block id / 32 at slot (id / 32) % kSeenBlocks),
+    // ending with the block of the newest id. A block's bits count for
+    // recentTtlMs after its last delivery, as entries of `recent_` do.
+    static constexpr uint16_t kSeenBlocks = 4;
+    struct Seen {  // 44 bytes
+        Mac src;
+        uint16_t top;   // newest id delivered
+        uint32_t last;  // last delivery
+        uint32_t bits[kSeenBlocks];
+        uint32_t at[kSeenBlocks];  // last delivery in each block
+    };
+
     // A destination whose frames failed: served again only after `retryAt`
     // while others have frames to send.
     struct Backoff {
@@ -250,6 +265,11 @@ private:
 
     void remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind, uint32_t now);
     const Recent* findRecent(const Mac& src, uint16_t id, uint32_t now) const;
+    /// True if message `id` from `src` was delivered recently. `bind` is set
+    /// to its epoch and sequence when remembered (authenticated messages).
+    bool isDuplicate(const Mac& src, uint16_t id, uint32_t now, const uint8_t*& bind) const;
+    void markSeen(const Mac& src, uint16_t id, uint32_t now);
+    bool wasSeen(const Mac& src, uint16_t id, uint32_t now) const;
     bool isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const;
     void dropOlderLatest(const Mac& src, uint8_t port, uint16_t id);
 
@@ -272,6 +292,7 @@ private:
     size_t controlCount_ = 0;
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
+    Table<Seen> seen_;  // memory per sender heard, not reserved for recentSenders
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;

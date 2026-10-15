@@ -138,8 +138,14 @@ struct Config {
     uint32_t frameSentTimeoutMs = 500;
     /// Delay before retrying when the radio's own queue is full.
     uint32_t linkBusyBackoffMs = 2;
-    /// Completed messages remembered for duplicate suppression.
+    /// Completed messages remembered, across all senders, for latest-only
+    /// ordering, for acks of authenticated duplicates, and as a second check
+    /// for duplicates.
     uint8_t recentEntries = 32;
+    /// Senders whose last ~100-128 message ids are tracked for duplicate
+    /// suppression (44 bytes each, taken as senders are heard). When full, the
+    /// sender that delivered least recently gives way.
+    uint8_t recentSenders = 20;
     /// How long a completed message is remembered.
     uint32_t recentTtlMs = 5000;
 };

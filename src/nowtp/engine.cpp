@@ -40,6 +40,7 @@ static Bytes allocBytes(size_t n) { return Bytes(static_cast<uint8_t*>(std::mall
 static Bytes allocZeroed(size_t n) { return Bytes(static_cast<uint8_t*>(std::calloc(n == 0 ? 1 : n, 1))); }
 
 constexpr size_t Engine::kMaxControlFrames;
+constexpr uint16_t Engine::kSeenBlocks;
 
 template <class T>
 Engine::Owned<T> Engine::create() {
@@ -148,7 +149,7 @@ struct Engine::RxMessage {
 };
 
 Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
-    : link_(link), config_(config), nextId_(firstMessageId) {
+    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders) {
     if (config_.recentEntries == 0) config_.recentEntries = 1;
     if (config_.sendTimeoutMs == 0) config_.sendTimeoutMs = 1;
     recent_.resize(config_.recentEntries);
@@ -719,10 +720,9 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
     bool ackRequest = reliable && (h.flags & kFlagAckRequest) != 0;
 
     // Also catches unreliable duplicates: the radio resends a frame whose MAC ack was lost.
-    if (const Recent* r = findRecent(src, h.messageId, now)) {
-        if (ackRequest) {
-            queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, r->bound ? r->bind : nullptr);
-        }
+    const uint8_t* seenBind = nullptr;
+    if (isDuplicate(src, h.messageId, now, seenBind)) {
+        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, seenBind);
         return;
     }
     if (!hasListener(h.port)) {
@@ -755,10 +755,9 @@ void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payl
     bool latest = (h.flags & kFlagLatest) != 0;
     bool ackRequest = reliable && (h.flags & kFlagAckRequest) != 0;
 
-    if (const Recent* r = findRecent(src, h.messageId, now)) {
-        if (ackRequest) {
-            queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, r->bound ? r->bind : nullptr);
-        }
+    const uint8_t* seenBind = nullptr;
+    if (isDuplicate(src, h.messageId, now, seenBind)) {
+        if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, seenBind);
         return;
     }
 
@@ -1155,6 +1154,7 @@ void Engine::popControl() {
 // Recently completed messages: duplicate suppression and latest-only ordering
 
 void Engine::remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind, uint32_t now) {
+    markSeen(src, id, now);
     Recent& r = recent_[recentNext_];
     r.bound = bind != nullptr;
     if (bind) memcpy(r.bind, bind, sizeof(r.bind));
@@ -1172,6 +1172,74 @@ const Engine::Recent* Engine::findRecent(const Mac& src, uint16_t id, uint32_t n
         if (r.used && r.messageId == id && r.src == src && !reached(now, r.at + config_.recentTtlMs)) return &r;
     }
     return nullptr;
+}
+
+// An authenticated duplicate that only the sender's window still knows is
+// acknowledged unbound, which a sender checking bound acks doesn't take: it
+// times out rather than being told a reused id was delivered.
+bool Engine::isDuplicate(const Mac& src, uint16_t id, uint32_t now, const uint8_t*& bind) const {
+    bind = nullptr;
+    if (const Recent* r = findRecent(src, id, now)) {
+        if (r->bound) bind = r->bind;
+        return true;
+    }
+    return wasSeen(src, id, now);
+}
+
+namespace {
+// Block of 32 ids; 2048 of them cover the id space, so differences wrap at 11 bits.
+inline uint16_t blocksBehind(uint16_t newer, uint16_t older) {
+    return static_cast<uint16_t>(((newer >> 5) - (older >> 5)) & 0x7FF);
+}
+}  // namespace
+
+void Engine::markSeen(const Mac& src, uint16_t id, uint32_t now) {
+    Seen* s = nullptr;
+    size_t oldest = 0;
+    for (size_t i = 0; i < seen_.size(); ++i) {
+        if (seen_[i].src == src) {
+            s = &seen_[i];
+            break;
+        }
+        if (static_cast<int32_t>(seen_[i].last - seen_[oldest].last) < 0) oldest = i;
+    }
+    bool fresh = s == nullptr || reached(now, s->last + config_.recentTtlMs);
+    if (!s) {
+        Seen blank;
+        memset(&blank, 0, sizeof(blank));
+        blank.src = src;
+        s = seen_.add(blank);
+        // Full, or no memory for another: the sender heard least recently gives way.
+        if (!s && !seen_.empty()) s = &seen_[oldest];
+        if (!s) return;  // `recent_` still holds the id
+        s->src = src;
+    }
+    if (fresh) {
+        memset(s->bits, 0, sizeof(s->bits));
+        s->top = id;
+    } else if (static_cast<int16_t>(id - s->top) > 0) {
+        // Newer: clear the blocks the window moves onto.
+        uint16_t steps = std::min(blocksBehind(id, s->top), kSeenBlocks);
+        for (uint16_t k = 1; k <= steps; ++k) s->bits[((s->top >> 5) + k) % kSeenBlocks] = 0;
+        s->top = id;
+    } else if (blocksBehind(s->top, id) >= kSeenBlocks) {
+        return;  // older than the window; `recent_` may still hold it
+    }
+    size_t slot = (id >> 5) % kSeenBlocks;
+    s->bits[slot] |= 1u << (id & 31);
+    s->at[slot] = now;
+    s->last = now;
+}
+
+bool Engine::wasSeen(const Mac& src, uint16_t id, uint32_t now) const {
+    for (const Seen& s : seen_) {
+        if (!(s.src == src)) continue;
+        if (reached(now, s.last + config_.recentTtlMs)) return false;
+        if (static_cast<int16_t>(id - s.top) > 0 || blocksBehind(s.top, id) >= kSeenBlocks) return false;
+        size_t slot = (id >> 5) % kSeenBlocks;
+        return ((s.bits[slot] >> (id & 31)) & 1) && !reached(now, s.at[slot] + config_.recentTtlMs);
+    }
+    return false;
 }
 
 bool Engine::isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const {

@@ -637,6 +637,135 @@ TEST(reliable_duplicate_suppressed_when_ack_lost) {
     CHECK(net.engine(a).stats().retransmissions >= 1);
 }
 
+// Many senders at a high rate, with acks lost: a probe for a message whose
+// ack was lost arrives after hundreds of other messages, which a ring shared
+// by all senders had already forgotten (the message was delivered twice).
+TEST(duplicates_suppressed_per_sender_at_high_rate) {
+    sim::Network net(3);
+    size_t r = net.addNode();
+    const size_t kSenders = 8;
+    const uint32_t kMessages = 100;
+    std::vector<size_t> tx;
+    for (size_t i = 0; i < kSenders; ++i) tx.push_back(net.addNode());
+    std::vector<int> delivered(kSenders * kMessages, 0);
+    net.engine(r).listen(1, [&](const Message& m) {
+        uint32_t key;
+        std::memcpy(&key, m.data, sizeof(key));
+        delivered[key]++;
+    });
+    std::mt19937 rng(9);
+    uint32_t acksDropped = 0;
+    net.dropIf = [&](const sim::Frame& f) {
+        wire::Header h;
+        size_t off;
+        if (f.from == r && wire::decodeHeader(f.data.data(), f.data.size(), h, off) && h.type == wire::Type::Ack &&
+            rng() % 4 == 0) {
+            acksDropped++;
+            return true;
+        }
+        return false;
+    };
+    std::vector<uint32_t> queued(kSenders, 0), finished(kSenders, 0);
+    std::vector<Status> outcome(kSenders * kMessages, Status::Ok);
+    auto refill = [&] {
+        for (size_t i = 0; i < kSenders; ++i) {
+            while (queued[i] < kMessages && queued[i] - finished[i] < 3) {
+                uint32_t key = static_cast<uint32_t>(i * kMessages + queued[i]);
+                auto msg = pattern(40, key);
+                std::memcpy(msg.data(), &key, sizeof(key));
+                Status st = net.engine(tx[i]).send(net.mac(r), 1, msg.data(), msg.size(), reliable(),
+                                                   [&, i, key](Status s) {
+                                                       finished[i]++;
+                                                       outcome[key] = s;
+                                                   },
+                                                   net.now());
+                if (st != Status::Ok) break;
+                queued[i]++;
+            }
+        }
+    };
+    uint32_t t0 = net.now();
+    CHECK(net.runUntil(
+        [&] {
+            refill();
+            for (size_t i = 0; i < kSenders; ++i) {
+                if (finished[i] < kMessages) return false;
+            }
+            return true;
+        },
+        60000));
+    net.run(100);
+    std::printf("    %u messages in %u ms, %u acks dropped\n", static_cast<unsigned>(kSenders * kMessages),
+                net.now() - t0, acksDropped);
+    CHECK(acksDropped > 50u);
+    for (size_t k = 0; k < delivered.size(); ++k) {
+        CHECK(delivered[k] <= 1);
+        if (outcome[k] == Status::Ok) CHECK_EQ(delivered[k], 1);
+    }
+}
+
+TEST(duplicate_window_edges) {
+    auto single = [](uint16_t id) {
+        wire::Header h;
+        h.type = wire::Type::Single;
+        h.port = 1;
+        h.messageId = id;
+        std::vector<uint8_t> f(wire::kCommonHeaderSize);
+        wire::encodeHeader(h, f.data());
+        f.push_back(static_cast<uint8_t>(id));
+        return f;
+    };
+    sim::Network net;
+    Config cfg;
+    cfg.recentSenders = 2;
+    size_t b = net.addNode(cfg);
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    auto from = [](uint8_t n) { return Mac{{0x06, 0, 0, 0, 0, n}}; };
+    auto count = [&] { return inbox.messages.size(); };
+    Mac x = from(1);
+    for (uint16_t id : {65534, 65535, 0, 1}) net.inject(b, x, single(id));  // across the wrap
+    CHECK_EQ(count(), 4u);
+    // Push x's ids out of the shared ring: the window still knows them.
+    Mac y = from(2);
+    for (uint16_t id = 0; id < 40; ++id) net.inject(b, y, single(id));
+    CHECK_EQ(count(), 44u);
+    for (uint16_t id : {65534, 65535, 0, 1}) net.inject(b, x, single(id));
+    CHECK_EQ(count(), 44u);
+    // Newer ids move the window; one older than it is taken as new.
+    net.inject(b, x, single(200));
+    net.inject(b, x, single(65535));
+    CHECK_EQ(count(), 46u);
+    net.inject(b, x, single(110));  // within the window, not seen
+    net.inject(b, x, single(110));
+    CHECK_EQ(count(), 47u);
+    // A third sender evicts the one heard least recently (y).
+    net.run(10);
+    net.inject(b, x, single(201));
+    net.run(10);
+    net.inject(b, from(3), single(5));
+    CHECK_EQ(count(), 49u);
+    net.inject(b, x, single(201));  // x's window
+    net.inject(b, y, single(39));   // the shared ring
+    CHECK_EQ(count(), 49u);
+    net.inject(b, y, single(0));  // forgotten by both
+    CHECK_EQ(count(), 50u);
+    // A block's bits expire with recentTtlMs, even while the sender is active.
+    sim::Network net2;
+    size_t c = net2.addNode();
+    Inbox inbox2;
+    net2.engine(c).listen(1, inbox2.handler());
+    net2.inject(c, x, single(5));
+    for (uint16_t id : {40, 70, 100}) {
+        net2.run(2000);
+        net2.inject(c, x, single(id));
+    }
+    net2.inject(c, x, single(5));
+    CHECK_EQ(inbox2.messages.size(), 5u);
+    net2.inject(c, x, single(70));
+    CHECK_EQ(inbox2.messages.size(), 5u);
+}
+
 TEST(reliable_no_listener_is_rejected) {
     sim::Network net;
     size_t a = net.addNode(), b = net.addNode();

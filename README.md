@@ -340,7 +340,7 @@ Sending works the other way round. `send()` copies the payload, so a large messa
 
 The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
 
-The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 2 KB of tables and a frame buffer (plus about 100 bytes per peer), and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
+The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 2 KB of tables and a frame buffer (plus about 150 bytes per peer), and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
 
 ```cpp
 cfg.protocol.maxMessageSize = 8 * 1024;
@@ -380,6 +380,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `protocol.sendTimeoutMs` | 2000 | Default deadline for a whole message (`SendOptions::timeoutMs` overrides it) |
 | `protocol.ackTimeoutMs` | 100 | Reliable mode: wait before probing the receiver again |
 | `protocol.rxTimeoutMs` | 1000 | A partial incoming message is dropped after this long without progress |
+| `protocol.recentSenders` / `recentEntries` / `recentTtlMs` | 20 / 32 / 5000 | Duplicate suppression: senders tracked (each over its last ~128 message IDs, 44 bytes), completed messages remembered across all senders, and for how long |
 | `protocol.networkId` | 0 | Separates NowTP deployments on one channel (not a security feature) |
 | `radio.initWifi`, `radio.channel`, `radio.disablePowerSave` | true, 1, true | Radio setup (see above) |
 | `radio.txPowerDbm`, `radio.broadcastRate`, `radio.unicastRate`, `radio.longRange`, `radio.countryCode` | driver, 1 Mbps, 1 Mbps, false, driver | Power, rate and Long Range (see above) |
