@@ -317,6 +317,9 @@ public:
 
     Mac localMac() const;
     TransportStats stats() const;
+    /// Heap NowTP holds for messages now (see Engine::MemoryUse); zeros
+    /// before begin(). Takes the lock: cheap enough to sample every few ms.
+    Engine::MemoryUse memory() const;
     /// Radio events lost because the event buffer was full.
     uint32_t droppedEvents() const;
 

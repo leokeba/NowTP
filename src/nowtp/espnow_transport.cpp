@@ -1279,6 +1279,14 @@ std::vector<PeerInfo> EspNowTransport::peers() const {
     return copy;
 }
 
+Engine::MemoryUse EspNowTransport::memory() const {
+    if (!started_) return Engine::MemoryUse();
+    lock();
+    Engine::MemoryUse m = engine_->memory();
+    unlock();
+    return m;
+}
+
 size_t EspNowTransport::peerMaxMessageSize(const Mac& peer) const {
     if (!started_) return 0;
     lock();

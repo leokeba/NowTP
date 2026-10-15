@@ -504,6 +504,40 @@ TEST(lost_mac_ack_does_not_duplicate_messages) {
     for (size_t i = 1; i < inbox.messages.size(); ++i) CHECK(inbox.messages[i] != inbox.messages[i - 1]);
 }
 
+// What a stalled peer makes us hold, as the application can sample it.
+TEST(engine_reports_memory_held) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    CHECK_EQ(net.engine(a).memory().txBytes, 0u);
+    // b receives every fragment but the last: a waits for the ack, b holds the partial message.
+    net.dropIf = [&](const sim::Frame& f) {
+        wire::Header h;
+        size_t off;
+        return f.from == a && wire::decodeHeader(f.data.data(), f.data.size(), h, off) &&
+               h.type == wire::Type::Fragment && h.index + 1 == h.count;
+    };
+    auto msg = pattern(3900);
+    Outcome out;
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+    Engine::MemoryUse tx = net.engine(a).memory();
+    CHECK_EQ(tx.txMessages, 1u);
+    CHECK_EQ(tx.txBytes, msg.size() + 4);  // with its CRC
+    net.run(50);
+    Engine::MemoryUse rx = net.engine(b).memory();
+    CHECK_EQ(rx.rxMessages, 1u);
+    CHECK(rx.rxBytes >= msg.size());
+    net.dropIf = nullptr;
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    net.run(10);
+    CHECK_EQ(net.engine(a).memory().txMessages, 0u);
+    CHECK_EQ(net.engine(a).memory().txBytes, 0u);
+    CHECK_EQ(net.engine(b).memory().rxMessages, 0u);
+    CHECK_EQ(net.engine(b).memory().rxBytes, 0u);
+}
+
 TEST(no_listener_drops_message) {
     sim::Network net;
     size_t a = net.addNode(), b = net.addNode();

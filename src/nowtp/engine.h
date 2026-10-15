@@ -167,6 +167,23 @@ public:
     /// Outgoing messages queued or awaiting acknowledgement.
     size_t pendingMessages() const { return tx_.size(); }
 
+    /// Heap held for messages right now: what the queue and reassembly limits
+    /// count. Fixed buffers (the frame being built, tables) are not included.
+    struct MemoryUse {
+        size_t txMessages = 0;  ///< Queued or awaiting their ack.
+        size_t txBytes = 0;     ///< Their payloads, with CRC and trailer.
+        size_t rxMessages = 0;  ///< Being reassembled.
+        size_t rxBytes = 0;     ///< Reserved for them (whole buffers once the fragment size is known).
+    };
+    MemoryUse memory() const {
+        MemoryUse m;
+        m.txMessages = tx_.size();
+        m.txBytes = txBytes_;
+        m.rxMessages = rx_.size();
+        m.rxBytes = rxBytes_;
+        return m;
+    }
+
     /// Largest message on `port` that fits in a single frame to `dst`.
     size_t singleFramePayload(const Mac& dst, uint8_t port = 0) const;
 
