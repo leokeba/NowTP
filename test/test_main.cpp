@@ -766,6 +766,59 @@ TEST(duplicate_window_edges) {
     CHECK_EQ(inbox2.messages.size(), 5u);
 }
 
+// A handler that can't take a message refuses it: the sender is told busy,
+// never Ok, and sends it again.
+TEST(handler_refusal_makes_the_sender_retry) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    ReceiveHandler take = inbox.handler();
+    int refusals = 0, calls = 0;
+    net.engine(b).listen(1, [&](const Message& m) {
+        calls++;
+        if (refusals > 0) {
+            refusals--;
+            m.refused = true;
+            return;
+        }
+        take(m);
+    });
+    for (size_t size : {100, 3000}) {
+        inbox.messages.clear();
+        calls = 0;
+        refusals = 2;
+        auto msg = pattern(size, static_cast<uint32_t>(size));
+        Outcome out;
+        net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+        CHECK(net.runUntil([&] { return out.done; }));
+        CHECK(out.status == Status::Ok);
+        CHECK_EQ(calls, 3);
+        CHECK_EQ(inbox.messages.size(), 1u);
+        CHECK(inbox.messages[0] == msg);
+    }
+    CHECK_EQ(net.engine(b).stats().messagesRefused, 4u);
+    CHECK_EQ(net.engine(b).stats().messagesReceived, 2u);
+    CHECK(net.engine(a).stats().receiverBusy >= 4u);
+
+    // Refused until its deadline: the sender times out.
+    inbox.messages.clear();
+    refusals = 1000;
+    auto msg = pattern(100);
+    Outcome out;
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Timeout);
+    CHECK(inbox.messages.empty());
+
+    // Unreliable: dropped.
+    refusals = 1;
+    uint32_t refused = net.engine(b).stats().messagesRefused;
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), SendOptions(), nullptr, net.now());
+    net.run(50);
+    CHECK(inbox.messages.empty());
+    CHECK_EQ(net.engine(b).stats().messagesRefused, refused + 1);
+}
+
 TEST(reliable_no_listener_is_rejected) {
     sim::Network net;
     size_t a = net.addNode(), b = net.addNode();
@@ -2251,6 +2304,36 @@ TEST(secure_acks_are_bound_to_the_message) {
 // A response without the capabilities extension, as from NowTP 0.5: the
 // sender won't seal its queued message again, so the receiver keeps the old
 // window rule and the held-back message still gets through.
+// The sequence number of a refused message is released for its retry.
+TEST(secure_refused_message_is_delivered_on_retry) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    ReceiveHandler take = inbox.handler();
+    int refusals = 0;
+    rig.net.engine(b).listen(1, [&](const Message& m) {
+        if (refusals > 0) {
+            refusals--;
+            m.refused = true;
+            return;
+        }
+        take(m);
+    });
+    CHECK(rig.sendWait(a, b, 1, pattern(10), reliable()) == Status::Ok);  // verifies the epoch
+    for (size_t size : {100, 3000}) {
+        inbox.messages.clear();
+        inbox.meta.clear();
+        refusals = 1;
+        auto msg = pattern(size, static_cast<uint32_t>(size));
+        CHECK(rig.sendWait(a, b, 1, msg, reliable()) == Status::Ok);
+        CHECK_EQ(inbox.messages.size(), 1u);
+        CHECK(inbox.messages[0] == msg);
+        CHECK(inbox.meta[0].authenticated);
+    }
+    CHECK_EQ(rig.net.engine(b).stats().messagesRefused, 2u);
+    CHECK_EQ(rig.sec[b]->counters().replaysRejected, 0u);
+}
+
 TEST(secure_older_senders_still_verify) {
     SecureRig rig;
     size_t a = rig.add(testKey()), b = rig.add(testKey());

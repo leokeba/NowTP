@@ -75,6 +75,14 @@ public:
     virtual bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
                          const uint8_t* bindBefore) = 0;
 
+    /// A reliable message open() found Authentic was refused by its receive
+    /// handler, and its sender will send it again. `bind` is the start of its
+    /// trailer (epoch and sequence): that sequence number may be accepted once more.
+    virtual void refused(const Mac& src, const uint8_t* bind) {
+        (void)src;
+        (void)bind;
+    }
+
     enum class Screen : uint8_t {
         Normal,
         Limited,  ///< Sender without a verified epoch: one reassembly slot shared by all of them.
@@ -254,8 +262,13 @@ private:
     RxMessage* findRx(const Mac& src, uint16_t id);
     void dropRx(RxMessage* rx, bool countAsDropped = true);
     void completeRx(RxMessage* rx, uint32_t now);
-    void deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
-                 uint64_t timestampUs, bool authenticated, uint8_t* buffer = nullptr);
+    enum class Delivery : uint8_t { Taken, Refused, NoListener };
+    Delivery deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
+                     uint64_t timestampUs, bool authenticated, uint8_t* buffer = nullptr);
+    /// Records a delivered message, or answers one the handler refused, and
+    /// queues the ack a reliable sender needs.
+    void delivered(Delivery d, const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind,
+                   uint32_t now);
     enum class Auth : uint8_t { Accept, Reject, Retry };
     Auth authorize(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t& len, bool& authenticated,
                    uint32_t now);

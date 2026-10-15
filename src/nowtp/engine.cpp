@@ -611,8 +611,8 @@ bool Engine::hasListener(uint8_t port) const {
 
 // `buffer`, if set, is the malloc()ed buffer behind `data`: it is freed here
 // unless the handler takes it (Message::buffer).
-void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len, int8_t rssi,
-                     uint64_t timestampUs, bool authenticated, uint8_t* buffer) {
+Engine::Delivery Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t* data, size_t len,
+                                 int8_t rssi, uint64_t timestampUs, bool authenticated, uint8_t* buffer) {
     Bytes owned(buffer);
     ReceiveHandler handler;
     for (const auto& l : listeners_) {
@@ -623,9 +623,8 @@ void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t*
     }
     if (!handler) {
         stats_.messagesDropped++;
-        return;
+        return Delivery::NoListener;
     }
-    stats_.messagesReceived++;
     Message m;
     m.src = src;
     m.port = port;
@@ -639,6 +638,35 @@ void Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, const uint8_t*
     m.buffer = owned.release();
     handler(m);
     std::free(m.buffer);
+    if (m.refused) {
+        stats_.messagesRefused++;
+        stats_.messagesDropped++;
+        return Delivery::Refused;
+    }
+    stats_.messagesReceived++;
+    return Delivery::Taken;
+}
+
+// Acks go out only once the handler has taken the message, so a refusal can
+// still turn into "busy". A refused message isn't remembered: the sender's
+// retry is delivered as new.
+void Engine::delivered(Delivery d, const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind,
+                       uint32_t now) {
+    bool reliable = (flags & kFlagReliable) != 0;
+    switch (d) {
+        case Delivery::Taken:
+            remember(src, port, flags, id, bind, now);
+            if (reliable) queueAck(src, port, id, flags, AckStatus::Complete, nullptr, bind);
+            break;
+        case Delivery::Refused:
+            if (!reliable) break;
+            if (bind && auth_) auth_->refused(src, bind);  // its sequence number comes back with the retry
+            queueAck(src, port, id, flags, AckStatus::Busy, nullptr, bind);
+            break;
+        case Delivery::NoListener:
+            if (reliable) queueAck(src, port, id, flags, AckStatus::Rejected, nullptr);
+            break;
+    }
 }
 
 // Splits off and checks an authentication trailer. `len` shrinks to the
@@ -745,9 +773,8 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
         dropOlderLatest(src, h.port, h.messageId);
     }
     const uint8_t* bind = authenticated ? payload + len : nullptr;  // the trailer follows the payload
-    remember(src, h.port, h.flags, h.messageId, bind, now);
-    if (ackRequest) queueAck(src, h.port, h.messageId, h.flags, AckStatus::Complete, nullptr, bind);
-    deliver(src, h.port, h.flags, payload, len, rxRssi_, rxTimeUs_, authenticated);
+    Delivery d = deliver(src, h.port, h.flags, payload, len, rxRssi_, rxTimeUs_, authenticated);
+    delivered(d, src, h.port, h.flags, h.messageId, bind, now);
 }
 
 void Engine::handleFragment(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {
@@ -1023,13 +1050,12 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
         stats_.messagesDropped++;
         return;
     }
-    const uint8_t* bind = authenticated ? data + len : nullptr;  // the trailer follows the payload
-    remember(owned->src, owned->port, owned->flags, owned->id, bind, now);
-    if (reliable) {
-        queueAck(owned->src, owned->port, owned->id, owned->flags, AckStatus::Complete, nullptr, bind);
-    }
-    deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated,
-            owned->buf.release());
+    // The trailer follows the payload, in a buffer the handler may take or free.
+    uint8_t bind[kAckBindSize];
+    if (authenticated) memcpy(bind, data + len, sizeof(bind));
+    Delivery d = deliver(owned->src, owned->port, owned->flags, data, len, owned->rssi, owned->timeUs, authenticated,
+                         owned->buf.release());
+    delivered(d, owned->src, owned->port, owned->flags, owned->id, authenticated ? bind : nullptr, now);
 }
 
 void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, size_t len, uint32_t now) {

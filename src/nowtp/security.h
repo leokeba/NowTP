@@ -112,6 +112,7 @@ public:
     bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
                  const uint8_t* bindBefore) override;
     Screen screen(const Mac& src, uint8_t port, uint8_t flags) const override;
+    void refused(const Mac& src, const uint8_t* bind) override;
 
 private:
     enum MsgType : uint8_t {

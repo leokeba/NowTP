@@ -280,6 +280,19 @@ bool Security::acceptSequence(Peer& p, uint32_t seq) {
     return true;
 }
 
+// Only the refused message's own number is released, for its retry: the
+// window doesn't move, and numbers of delivered messages stay taken. Not for
+// unreliable messages (no retry comes), whose replay would deliver them late.
+void Security::refused(const Mac& src, const uint8_t* bind) {
+    uint32_t epoch = getU32(bind);
+    uint32_t seq = getU32(bind + 4);
+    for (Peer& p : peers_) {
+        if (!(p.mac == src) || !p.verified || p.epoch != epoch || seq > p.highest) continue;
+        uint32_t back = p.highest - seq;
+        if (back < 64) p.window &= ~(static_cast<uint64_t>(1) << back);
+    }
+}
+
 // Before reassembly: a multi-frame message from a sender we haven't verified
 // may be garbage, and only the complete message's tag tells.
 Authenticator::Screen Security::screen(const Mac& src, uint8_t port, uint8_t flags) const {

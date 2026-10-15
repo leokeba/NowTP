@@ -52,7 +52,7 @@ Port and message ID repeat the values of the message being acknowledged. Status 
 - `0` complete: the whole message was received, verified and delivered (or was already delivered earlier).
 - `1` missing: the payload lists missing fragment indices, 2 bytes each, in increasing order. The list may be cut short to fit one frame.
 - `2` rejected: the receiver will never accept this message, because it has no handler on the port or the message is too large.
-- `3` busy: the receiver has no room to reassemble this message right now. The sender stops sending it, waits one to two and a half ack timeouts (spread by message ID), then probes (step 5 below). Receivers send it for the first fragment and for ack-requests of a message they refuse. Senders that predate this status ignore it and simply probe after their ack timeout.
+- `3` busy: the receiver has no room to reassemble this message right now. The sender stops sending it, waits one to two and a half ack timeouts (spread by message ID), then probes (step 5 below). Receivers send it for the first fragment and for ack-requests of a message they refuse, and for a complete message (single-frame or reassembled) that the receiving application refused. Senders that predate this status ignore it and simply probe after their ack timeout.
 
 ## Sending
 
@@ -70,7 +70,7 @@ Port and message ID repeat the values of the message being acknowledged. Status 
    - complete, if it has the whole message,
    - missing, listing the gaps, or
    - rejected.
-3. When a message completes, the receiver also sends complete without being asked.
+3. When a message completes, the receiver also sends complete without being asked. It does so only once the application has taken the message. An application that can't take it (on a short heap, for instance) refuses it, and the receiver answers busy instead and forgets the message, so the sender's retry arrives as a new delivery.
 4. On missing, the sender resends the listed fragments and sets ack-request on the last of them.
 5. If no ack arrives within the ack timeout, the sender resends the last fragment with ack-request as a probe. This also works if the receiver has dropped its partial state: it rebuilds the state from the probe and reports the rest as missing.
    - On busy, the sender probes the same way after its backoff.
@@ -156,6 +156,7 @@ A node with a key authenticates every message it sends, except those on port 253
 
 - **What the tag covers.** `flags` are the message's reliable and latest-only bits. `dst MAC` is the receiver's own MAC for unicast, and `FF:FF:FF:FF:FF:FF` for broadcast, so a unicast message cannot be redirected to another node.
 - **Receiver checks.** The receiver checks the tag, then the sequence number against a 64-entry sliding window per sender and epoch. Repeats and numbers older than the window are dropped silently. A refusal could reach the real sender, which may have a message with that ID in flight.
+  - **Refused by the application.** When the application refuses a verified reliable message (answered busy, see above), its sequence number is released, so the sender's retry verifies. The window doesn't move, and the numbers of delivered messages stay taken. Until the window passes that number, a recording of the refused message could still be delivered once, even after its sender gave up. That is no worse than a late retransmission. An unreliable message keeps its number, since no retry follows.
 - **Unknown epochs.** A message from an epoch the receiver hasn't verified is held back. The receiver drops it without an ack, and challenges the sender:
   - **Challenge** (type 1): `type ‖ nonce (8)`.
   - **Response** (type 2): `type ‖ nonce (8) ‖ epoch (4) ‖ current sequence (4) ‖ tag (16) ‖ capabilities (1) ‖ capabilities tag (16)`.

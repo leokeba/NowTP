@@ -89,6 +89,11 @@ struct Message {
     /// it after the handler. Null for a single-frame message (`data` points
     /// into the frame), which must be copied to be kept.
     mutable uint8_t* buffer = nullptr;
+    /// Set by the handler to refuse a message it can't take now, e.g. on a
+    /// short heap. The message counts as not received: a reliable sender is
+    /// told the receiver is busy and sends it again shortly, which the
+    /// handler then sees as a new delivery. An unreliable message is dropped.
+    mutable bool refused = false;
 };
 
 /// Ports used by NowTP's own services. Ports 240-255 are reserved.
@@ -168,6 +173,9 @@ struct Stats {
     uint32_t reassemblyRefused = 0;
     /// Our messages the receiver had no room for yet; each backs off and retries.
     uint32_t receiverBusy = 0;
+    /// Messages a receive handler refused (Message::refused). Also counted in
+    /// messagesDropped, not in messagesReceived.
+    uint32_t messagesRefused = 0;
 };
 
 }  // namespace nowtp
