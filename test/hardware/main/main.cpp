@@ -404,6 +404,8 @@ void noLeakAcrossRestarts() {
         transport.sendAndWait(Mac::broadcast(), 1, msg.data(), msg.size());
         transport.send(kAbsent, 1, msg.data(), msg.size());  // auto-added peer, left in flight
         transport.end();
+        // The NowTP task deletes itself; the idle task frees its stack later.
+        vTaskDelay(pdMS_TO_TICKS(50));
         if (i == 1) heapAfterWarmup = esp_get_free_heap_size();
     }
     size_t heapNow = esp_get_free_heap_size();
