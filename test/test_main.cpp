@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1458,6 +1459,57 @@ TEST(discovery_reports_lost_peers) {
     CHECK(rig.nodes[a]->peers().empty());
 }
 
+namespace {
+
+// Drops `from`'s frames on kDiscoveryPort: its announcements are lost.
+std::function<bool(const sim::Frame&)> dropAnnouncementsFrom(const std::vector<size_t>& nodes) {
+    return [nodes](const sim::Frame& f) {
+        wire::Header h;
+        size_t off;
+        return std::find(nodes.begin(), nodes.end(), f.from) != nodes.end() &&
+               wire::decodeHeader(f.data.data(), f.data.size(), h, off) && h.port == kDiscoveryPort;
+    };
+}
+
+}  // namespace
+
+TEST(discovery_keeps_peers_heard_sending_data) {
+    DiscoveryRig rig;
+    DiscoveryConfig cfg;
+    cfg.announceIntervalMs = 500;
+    cfg.peerTimeoutMs = 1600;
+    size_t a = rig.add("a", cfg), b = rig.add("b", cfg), c = rig.add("c", cfg);
+    for (auto& d : rig.nodes) d->start(rig.net.now());
+    rig.run(1000);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+
+    // b's and c's announcements are lost, but b sends messages to a, and c
+    // acknowledges a's messages: neither is lost while that goes on.
+    rig.net.dropIf = dropAnnouncementsFrom({b, c});
+    Inbox atA, atC;
+    rig.net.engine(a).listen(1, atA.handler());
+    rig.net.engine(c).listen(1, atC.handler());
+    auto big = pattern(600), small = pattern(20);  // reassembled, and single-frame
+    for (int i = 0; i < 25; ++i) {
+        const std::vector<uint8_t>& m = i % 2 ? big : small;
+        CHECK(rig.net.engine(b).send(rig.net.mac(a), 1, m.data(), m.size(), SendOptions(), nullptr, rig.net.now()) ==
+              Status::Ok);
+        CHECK(rig.net.engine(a).send(rig.net.mac(c), 1, small.data(), small.size(), reliable(), nullptr,
+                                     rig.net.now()) == Status::Ok);
+        rig.run(200);
+    }
+    CHECK_EQ(atA.messages.size(), 25u);
+    CHECK_EQ(atC.messages.size(), 25u);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), 0u);
+    CHECK_EQ(rig.nodes[a]->peers().size(), 2u);
+
+    // Once the traffic stops as well, both are lost.
+    rig.run(2500);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), 2u);
+    CHECK(rig.nodes[a]->peers().empty());
+    rig.net.dropIf = nullptr;
+}
+
 TEST(discovery_metadata_updates) {
     DiscoveryRig rig;
     DiscoveryConfig cfg;
@@ -2120,6 +2172,58 @@ TEST(secure_messages_are_authenticated) {
     CHECK_EQ(inbox.messages.size(), 3u);
     CHECK(inbox.meta[2].authenticated);
     CHECK_EQ(rig.net.engine(b).stats().authRejected, 0u);
+}
+
+TEST(secure_discovery_peer_is_kept_by_authenticated_traffic_only) {
+    SecureRig rig;
+    size_t a = rig.add(testKey(), false), b = rig.add(testKey(), false);  // optional: plain messages delivered
+    DiscoveryConfig cfg;
+    cfg.announceIntervalMs = 500;
+    cfg.peerTimeoutMs = 1600;
+    Discovery da(rig.net.engine(a), cfg, 250, [] { return 0u; });
+    Discovery db(rig.net.engine(b), cfg, 250, [] { return 0u; });
+    size_t lost = 0;
+    da.onPeerEvent([&](PeerEvent e, const PeerInfo&) { lost += e == PeerEvent::Lost; });
+    rig.net.tickers.push_back([&](uint32_t now) {
+        da.tick(now);
+        db.tick(now);
+    });
+    da.start(rig.net.now());
+    db.start(rig.net.now());
+    rig.net.run(3000);
+    const PeerInfo* peer = da.find(rig.net.mac(b));
+    CHECK(peer != nullptr && peer->authenticated);
+
+    // b's announcements are lost; its authenticated messages keep it.
+    rig.net.dropIf = dropAnnouncementsFrom({b});
+    Inbox inbox;
+    rig.net.engine(a).listen(1, inbox.handler());
+    auto msg = pattern(20);
+    for (int i = 0; i < 20; ++i) {
+        rig.net.engine(b).send(rig.net.mac(a), 1, msg.data(), msg.size(), SendOptions(), nullptr, rig.net.now());
+        rig.net.run(200);
+    }
+    CHECK_EQ(inbox.messages.size(), 20u);
+    CHECK(inbox.meta.back().authenticated);
+    CHECK_EQ(lost, 0u);
+
+    // Plain messages in b's name don't: anyone could send them.
+    for (int i = 0; i < 13; ++i) {
+        wire::Header h;
+        h.port = 1;
+        h.messageId = static_cast<uint16_t>(30000 + i);
+        std::vector<uint8_t> f(wire::kCommonHeaderSize);
+        wire::encodeHeader(h, f.data());
+        f.push_back(7);
+        rig.net.inject(a, rig.net.mac(b), f);
+        rig.net.run(200);
+    }
+    CHECK(!inbox.meta.back().authenticated);  // delivered, as plain messages
+    CHECK_EQ(lost, 1u);
+    CHECK(da.find(rig.net.mac(b)) == nullptr);
+    rig.net.dropIf = nullptr;
+    da.stop(rig.net.now());
+    db.stop(rig.net.now());
 }
 
 TEST(secure_first_unreliable_message_waits_for_epoch) {

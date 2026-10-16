@@ -41,6 +41,8 @@ struct FrameInfo {
 };
 
 using FrameObserver = std::function<void(const FrameInfo&)>;
+/// `src` was heard: see Engine::setHeardObserver().
+using HeardObserver = std::function<void(const Mac& src, bool authenticated, uint32_t nowMs)>;
 
 /// Message authentication, plugged into the engine by Security.
 ///
@@ -148,6 +150,12 @@ public:
     /// Sees every received frame before filtering (other network ids, other
     /// protocol versions, non-NowTP ESP-NOW traffic). For diagnostics; one at a time.
     void setFrameObserver(FrameObserver observer) { observer_.set(std::move(observer)); }
+    /// Called for each message accepted from `src` (past authentication when a
+    /// key is installed; `authenticated` when verified with it), and for each
+    /// ack to one of our reliable messages (`authenticated` when its tag
+    /// verified). Discovery sets it, so that a peer whose announcements go
+    /// missing while it exchanges messages with us isn't reported lost. One at a time.
+    void setHeardObserver(HeardObserver observer) { heard_.set(std::move(observer)); }
 
     /// Authenticates outgoing messages and checks incoming ones (null: none).
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
@@ -348,6 +356,7 @@ private:
     int8_t rxRssi_ = 0;  // RSSI of the frame being processed
     uint64_t rxTimeUs_ = 0;
     Callback<void(const FrameInfo&)> observer_;
+    Callback<void(const Mac&, bool, uint32_t)> heard_;
     Authenticator* auth_ = nullptr;
 };
 

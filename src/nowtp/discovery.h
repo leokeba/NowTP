@@ -21,6 +21,8 @@ struct PeerInfo {
     uint32_t maxMessageSize = 0;
     int8_t rssi = 0;              ///< Signal strength of its last announcement, dBm.
     uint32_t firstSeenMs = 0;
+    /// Its last announcement, or the last message or ack accepted from it
+    /// (authenticated ones only, for an authenticated peer).
     uint32_t lastSeenMs = 0;
     /// Wi-Fi channel the peer says it is on; 0 if it does not say (NowTP < 0.5).
     uint8_t channel = 0;
@@ -36,7 +38,7 @@ struct PeerInfo {
 enum class PeerEvent : uint8_t {
     Found,    ///< First announcement from this peer.
     Updated,  ///< Its name, metadata or frame size changed.
-    Lost,     ///< Said goodbye, or silent for DiscoveryConfig::peerTimeoutMs.
+    Lost,     ///< Said goodbye, or not heard for DiscoveryConfig::peerTimeoutMs.
 };
 
 using PeerHandler = std::function<void(PeerEvent, const PeerInfo&)>;
@@ -52,12 +54,13 @@ struct DiscoveryConfig {
     /// Periodic announcement interval; 0 announces only on start, on discover()
     /// and in reply to other nodes' queries.
     uint32_t announceIntervalMs = 2000;
-    /// A peer is reported lost after this long without an announcement.
+    /// A peer is reported lost after this long without being heard: no
+    /// announcement, and no message or ack accepted from it (see PeerInfo::lastSeenMs).
     uint32_t peerTimeoutMs = 7000;
     /// Replies to a query are delayed randomly by up to this much to avoid collisions.
     uint32_t replyJitterMs = 50;
     /// Peers tracked at most. When full, a new one replaces (and reports lost)
-    /// a peer silent for 1.5 announcement intervals, the one heard least
+    /// a peer not heard for 1.5 announcement intervals, the one heard least
     /// recently first; an authenticated peer only gives way to another.
     uint8_t maxPeers = 20;
 };
@@ -127,6 +130,7 @@ private:
     enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02, kExtMaxMessage = 0x04 };
 
     void handle(const Message& m);
+    void heard(const Mac& src, bool authenticated, uint32_t now);
     bool announce(uint8_t flags, uint8_t moveTo = 0);
     void emit(PeerEvent event, const PeerInfo& peer);
 

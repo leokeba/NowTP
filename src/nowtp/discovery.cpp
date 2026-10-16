@@ -41,13 +41,16 @@ Discovery::Discovery(Engine& engine, const DiscoveryConfig& config, uint16_t loc
 }
 
 Discovery::~Discovery() {
-    if (running_) engine_.listen(kDiscoveryPort, ReceiveHandler());
+    if (!running_) return;
+    engine_.listen(kDiscoveryPort, ReceiveHandler());
+    engine_.setHeardObserver(HeardObserver());
 }
 
 void Discovery::start(uint32_t now) {
     now_ = now;
     running_ = true;
     engine_.listen(kDiscoveryPort, [this](const Message& m) { handle(m); });
+    engine_.setHeardObserver([this](const Mac& src, bool authenticated, uint32_t t) { heard(src, authenticated, t); });
     queryDue_ = true;  // sent from tick() so start() itself never fails
     tick(now);
 }
@@ -57,6 +60,7 @@ void Discovery::stop(uint32_t now) {
     now_ = now;
     announce(kGoodbye);
     engine_.listen(kDiscoveryPort, ReceiveHandler());
+    engine_.setHeardObserver(HeardObserver());
     running_ = false;
     replyDue_ = queryDue_ = false;
     for (const PeerInfo& p : peers_) engine_.setPeerMessageLimit(p.mac, 0);
@@ -255,7 +259,7 @@ void Discovery::handle(const Message& m) {
     if (!peer) {
         if (!heap::fits(need)) return;
         if (peers_.full()) {
-            // Full: a peer that missed an announcement gives way, the one heard
+            // Full: a peer not heard for a while gives way, the one heard
             // least recently first, so a burst of (possibly spoofed)
             // announcements can't hide peers for good. Peers that keep
             // announcing keep their place (no churn), and an authenticated peer
@@ -317,6 +321,19 @@ void Discovery::handle(const Message& m) {
         peer->authenticated = m.authenticated;
         PeerInfo copy = *peer;
         emit(PeerEvent::Updated, copy);
+    }
+}
+
+// Announcements are unacknowledged broadcasts: on a busy channel, or with a
+// weak link, a peer can miss several in a row while its messages and acks
+// still get through. Those keep it, but only announcements add or change one.
+void Discovery::heard(const Mac& src, bool authenticated, uint32_t now) {
+    for (PeerInfo& p : peers_) {
+        if (p.mac != src) continue;
+        // An authenticated peer is vouched for by authenticated traffic only.
+        if (p.authenticated && !authenticated) return;
+        if (static_cast<int32_t>(now - p.lastSeenMs) > 0) p.lastSeenMs = now;
+        return;
     }
 }
 

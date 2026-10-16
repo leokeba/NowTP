@@ -787,6 +787,7 @@ void Engine::handleSingle(const Mac& src, const Header& h, const uint8_t* payloa
         if (auth == Auth::Reject && reliable) queueAck(src, h.port, h.messageId, 0, AckStatus::Rejected, nullptr);
         return;
     }
+    if (heard_) heard_(src, authenticated, now);
     if (latest) {
         if (isStaleLatest(src, h.port, h.messageId, now)) {
             stats_.messagesDropped++;
@@ -1068,6 +1069,7 @@ void Engine::completeRx(RxMessage* rx, uint32_t now) {
         }
         return;
     }
+    if (heard_) heard_(owned->src, authenticated, now);
     if (len > config_.maxMessageSize) {
         stats_.messagesDropped++;
         return;
@@ -1115,6 +1117,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         }
         len -= kAckTagSize;
     }
+    if (heard_) heard_(src, (tx->flags & kFlagAuth) != 0, now);
 
     switch (static_cast<AckStatus>(payload[0])) {
         case AckStatus::Complete: finish(tx, Status::Ok); break;
