@@ -278,7 +278,7 @@ Costs:
 Every node estimates the clock of a *reference* node, so an instant can be named once and acted on everywhere:
 
 ```cpp
-// The master (config.timeSync.reference = true) names an instant 300 ms ahead:
+// Any node names an instant 300 ms ahead:
 uint64_t at = transport.networkTimeUs() + 300000;
 transport.send(nowtp::Mac::broadcast(), kPortStart, &at, sizeof(at));
 // Every node, on receipt, schedules it on its own clock:
@@ -286,9 +286,15 @@ int64_t local = transport.localTimeUs(at);   // esp_timer_get_time() at that ins
 esp_timer_start_once(timer, local - esp_timer_get_time());
 ```
 
-- **Estimation.** Nodes run NTP-style exchanges with the reference: 8 per round, keeping the one with the shortest round trip. Receive times are taken in the radio driver's callback. A fit over recent rounds tracks clock drift, so the estimate holds between rounds and through short outages. Between two boards a meter apart, its offset agreed with an independent min-round-trip measurement to within 25 µs.
-- **Choosing the reference.** The reference is announced through discovery, or chosen with `setTimeReference()`. A node synchronized to the reference also answers in network time, so a node out of the reference's range can synchronize through it.
-- **Status.** `timeSyncStatus()` reports the offset, round trip, drift, and the age of the last round.
+- **Estimation.** Nodes run NTP-style exchanges with the reference: 8 per round, keeping the one with the shortest round trip. Receive times are taken in the radio driver's callback, and requests are padded to the length of responses, so both directions take the same air time. A round much slower than usual (queued behind other traffic) is skipped. A fit over recent rounds tracks clock drift, so the estimate holds between rounds and through short outages. Between two boards a meter apart, its offset agreed with an independent min-round-trip measurement to within 25 µs. That checks consistency, not the absolute error, which a probe with the same delays can't see.
+- **Roles.** `timeSync.role` (or `setTimeRole()` at runtime, without a restart) says what a node does:
+  - `Follow` (the default): synchronizes with the reference announced through discovery.
+  - `Candidate`: follows too, and offers to take over. When no reference is heard for `timeSync.takeoverAfterMs` (5 s), one candidate becomes the reference: synchronized candidates first, then the lowest MAC; the next in line waits twice as long. A fleet of identical nodes, all candidates, needs no configuration. A candidate that boots later follows the reference already acting, even with a lower MAC. If two references meet (two groups that were out of range), the acting candidate with the higher MAC gives way.
+  - `Reference`: always the reference. Followers prefer it to an acting candidate. `timeSync.reference = true` means the same.
+  - `Off`: no synchronization; network time is the local clock.
+- **Continuity.** A node that becomes the reference while synchronized keeps serving the network time it had: its estimate, extrapolated with the drift. Followers switch to it without a step, so the shared clock survives the loss of a reference. A reference that reboots comes back as a follower if a synchronized candidate took over.
+- **Choosing the reference yourself.** `setTimeReference(mac)` synchronizes with a given node (in the Follow and Candidate roles), and `clearTimeReference()` returns to the announced one. A node synchronized to the reference also answers in network time, so a node out of the reference's range can synchronize through it.
+- **Status.** `timeSyncStatus()` reports the role, whether this node acts as the reference, the reference's MAC, the offset, round trip, drift, rounds, and the age of the last round. Discovery reports each peer's `timeReference`, `timeCandidate` and `timeSynced`.
 
 ### Streams
 
@@ -393,7 +399,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `channel.follow`, `channel.findAnchor`, `channel.anchor` | true, false, false | Channel following (see above) |
 | `channel.searchAfterMs`, `channel.dwellMs`, `channel.retryMs`, `channel.channels` | 2000, 250, 15000, 1–13 | Channel search timing |
 | `security.key`, `security.requireAuthentication`, `security.pairingCode`, `persistSecurityKey` | none, true, "", true | Security (see above) |
-| `enableTimeSync`, `timeSync.reference`, `timeSync.intervalMs` | true, false, 5000 | Network time (see above) |
+| `enableTimeSync`, `timeSync.role`, `timeSync.intervalMs`, `timeSync.takeoverAfterMs` | true, Follow, 5000, 5000 | Network time (see above) |
 | `enableStreams` | true | Streams (see above) |
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |

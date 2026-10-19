@@ -2875,37 +2875,72 @@ struct TimeRig {
     std::mt19937 rng{4};
     std::vector<std::unique_ptr<Discovery>> disc;
     std::vector<std::unique_ptr<TimeSync>> ts;
+    std::vector<TimeRole> roles;
 
-    size_t add(bool reference, uint64_t clockOffsetUs, double skew) {
+    size_t add(TimeRole role, uint64_t clockOffsetUs, double skew) {
         size_t i = net.addNode();
         net.node(i).clockOffsetUs = clockOffsetUs;
         net.node(i).clockSkew = skew;
-        DiscoveryConfig dc;
-        dc.name = "t" + std::to_string(i);
-        disc.emplace_back(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
-        TimeSyncConfig tc;
-        tc.reference = reference;
-        sim::Node* node = &net.node(i);
-        sim::Network* nw = &net;
-        ts.emplace_back(new TimeSync(net.engine(i), [node, nw] { return node->clockUs(nw->now()); }, tc));
-        disc[i]->setTimeReference(reference, 0);
-        disc[i]->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { ts[i]->onPeerEvent(e, p, net.now()); });
+        disc.emplace_back();
+        ts.emplace_back();
+        roles.push_back(role);
+        build(i);
         net.tickers.push_back([this, i](uint32_t now) {
             disc[i]->tick(now);
             ts[i]->tick(now);
         });
         return i;
     }
+    size_t add(bool reference, uint64_t clockOffsetUs, double skew) {
+        return add(reference ? TimeRole::Reference : TimeRole::Follow, clockOffsetUs, skew);
+    }
+    // Node i's Discovery and TimeSync, as they are after a boot (not started).
+    void build(size_t i) {
+        ts[i].reset();
+        DiscoveryConfig dc;
+        dc.name = "t" + std::to_string(i);
+        disc[i].reset(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
+        TimeSyncConfig tc;
+        tc.role = roles[i];
+        sim::Node* node = &net.node(i);
+        sim::Network* nw = &net;
+        ts[i].reset(new TimeSync(net.engine(i), [node, nw] { return node->clockUs(nw->now()); }, tc, net.mac(i)));
+        ts[i]->setDiscovery(disc[i].get());
+        disc[i]->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { ts[i]->onPeerEvent(e, p, net.now()); });
+    }
+    void start(size_t i) {
+        disc[i]->start(net.now());
+        ts[i]->start(net.now());
+    }
     void start() {
-        for (size_t i = 0; i < ts.size(); ++i) {
-            disc[i]->start(net.now());
-            ts[i]->start(net.now());
+        for (size_t i = 0; i < ts.size(); ++i) start(i);
+    }
+    // A reboot without goodbye: the node's clock restarts near `uptimeUs`.
+    void reboot(size_t i, uint64_t uptimeUs) {
+        net.node(i).online = false;  // what the old objects send on the way out is lost
+        build(i);
+        net.node(i).clockOffsetUs = uptimeUs - static_cast<uint64_t>(net.now()) * 1000;
+        net.node(i).clockSkew = 0;
+        net.node(i).online = true;
+        start(i);
+    }
+    size_t acting() const {
+        size_t n = 0;
+        for (const auto& t : ts) n += t->isReference() ? 1 : 0;
+        return n;
+    }
+    bool allSynced() const {
+        for (const auto& t : ts) {
+            if (!t->synced()) return false;
         }
+        return true;
     }
     // Error of node i's network time against the reference's clock, µs.
     int64_t error(size_t i, size_t ref) {
         return static_cast<int64_t>(ts[i]->networkTime() - net.node(ref).clockUs(net.now()));
     }
+    // Difference between two nodes' network times, µs.
+    int64_t apart(size_t i, size_t j) { return static_cast<int64_t>(ts[i]->networkTime() - ts[j]->networkTime()); }
 };
 
 int64_t absValue(int64_t v) {
@@ -2979,6 +3014,220 @@ TEST(timesync_rejects_outliers_and_follows_a_jump) {
     rig.net.node(ref).clockOffsetUs -= 1500000000ull;
     rig.net.run(40000);
     CHECK(absValue(rig.error(b, ref)) < 1000);
+}
+
+namespace {
+
+// The simulator timestamps frames to the millisecond, so an estimate is off by
+// up to about a millisecond per hop (well under that on hardware). A step or an
+// error beyond these would be a reference change that lost the network time
+// (which would be seconds: another node's uptime).
+constexpr int64_t kHopUs = 1500;
+constexpr int64_t kTwoHopsUs = 2500;
+
+// The largest change of node i's network-time error against `truth` (the
+// network time as it should be) between two samples 10 ms apart, and the
+// largest error.
+struct StepWatch {
+    TimeRig& rig;
+    size_t node;
+    std::function<uint64_t()> truth;
+    int64_t last = 0;
+    int64_t maxStep = 0;
+    int64_t maxError = 0;
+    bool first = true;
+    void run(uint32_t ms) {
+        for (uint32_t t = 0; t < ms; t += 10) {
+            rig.net.run(10);
+            int64_t e = static_cast<int64_t>(rig.ts[node]->networkTime() - truth());
+            if (!first) maxStep = std::max(maxStep, absValue(e - last));
+            maxError = std::max(maxError, absValue(e));
+            first = false;
+            last = e;
+        }
+    }
+};
+
+}  // namespace
+
+TEST(timesync_candidates_agree_on_one_reference) {
+    TimeRig rig;
+    const double skews[] = {10e-6, -20e-6, 30e-6, -5e-6};
+    for (size_t k = 0; k < 4; ++k) rig.add(TimeRole::Candidate, 1000000000ull * (k + 1) + 12345 * k, skews[k]);
+    rig.start();
+    rig.net.run(4000);
+    CHECK_EQ(rig.acting(), 0u);  // listening for an incumbent first
+    CHECK(rig.net.runUntil([&] { return rig.acting() == 1 && rig.allSynced(); }, 20000));
+    CHECK(rig.ts[0]->isReference());  // the lowest MAC
+    rig.net.run(30000);
+    CHECK_EQ(rig.acting(), 1u);
+    for (size_t k = 0; k < 4; ++k) {
+        CHECK(absValue(rig.error(k, 0)) < kHopUs);
+        TimeSyncStatus s = rig.ts[k]->status();
+        CHECK(s.reference == rig.net.mac(0));
+        CHECK(s.role == TimeRole::Candidate);
+    }
+    const PeerInfo* p = rig.disc[1]->find(rig.net.mac(0));
+    CHECK(p && p->timeReference && p->timeCandidate && p->timeSynced);
+    p = rig.disc[0]->find(rig.net.mac(1));
+    CHECK(p && !p->timeReference && p->timeCandidate && p->timeSynced);
+}
+
+TEST(timesync_takeover_keeps_network_time) {
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Candidate, 5000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 40e-6),
+           c = rig.add(TimeRole::Candidate, 3000000ull, -30e-6);
+    rig.start();
+    rig.net.run(40000);
+    CHECK(rig.ts[a]->isReference());
+    // The reference goes away for good; the network time is its clock, still.
+    rig.net.node(a).online = false;
+    sim::Node* na = &rig.net.node(a);
+    StepWatch wb{rig, b, [&] { return na->clockUs(rig.net.now()); }};
+    StepWatch wc{rig, c, [&] { return na->clockUs(rig.net.now()); }};
+    for (int i = 0; i < 600; ++i) {
+        wb.run(50);
+        wc.run(50);
+        CHECK(!rig.ts[c]->isReference());
+    }
+    CHECK(rig.ts[b]->isReference());  // synchronized, then the lower MAC
+    CHECK(rig.ts[c]->status().reference == rig.net.mac(b));
+    CHECK(rig.ts[c]->synced());
+    CHECK(wb.maxError < kHopUs);
+    CHECK(wc.maxError < kTwoHopsUs);
+    CHECK(wb.maxStep < kHopUs);
+    CHECK(wc.maxStep < kHopUs);
+}
+
+TEST(timesync_late_candidate_follows_the_incumbent) {
+    TimeRig rig;
+    size_t low = rig.add(TimeRole::Candidate, 9000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 20e-6),
+           c = rig.add(TimeRole::Candidate, 2000ull, -20e-6);
+    rig.start(b);
+    rig.start(c);
+    rig.net.run(20000);
+    CHECK(rig.ts[b]->isReference());
+    // A lower MAC boots later: it follows instead of resetting everyone's time.
+    rig.start(low);
+    StepWatch w{rig, c, [&] { return rig.net.node(b).clockUs(rig.net.now()); }};
+    w.run(20000);
+    CHECK(rig.ts[b]->isReference());
+    CHECK_EQ(rig.acting(), 1u);
+    CHECK(rig.ts[low]->synced());
+    CHECK(absValue(rig.error(low, b)) < kHopUs);
+    CHECK(w.maxError < kHopUs);
+}
+
+TEST(timesync_split_references_merge_on_the_lowest_mac) {
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Candidate, 4000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 15e-6),
+           c = rig.add(TimeRole::Candidate, 2000ull, -15e-6);
+    bool split = true;
+    rig.net.linkModel = [&](size_t from, size_t to, PhyRate, float) {
+        return split && ((from == a) != (to == a)) ? 1.0 : 0.0;
+    };
+    rig.start();
+    rig.net.run(20000);
+    CHECK(rig.ts[a]->isReference());
+    CHECK(rig.ts[b]->isReference());
+    CHECK(rig.ts[c]->status().reference == rig.net.mac(b));
+    split = false;
+    rig.net.run(20000);
+    CHECK_EQ(rig.acting(), 1u);
+    CHECK(rig.ts[a]->isReference());
+    CHECK(absValue(rig.error(b, a)) < kHopUs);
+    CHECK(absValue(rig.error(c, a)) < kHopUs);
+}
+
+TEST(timesync_rebooted_reference_hands_over_to_a_synced_candidate) {
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Candidate, 6000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 25e-6),
+           c = rig.add(TimeRole::Candidate, 2000ull, -25e-6);
+    rig.start();
+    rig.net.run(30000);
+    CHECK(rig.ts[a]->isReference());
+    // The network time is a's clock before the reboot, which restarts it at 2 s.
+    uint64_t base = rig.net.node(a).clockUs(rig.net.now());
+    uint32_t at = rig.net.now();
+    auto truth = [&] { return base + static_cast<uint64_t>(rig.net.now() - at) * 1000; };
+    rig.reboot(a, 2000000);
+    StepWatch w{rig, c, truth};
+    w.run(30000);
+    // a has the lowest MAC, but lost the time: b, synchronized, took over.
+    CHECK(rig.ts[b]->isReference());
+    CHECK_EQ(rig.acting(), 1u);
+    CHECK(rig.ts[a]->synced());
+    CHECK(rig.ts[a]->status().reference == rig.net.mac(b));
+    CHECK(absValue(static_cast<int64_t>(rig.ts[a]->networkTime() - truth())) < kTwoHopsUs);
+    CHECK(w.maxError < kTwoHopsUs);
+    CHECK(w.maxStep < kHopUs);
+}
+
+TEST(timesync_configured_reference_wins_over_candidates) {
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Candidate, 3000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 10e-6),
+           r = rig.add(TimeRole::Follow, 2000ull, -10e-6);
+    rig.start();
+    rig.net.run(20000);
+    CHECK(rig.ts[a]->isReference());
+    CHECK(rig.ts[r]->status().reference == rig.net.mac(a));
+    // Made the reference at runtime: it keeps the network time it had.
+    StepWatch w{rig, b, [&] { return rig.net.node(a).clockUs(rig.net.now()); }};
+    w.run(1000);
+    rig.ts[r]->setRole(TimeRole::Reference, rig.net.now());
+    CHECK(rig.ts[r]->isReference());
+    CHECK(absValue(rig.error(r, a)) < kHopUs);
+    w.run(20000);
+    CHECK_EQ(rig.acting(), 1u);  // the candidate gave way
+    CHECK(rig.ts[a]->status().reference == rig.net.mac(r));
+    CHECK(rig.ts[b]->status().reference == rig.net.mac(r));
+    CHECK(w.maxStep < kTwoHopsUs);
+    CHECK(w.maxError < kTwoHopsUs);
+    CHECK(absValue(rig.apart(a, r)) < kHopUs);  // r serves its estimate of a's clock
+    CHECK(absValue(rig.apart(b, r)) < kHopUs);
+}
+
+TEST(timesync_roles_and_reference_change_at_runtime) {
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Reference, 3000000000ull, 0), b = rig.add(TimeRole::Follow, 1000ull, 10e-6),
+           c = rig.add(TimeRole::Candidate, 2000ull, 0);
+    rig.start();
+    rig.net.run(10000);
+    CHECK(rig.allSynced());
+    // Explicit reference: c follows b, and stops offering itself.
+    rig.ts[c]->setReference(rig.net.mac(b), rig.net.now());
+    rig.net.run(5000);
+    TimeSyncStatus s = rig.ts[c]->status();
+    CHECK(s.explicitReference && s.reference == rig.net.mac(b) && s.synced);
+    const PeerInfo* p = rig.disc[a]->find(rig.net.mac(c));
+    CHECK(p && !p->timeCandidate && p->timeSynced);
+    rig.ts[c]->clearReference(rig.net.now());
+    rig.net.run(5000);
+    s = rig.ts[c]->status();
+    CHECK(!s.explicitReference && s.reference == rig.net.mac(a));
+    p = rig.disc[a]->find(rig.net.mac(c));
+    CHECK(p && p->timeCandidate);
+    // Off: the local clock, nothing announced.
+    rig.ts[b]->setRole(TimeRole::Off, rig.net.now());
+    CHECK(!rig.ts[b]->synced());
+    CHECK_EQ(rig.ts[b]->networkTime(), rig.net.node(b).clockUs(rig.net.now()));
+    rig.net.run(3000);
+    p = rig.disc[a]->find(rig.net.mac(b));
+    CHECK(p && !p->timeSynced && !p->timeCandidate && !p->timeReference);
+    rig.ts[b]->setRole(TimeRole::Follow, rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.ts[b]->synced(); }, 5000));
+    CHECK(absValue(rig.error(b, a)) < kHopUs);
+    // The configured reference steps down to a candidate; c, synchronized,
+    // and with a higher MAC, is next in line, and keeps a's time.
+    rig.ts[a]->setRole(TimeRole::Follow, rig.net.now());
+    rig.ts[a]->setInterval(1000);
+    sim::Node* na = &rig.net.node(a);
+    StepWatch w{rig, b, [&] { return na->clockUs(rig.net.now()); }};
+    w.run(15000);
+    CHECK(rig.ts[c]->isReference());
+    CHECK_EQ(rig.acting(), 1u);
+    CHECK(w.maxStep < kHopUs);
+    CHECK(w.maxError < kTwoHopsUs);
 }
 
 // ---------------------------------------------------------------------------

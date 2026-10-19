@@ -102,12 +102,12 @@ Discovery messages are ordinary single-frame broadcast messages, unreliable and 
 | 5 | N | Name (UTF-8) |
 | 5+N | 1 | Metadata length `M` (≤ 160) |
 | 6+N | M | Application metadata |
-| 6+N+M | 1 | Extension flags: `0x1` anchor (the sender's channel is fixed), `0x2` time reference, `0x4` message limit follows |
+| 6+N+M | 1 | Extension flags: `0x1` anchor (the sender's channel is fixed), `0x2` time reference (the sender's network time is the network time), `0x4` message limit follows, `0x8` time candidate (offers to become the reference), `0x10` synchronized to the network time |
 | 7+N+M | 1 | The sender's Wi-Fi channel |
 | 8+N+M | 1 | Moving notices only: the channel the sender moves to |
 | next | 4 | With flag `0x4`: the largest message the sender accepts (its maximum message size), little-endian |
 
-The extension flags, the channel and the move-to channel arrived with NowTP 0.5. Older nodes neither send nor read them. A receiver treats a missing extension as channel 0 (unknown) with no flags. The message limit came after 0.5, which reads no further than the move-to channel and so ignores it. Without flag `0x4`, a peer's limit is unknown.
+The extension flags, the channel and the move-to channel arrived with NowTP 0.5. Older nodes neither send nor read them. A receiver treats a missing extension as channel 0 (unknown) with no flags. The message limit came after 0.5, which reads no further than the move-to channel and so ignores it. Without flag `0x4`, a peer's limit is unknown. Flags `0x8` and `0x10` came later still; older nodes ignore them, and take any node with `0x2` as a reference.
 
 - **Announcing.** Nodes announce periodically, with ±10% jitter so nodes that booted together don't stay in step.
 - **Answering queries.** A node that receives a query answers with its own announcement after a random delay. Any announcement it sends in the meantime counts as the answer.
@@ -219,13 +219,16 @@ Unicast, unreliable, single-frame messages. Times are microseconds on the sender
 
 | Type | Name | Payload after the type byte |
 |---|---|---|
-| 1 | Request | round (1) ‖ index (1) ‖ t1 |
+| 1 | Request | round (1) ‖ index (1) ‖ t1 ‖ zeros (16) |
 | 2 | Response | round ‖ index ‖ t1 (echoed) ‖ t2 ‖ t3 |
 
 - **Timestamps.** `t2` is the time the request's frame arrived (taken in the radio driver's receive callback), and `t3` is the time the response was queued. A responder that is itself synchronized answers in network time, so nodes can synchronize through it.
+- **Padding.** The request is padded to the response's length (27 bytes), so both frames take the same air time: receive times are taken after the whole frame is in, and a 16-byte difference at 1 Mbps would put 64 µs into the offset. Responders accept any request of 11 bytes or more (unpadded ones from older nodes).
 - **Rounds.** A round is 8 exchanges, 15 ms apart. With `t4` the arrival time of the response, the client computes `rtt = (t4 − t1) − (t3 − t2)` and `offset = ((t2 − t1) + (t3 − t4)) / 2`, and keeps the exchange with the smallest `rtt`.
-- **Estimate.** A least-squares fit over the last 8 rounds gives the offset and the drift. Rounds run every second at first, then every 5 s. A round far from the prediction is discarded, unless three in a row are: then the reference's clock has jumped.
-- **Reference.** The reference is the node announcing the time-reference flag in discovery (the lowest MAC if several do), unless the application chose one.
+- **Estimate.** A least-squares fit over the last 8 rounds gives the offset and the drift. Rounds run every second at first, then every 5 s. A round whose round trip exceeds twice the shortest recent one plus 1.5 ms was queued behind other traffic, and is discarded; that threshold grows by an eighth with each one discarded, so a lasting change is accepted in the end. Discarded rounds are retried after a second. A round far from the prediction is discarded too, unless three in a row are: then the reference's clock has jumped.
+- **Reference.** The application may choose the reference. Otherwise a node follows a peer announcing flag `0x2`: one without `0x8` (configured as the reference) before an acting candidate, then the lowest MAC. Rounds stop while no reference is announced; the estimate is kept.
+- **Candidates.** A node with flag `0x8` takes over when no reference has been announced for the takeover delay (5 s by default; measured from its start, or from the moment the last reference disappeared). Candidates take turns: a candidate waits one takeover delay for each candidate ahead of it, synchronized ones (`0x10`) first, then lower MACs. An acting candidate that hears a reference without `0x8`, or an acting candidate with a lower MAC, gives way and follows it.
+- **Continuity.** A node that starts acting keeps its estimate, extrapolated with its drift and no longer updated, as its network time. A node that switches references, or stops acting, keeps its estimate too; the first round with the new reference corrects it, after the checks above, so a reference with the same network time causes no step and one with another time base replaces it after three rounds.
 
 ## Streams (port 251)
 

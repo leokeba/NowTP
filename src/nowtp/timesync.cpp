@@ -9,7 +9,7 @@ namespace nowtp {
 namespace {
 
 constexpr size_t kMaxSamples = 8;
-constexpr size_t kMaxReferences = 8;  // peers announcing themselves as references, tracked
+constexpr size_t kMaxOffers = 16;     // peers acting as the reference or offering to, tracked
 constexpr uint32_t kRoundGraceMs = 300;   // wait for late responses after the last request
 constexpr uint32_t kFastRounds = 3;       // first rounds run every second
 constexpr uint32_t kFastIntervalMs = 1000;
@@ -36,23 +36,52 @@ bool lessMac(const Mac& a, const Mac& b) {
 
 }  // namespace
 
-TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& config)
-    : engine_(engine), clock_(std::move(localClockUs)), config_(config) {
+const char* toString(TimeRole role) {
+    switch (role) {
+        case TimeRole::Off:
+            return "off";
+        case TimeRole::Follow:
+            return "follow";
+        case TimeRole::Candidate:
+            return "candidate";
+        case TimeRole::Reference:
+            return "reference";
+    }
+    return "?";
+}
+
+TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& config, const Mac& localMac)
+    : engine_(engine),
+      clock_(std::move(localClockUs)),
+      config_(config),
+      self_(localMac),
+      role_(config.reference ? TimeRole::Reference : config.role) {
     if (config_.samples == 0) config_.samples = 1;
     // Both grow on what the network does: reserved here, never grown.
     samples_.reserve(kMaxSamples);
-    announced_.reserve(kMaxReferences);
+    offers_.reserve(kMaxOffers);
     if (config_.intervalMs < kFastIntervalMs) config_.intervalMs = kFastIntervalMs;
+    acting_ = role_ == TimeRole::Reference;
 }
 
 TimeSync::~TimeSync() {
     stop();
 }
 
+void TimeSync::setDiscovery(Discovery* discovery) {
+    discovery_ = discovery;
+    published_ = -1;
+    publish();
+}
+
 void TimeSync::start(uint32_t now) {
     running_ = true;
+    now_ = now;
     nextRoundAt_ = now;
+    vacant_ = true;  // a candidate listens for a reference before taking over
+    vacantSince_ = now;
     engine_.listen(kTimeSyncPort, [this](const Message& m) { handle(m); });
+    evaluate(now);
 }
 
 void TimeSync::stop() {
@@ -63,57 +92,184 @@ void TimeSync::stop() {
 }
 
 // ---------------------------------------------------------------------------
-// Reference selection
+// Roles and reference selection
 
 void TimeSync::onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_t now) {
-    bool listed = false;
-    for (size_t i = 0; i < announced_.size(); ++i) {
-        if (announced_[i] != peer.mac) continue;
-        listed = true;
-        if (event == PeerEvent::Lost || !peer.timeReference) {
-            announced_.erase(announced_.begin() + static_cast<std::ptrdiff_t>(i));
+    bool offers = event != PeerEvent::Lost && (peer.timeReference || peer.timeCandidate);
+    size_t i = 0;
+    while (i < offers_.size() && offers_[i].mac != peer.mac) ++i;
+    if (!offers) {
+        if (i < offers_.size()) offers_.erase(offers_.begin() + static_cast<std::ptrdiff_t>(i));
+    } else {
+        Offer o = {peer.mac, peer.timeReference, peer.timeCandidate, peer.timeSynced};
+        if (i < offers_.size()) {
+            offers_[i] = o;
+        } else if (offers_.size() < kMaxOffers) {
+            offers_.push_back(o);
+        } else {
+            // Full: keep the acting ones, and the candidates first in line (lowest MACs).
+            size_t victim = offers_.size();
+            for (size_t j = 0; j < offers_.size(); ++j) {
+                if (offers_[j].acting) continue;
+                if (victim == offers_.size() || lessMac(offers_[victim].mac, offers_[j].mac)) victim = j;
+            }
+            if (victim < offers_.size() && (o.acting || lessMac(o.mac, offers_[victim].mac))) offers_[victim] = o;
         }
-        break;
     }
-    if (!listed && event != PeerEvent::Lost && peer.timeReference && announced_.size() < kMaxReferences) {
-        announced_.push_back(peer.mac);
-    }
-    chooseReference(now);
+    evaluate(now);
 }
 
-void TimeSync::chooseReference(uint32_t now) {
-    if (explicitRef_ || config_.reference) return;
-    if (announced_.empty()) {
-        // Keep the estimate: it stays usable (with drift) until it goes stale.
-        return;
-    }
-    Mac best = announced_.front();
-    for (const Mac& m : announced_) {
-        if (lessMac(m, best)) best = m;
-    }
-    if (!haveRef_ || best != ref_) switchTo(best, true, now);
+void TimeSync::setRole(TimeRole role, uint32_t now) {
+    role_ = role;
+    evaluate(now);
 }
 
 void TimeSync::setReference(const Mac& mac, uint32_t now) {
     explicitRef_ = true;
-    if (!haveRef_ || mac != ref_) switchTo(mac, true, now);
+    explicit_ = mac;
+    evaluate(now);
 }
 
 void TimeSync::clearReference(uint32_t now) {
     explicitRef_ = false;
-    chooseReference(now);
+    evaluate(now);
 }
 
-void TimeSync::switchTo(const Mac& mac, bool known, uint32_t now) {
-    haveRef_ = known;
-    ref_ = mac;
+void TimeSync::setInterval(uint32_t ms) {
+    config_.intervalMs = ms < kFastIntervalMs ? kFastIntervalMs : ms;
+    uint32_t next = now_ + config_.intervalMs;
+    if (!roundActive_ && static_cast<int32_t>(nextRoundAt_ - next) > 0) nextRoundAt_ = next;
+}
+
+// The acting reference a follower takes: one configured as the reference
+// before an acting candidate, then the lowest MAC.
+const TimeSync::Offer* TimeSync::bestActing() const {
+    const Offer* best = nullptr;
+    for (const Offer& o : offers_) {
+        if (!o.acting) continue;
+        if (!best || (best->candidate && !o.candidate) ||
+            (best->candidate == o.candidate && lessMac(o.mac, best->mac))) {
+            best = &o;
+        }
+    }
+    return best;
+}
+
+// Candidates take over in turn: synchronized ones first, which keep the
+// network time, then the lowest MAC.
+bool TimeSync::aheadOfUs(const Offer& o) const {
+    bool us = synced();
+    if (o.synced != us) return o.synced;
+    return lessMac(o.mac, self_);
+}
+
+void TimeSync::evaluate(uint32_t now) {
+    now_ = now;
+    if (role_ == TimeRole::Off) {
+        if (acting_) act(false, now);
+        forget();
+    } else if (role_ == TimeRole::Reference) {
+        act(true, now);
+    } else if (explicitRef_) {
+        act(false, now);
+        if (!haveRef_ || ref_ != explicit_) switchTo(explicit_, now);
+    } else {
+        const Offer* best = bestActing();
+        // Two references: an acting candidate gives way to a configured
+        // reference, or to a candidate with a lower MAC.
+        if (acting_ && !(role_ == TimeRole::Candidate && (!best || (best->candidate && lessMac(self_, best->mac))))) {
+            act(false, now);
+        }
+        if (!acting_ && best) {
+            vacant_ = false;
+            if (!haveRef_ || ref_ != best->mac) switchTo(best->mac, now);
+        } else if (!acting_) {
+            // The estimate stays usable (with drift) until it goes stale.
+            // Rounds stop: requests to an absent node hold the radio ~100 ms
+            // each and would delay the first rounds with the next reference.
+            haveRef_ = false;
+            if (!vacant_) {
+                vacant_ = true;
+                vacantSince_ = now;
+            }
+            if (role_ == TimeRole::Candidate && running_) {
+                uint32_t ahead = 0;
+                for (const Offer& o : offers_) {
+                    if (o.candidate && aheadOfUs(o)) ahead++;
+                }
+                if (reached(now, vacantSince_ + config_.takeoverAfterMs * (ahead + 1))) act(true, now);
+            }
+        }
+    }
+    publish();
+}
+
+void TimeSync::act(bool acting, uint32_t now) {
+    if (acting == acting_) return;
+    acting_ = acting;
+    roundActive_ = false;
+    if (acting) {
+        // Keeps serving the network time it had: the estimate, extrapolated
+        // with the drift and no longer updated (none: the local clock).
+        haveRef_ = false;
+        return;
+    }
+    // What it served as the network time is where its estimate starts.
+    uint64_t local = clock_();
+    if (haveEstimate_) {
+        base_ = offsetAt(local);
+    } else {
+        base_ = 0;
+        drift_ = 0;
+        haveEstimate_ = true;
+    }
+    baseLocal_ = local;
+    lastSyncLocal_ = local;
+    carried_ = true;
     samples_.clear();
-    haveEstimate_ = false;
-    drift_ = 0;
+    rounds_ = 0;
+    rejected_ = 0;
+    vacant_ = true;
+    vacantSince_ = now;
+    nextRoundAt_ = now;
+}
+
+void TimeSync::publish() {
+    if (!discovery_) return;
+    bool candidate = role_ == TimeRole::Candidate && !explicitRef_;
+    bool isSynced = synced();
+    int flags = (acting_ ? 1 : 0) | (candidate ? 2 : 0) | (isSynced ? 4 : 0);
+    if (flags == published_) return;
+    published_ = flags;
+    discovery_->setTimeState(acting_, candidate, isSynced);
+}
+
+// A new reference serves the same network time when it was synchronized (or
+// is the one we follow through a chain): the estimate is kept, and the first
+// round corrects it. A reference with another time base replaces it then.
+void TimeSync::switchTo(const Mac& mac, uint32_t now) {
+    haveRef_ = true;
+    ref_ = mac;
+    carried_ = haveEstimate_;
+    samples_.clear();
     rounds_ = 0;
     rejected_ = 0;
     roundActive_ = false;
     nextRoundAt_ = now;
+}
+
+void TimeSync::forget() {
+    haveRef_ = false;
+    ref_ = Mac();
+    samples_.clear();
+    haveEstimate_ = false;
+    carried_ = false;
+    minRtt_ = 0;
+    drift_ = 0;
+    rounds_ = 0;
+    rejected_ = 0;
+    lastRtt_ = 0;
+    roundActive_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +277,9 @@ void TimeSync::switchTo(const Mac& mac, bool known, uint32_t now) {
 
 void TimeSync::tick(uint32_t now) {
     now_ = now;
-    if (!running_ || config_.reference || !haveRef_) return;
+    if (!running_) return;
+    evaluate(now);  // a candidate's takeover is due by time
+    if (acting_ || role_ == TimeRole::Off || !haveRef_) return;
     if (!roundActive_) {
         if (!reached(now, nextRoundAt_)) return;
         roundActive_ = true;
@@ -138,8 +296,10 @@ void TimeSync::tick(uint32_t now) {
 }
 
 void TimeSync::sendRequest(uint32_t now) {
-    // type | round | index | t1 (8)
-    uint8_t msg[11];
+    // type | round | index | t1 (8), padded to the response's length: both
+    // directions then take the same air time, which the offset assumes.
+    uint8_t msg[27];
+    memset(msg, 0, sizeof(msg));
     msg[0] = kRequest;
     msg[1] = round_;
     msg[2] = sent_;
@@ -160,8 +320,9 @@ void TimeSync::handle(const Message& m) {
     if (d[0] == kRequest) {
         if (!config_.respond || m.len < 11) return;
         uint64_t t2 = m.timestampUs ? m.timestampUs : clock_();
-        // Answered in our network time: the reference's clock, if we follow one.
-        // A node set to synchronize with us thereby joins the same network time.
+        // Answered in our network time: the reference's clock, if we follow one
+        // (or the one we serve). A node set to synchronize with us thereby
+        // joins the same network time.
         bool chained = synced();
         uint8_t out[27];
         out[0] = kResponse;
@@ -198,23 +359,33 @@ void TimeSync::endRound(uint32_t now) {
         nextRoundAt_ = now + kFastIntervalMs;
         return;
     }
-    addSample(bestLocal_, bestOffset_, bestRtt_);
-    nextRoundAt_ = now + (rounds_ < kFastRounds ? kFastIntervalMs : config_.intervalMs);
+    bool taken = addSample(bestLocal_, bestOffset_, bestRtt_);
+    nextRoundAt_ = now + (!taken || rounds_ < kFastRounds ? kFastIntervalMs : config_.intervalMs);
 }
 
-void TimeSync::addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs) {
-    if (haveEstimate_ && samples_.size() >= 3) {
+bool TimeSync::addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs) {
+    // A slow round was queued behind other traffic (or failed frames, which
+    // hold the radio ~100 ms): the delay is on one side, and half of it goes
+    // into the offset. Such rounds are skipped; the threshold relaxes with
+    // each one, so a lasting change (e.g. a slower rate) is taken in the end.
+    if (minRtt_ != 0 && rttUs > 2 * minRtt_ + 1500) {
+        minRtt_ += minRtt_ / 8 + 1;
+        return false;
+    }
+    if (haveEstimate_ && (samples_.size() >= 3 || carried_)) {
         // A sample far from the prediction is a delayed exchange, or the
         // reference rebooted; after a few in a row, believe them.
         int64_t error = offsetUs - offsetAt(localUs);
         int64_t tolerance = 2000 + 4 * static_cast<int64_t>(rttUs);
         if (error > tolerance || error < -tolerance) {
-            if (++rejected_ < kRejectLimit) return;
+            if (++rejected_ < kRejectLimit) return false;
             samples_.clear();
             drift_ = 0;
+            carried_ = false;
         }
     }
     rejected_ = 0;
+    if (minRtt_ == 0 || rttUs < minRtt_) minRtt_ = rttUs;
     if (samples_.size() >= kMaxSamples) samples_.erase(samples_.begin());
     Sample s = {localUs, offsetUs};
     samples_.push_back(s);
@@ -222,6 +393,7 @@ void TimeSync::addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs) {
     lastRtt_ = rttUs;
     rounds_++;
     fit();
+    return true;
 }
 
 void TimeSync::fit() {
@@ -267,18 +439,17 @@ int64_t TimeSync::offsetAt(uint64_t localUs) const {
 // Queries
 
 bool TimeSync::synced() const {
-    if (config_.reference) return true;
+    if (acting_) return true;
     if (!haveEstimate_) return false;
     return clock_() - lastSyncLocal_ < static_cast<uint64_t>(config_.staleAfterMs) * 1000;
 }
 
 uint64_t TimeSync::toNetwork(uint64_t localUs) const {
-    if (config_.reference) return localUs;
     return localUs + static_cast<uint64_t>(offsetAt(localUs));
 }
 
 uint64_t TimeSync::toLocal(uint64_t networkUs) const {
-    if (config_.reference || !haveEstimate_) return networkUs;
+    if (!haveEstimate_) return networkUs;
     // The offset barely changes over the gap, so evaluating it near the answer is exact enough.
     uint64_t guess = networkUs - static_cast<uint64_t>(base_);
     return networkUs - static_cast<uint64_t>(offsetAt(guess));
@@ -286,15 +457,19 @@ uint64_t TimeSync::toLocal(uint64_t networkUs) const {
 
 TimeSyncStatus TimeSync::status() const {
     TimeSyncStatus s;
-    s.isReference = config_.reference;
+    s.role = role_;
+    s.isReference = acting_;
+    s.explicitReference = explicitRef_ && !acting_ && role_ != TimeRole::Off;
     s.synced = synced();
-    s.reference = ref_;
+    s.reference = acting_ ? self_ : ref_;
     uint64_t now = clock_();
-    s.offsetUs = config_.reference ? 0 : offsetAt(now);
-    s.roundTripUs = lastRtt_;
+    s.offsetUs = offsetAt(now);
     s.driftPpm = static_cast<float>(drift_ * 1e6);
-    s.ageMs = haveEstimate_ ? static_cast<uint32_t>((now - lastSyncLocal_) / 1000) : 0;
     s.rounds = rounds_;
+    if (!acting_) {
+        s.roundTripUs = lastRtt_;
+        s.ageMs = haveEstimate_ ? static_cast<uint32_t>((now - lastSyncLocal_) / 1000) : 0;
+    }
     return s;
 }
 

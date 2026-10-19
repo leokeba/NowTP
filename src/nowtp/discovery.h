@@ -29,8 +29,12 @@ struct PeerInfo {
     /// Its channel is fixed (by an access point, or by configuration): other
     /// nodes follow it when it moves (see ChannelFollower).
     bool anchor = false;
-    /// It offers its clock as the network time (see TimeSync).
+    /// Its clock is the network time: it acts as the time reference (see TimeSync).
     bool timeReference = false;
+    /// It offers to become the time reference when none is heard (TimeRole::Candidate).
+    bool timeCandidate = false;
+    /// It is synchronized to the network time (or is the reference).
+    bool timeSynced = false;
     /// Its announcements are authenticated with the installation key (see Security).
     bool authenticated = false;
 };
@@ -99,6 +103,9 @@ public:
     /// What this node announces about its radio; announced right away when it changes.
     void setChannelInfo(uint8_t channel, bool anchor, uint32_t nowMs);
     void setTimeReference(bool reference, uint32_t nowMs);
+    /// What this node announces about network time (see TimeSync), with the
+    /// next announcement.
+    void setTimeState(bool reference, bool candidate, bool synced);
     void onPeerEvent(PeerHandler handler) { handler_.set(std::move(handler)); }
     void onPeerMoved(MoveHandler handler) { moveHandler_.set(std::move(handler)); }
 
@@ -127,7 +134,13 @@ public:
 
 private:
     enum Flags : uint8_t { kQuery = 0x01, kReply = 0x02, kGoodbye = 0x04, kMoving = 0x08 };
-    enum ExtFlags : uint8_t { kExtAnchor = 0x01, kExtTimeReference = 0x02, kExtMaxMessage = 0x04 };
+    enum ExtFlags : uint8_t {
+        kExtAnchor = 0x01,
+        kExtTimeReference = 0x02,
+        kExtMaxMessage = 0x04,
+        kExtTimeCandidate = 0x08,
+        kExtTimeSynced = 0x10,
+    };
 
     void handle(const Message& m);
     void heard(const Mac& src, bool authenticated, uint32_t now);

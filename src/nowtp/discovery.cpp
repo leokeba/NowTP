@@ -102,6 +102,16 @@ void Discovery::setTimeReference(bool reference, uint32_t now) {
     tick(now);
 }
 
+void Discovery::setTimeState(bool reference, bool candidate, bool synced) {
+    uint8_t flags = static_cast<uint8_t>((extFlags_ & ~(kExtTimeReference | kExtTimeCandidate | kExtTimeSynced)) |
+                                         (reference ? kExtTimeReference : 0) | (candidate ? kExtTimeCandidate : 0) |
+                                         (synced ? kExtTimeSynced : 0));
+    if (flags == extFlags_) return;
+    extFlags_ = flags;
+    // Sent by the next tick: called from peer events, which tick() may be emitting.
+    if (running_) announceDue_ = true;
+}
+
 void Discovery::setMetadata(const uint8_t* data, size_t len, uint32_t now) {
     config_.metadata.assign(data, data + std::min(len, kMaxMetadata));
     if (!running_) return;
@@ -256,6 +266,8 @@ void Discovery::handle(const Message& m) {
     }
     bool anchor = (a.extFlags & kExtAnchor) != 0;
     bool timeReference = (a.extFlags & kExtTimeReference) != 0;
+    bool timeCandidate = (a.extFlags & kExtTimeCandidate) != 0;
+    bool timeSynced = (a.extFlags & kExtTimeSynced) != 0;
     if (!peer) {
         if (!heap::fits(need)) return;
         if (peers_.full()) {
@@ -296,6 +308,8 @@ void Discovery::handle(const Message& m) {
         fresh.channel = a.channel;
         fresh.anchor = anchor;
         fresh.timeReference = timeReference;
+        fresh.timeCandidate = timeCandidate;
+        fresh.timeSynced = timeSynced;
         fresh.authenticated = m.authenticated;
         if (!peers_.add(fresh)) return;  // no memory: heard again at its next announcement
         emit(PeerEvent::Found, fresh);
@@ -309,6 +323,7 @@ void Discovery::handle(const Message& m) {
                    peer->metadata.size() != a.metadataLen ||
                    !std::equal(peer->metadata.begin(), peer->metadata.end(), a.metadata) ||
                    peer->channel != a.channel || peer->anchor != anchor || peer->timeReference != timeReference ||
+                   peer->timeCandidate != timeCandidate || peer->timeSynced != timeSynced ||
                    peer->authenticated != m.authenticated;
     if (changed && heap::fits(need)) {
         peer->name.assign(a.nameData, a.nameLen);
@@ -318,6 +333,8 @@ void Discovery::handle(const Message& m) {
         peer->channel = a.channel;
         peer->anchor = anchor;
         peer->timeReference = timeReference;
+        peer->timeCandidate = timeCandidate;
+        peer->timeSynced = timeSynced;
         peer->authenticated = m.authenticated;
         PeerInfo copy = *peer;
         emit(PeerEvent::Updated, copy);

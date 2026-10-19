@@ -258,8 +258,17 @@ public:
     /// schedule an action there (e.g. with esp_timer_start_once()).
     int64_t localTimeUs(uint64_t networkUs) const;
     TimeSyncStatus timeSyncStatus() const;
-    /// Synchronizes with `peer` instead of the reference announced by discovery.
+    /// Changes this node's role (see TimeRole) at once, without a restart; it
+    /// also applies to the next begin(). A node that becomes the reference
+    /// while synchronized keeps the network time it had.
+    Status setTimeRole(TimeRole role);
+    /// Synchronizes with `peer` instead of the reference announced by
+    /// discovery (roles Follow and Candidate), until clearTimeReference() or end().
     Status setTimeReference(const Mac& peer);
+    Status clearTimeReference();
+    /// Pause between synchronization rounds once synchronized (at least 1 s);
+    /// also applies to the next begin().
+    Status setTimeSyncInterval(uint32_t ms);
 
     // --- Streams (see Streams) -----------------------------------------------
     /// Sends `size` bytes pulled from `read` to `dst`. `done` runs once in the

@@ -394,7 +394,6 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
                                        [] { return static_cast<uint32_t>(esp_random()); }));
         discovery_->onPeerEvent([this](PeerEvent e, const PeerInfo& p) { handlePeerEvent(e, p); });
         discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || channelFixed(), nowMs());
-        discovery_->setTimeReference(config_.enableTimeSync && config_.timeSync.reference, nowMs());
         follower_.reset(new ChannelFollower(*discovery_, *this, config_.channel));
         follower_->onChannelChange([this](uint8_t ch) {
             ESP_LOGI(kTag, "followed peers to channel %u", ch);
@@ -412,7 +411,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     }
     if (config_.enableTimeSync) {
         timeSync_.reset(new TimeSync(*engine_, [] { return static_cast<uint64_t>(esp_timer_get_time()); },
-                                     config_.timeSync));
+                                     config_.timeSync, localMac()));
+        timeSync_->setDiscovery(discovery_.get());
     }
     if (config_.enableStreams) {
         streams_.reset(new Streams(*engine_, [] { return static_cast<uint32_t>(esp_random()); }));
@@ -1692,17 +1692,59 @@ int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
 }
 
 TimeSyncStatus EspNowTransport::timeSyncStatus() const {
-    if (!started_ || !timeSync_) return TimeSyncStatus();
+    if (!started_ || !timeSync_) {
+        TimeSyncStatus s;
+        s.role = !config_.enableTimeSync     ? TimeRole::Off
+                 : config_.timeSync.reference ? TimeRole::Reference
+                                              : config_.timeSync.role;
+        return s;
+    }
     lock();
     TimeSyncStatus s = timeSync_->status();
     unlock();
     return s;
 }
 
+Status EspNowTransport::setTimeRole(TimeRole role) {
+    if (!config_.enableTimeSync) return Status::InvalidState;
+    if (!started_) {
+        config_.timeSync.role = role;
+        config_.timeSync.reference = false;
+        return Status::Ok;
+    }
+    lock();
+    config_.timeSync.role = role;
+    config_.timeSync.reference = false;
+    timeSync_->setRole(role, nowMs());
+    unlock();
+    return Status::Ok;
+}
+
 Status EspNowTransport::setTimeReference(const Mac& peer) {
     if (!started_ || !timeSync_) return Status::InvalidState;
     lock();
     timeSync_->setReference(peer, nowMs());
+    unlock();
+    return Status::Ok;
+}
+
+Status EspNowTransport::clearTimeReference() {
+    if (!started_ || !timeSync_) return Status::InvalidState;
+    lock();
+    timeSync_->clearReference(nowMs());
+    unlock();
+    return Status::Ok;
+}
+
+Status EspNowTransport::setTimeSyncInterval(uint32_t ms) {
+    if (!config_.enableTimeSync) return Status::InvalidState;
+    if (!started_) {
+        config_.timeSync.intervalMs = ms;
+        return Status::Ok;
+    }
+    lock();
+    config_.timeSync.intervalMs = ms;
+    timeSync_->setInterval(ms);
     unlock();
     return Status::Ok;
 }

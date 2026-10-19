@@ -1,5 +1,6 @@
 // NowTP: network time, so that every node acts at the same instant.
-// Flash on two or more boards; set IS_REFERENCE to 1 on exactly one of them.
+// Flash the same sketch on two or more boards. They are all time candidates:
+// one becomes the reference by itself, and another takes over if it goes away.
 // Every 3 s the reference picks an instant 300 ms ahead in network time and
 // broadcasts it; every node, the reference included, toggles its LED at that
 // instant on its own clock. Probe two LEDs with a scope to see the skew.
@@ -7,7 +8,6 @@
 
 #include "esp_timer.h"
 
-#define IS_REFERENCE 0
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
@@ -39,7 +39,7 @@ void setup() {
 
     nowtp::EspNowConfig config;
     config.enableDiscovery = true;           // the reference is announced through discovery
-    config.timeSync.reference = IS_REFERENCE;
+    config.timeSync.role = nowtp::TimeRole::Candidate;
     transport.listen(kPortStart, [](const nowtp::Message& m) {
         uint64_t at;
         if (m.len != sizeof(at)) return;
@@ -55,7 +55,7 @@ void loop() {
     Serial.printf("%s, offset %lld us, round trip %u us, drift %.1f ppm\n",
                   s.isReference ? "reference" : s.synced ? "synchronized" : "not synchronized", (long long)s.offsetUs,
                   (unsigned)s.roundTripUs, s.driftPpm);
-    if (!IS_REFERENCE) return;
+    if (!s.isReference) return;
     uint64_t at = transport.networkTimeUs() + 300000;
     transport.send(nowtp::Mac::broadcast(), kPortStart, &at, sizeof(at));
     scheduleAt(at);
