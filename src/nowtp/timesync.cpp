@@ -11,7 +11,7 @@ namespace {
 constexpr size_t kMaxSamples = 8;
 constexpr size_t kMaxOffers = 16;     // peers acting as the reference or offering to, tracked
 constexpr uint32_t kRoundGraceMs = 300;   // wait for late responses after the last request
-constexpr uint32_t kFastRounds = 3;       // first rounds run every second
+constexpr uint32_t kFastRounds = 8;       // first rounds run every second: a drift fit over a 7 s baseline
 constexpr uint32_t kFastIntervalMs = 1000;
 constexpr double kMaxDrift = 500e-6;      // crystals are within ±50 ppm; anything more is noise
 constexpr uint64_t kMinFitSpanUs = 2000000;
