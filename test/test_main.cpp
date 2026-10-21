@@ -3050,6 +3050,47 @@ struct StepWatch {
 
 }  // namespace
 
+TEST(timesync_stamps_exchanges_on_air) {
+    // The reference's frames wait 4 ms in its driver before going on air: one
+    // direction only, so queue-time stamps would be 2 ms off. Stamped when
+    // the radio reports them sent, the wait drops out.
+    TimeRig rig;
+    size_t ref = rig.add(true, 8000000000ull, 0), b = rig.add(false, 1234ull, 35e-6);
+    rig.net.node(ref).txQueueMs = 4;
+    rig.start();
+    rig.net.run(60000);
+    CHECK(rig.ts[b]->synced());
+    CHECK(absValue(rig.error(b, ref)) < 20);
+}
+
+TEST(timesync_works_with_older_responders) {
+    // A responder from before on-air stamps: 27-byte responses, queue-time t3.
+    TimeRig rig;
+    size_t old = rig.add(true, 3000000000ull, 0), b = rig.add(false, 1000ull, -15e-6);
+    sim::Node* node = &rig.net.node(old);
+    node->txQueueMs = 4;  // with queue-time stamps only, 2 ms of it shows
+    rig.net.engine(old).listen(kTimeSyncPort, [&rig, node, old](const Message& m) {
+        if (m.len < 11 || m.data[0] != 1) return;
+        uint8_t out[27];
+        memcpy(out, m.data, 11);
+        out[0] = 2;
+        uint64_t t2 = m.timestampUs, t3 = node->clockUs(rig.net.now());
+        for (int i = 0; i < 8; ++i) {
+            out[11 + i] = static_cast<uint8_t>(t2 >> (8 * i));
+            out[19 + i] = static_cast<uint8_t>(t3 >> (8 * i));
+        }
+        rig.net.engine(old).send(m.src, kTimeSyncPort, out, sizeof(out), SendOptions(), CompletionHandler(),
+                                 rig.net.now());
+    });
+    rig.ts[b]->start(rig.net.now());
+    rig.disc[b]->start(rig.net.now());
+    rig.disc[old]->start(rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.ts[b]->synced(); }, 10000));
+    rig.net.run(30000);
+    int64_t e = rig.error(b, old);
+    CHECK(e > -2000 - kHopUs && e < -2000 + kHopUs);
+}
+
 TEST(timesync_candidates_agree_on_one_reference) {
     TimeRig rig;
     const double skews[] = {10e-6, -20e-6, 30e-6, -5e-6};

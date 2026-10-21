@@ -115,6 +115,7 @@ struct SentSlot {
     std::atomic<uint32_t> count{0};
     std::atomic<bool> delivered{false};
     uint8_t mac[6];
+    uint64_t timeUs;  // when the driver reported it (time sync stamps exchanges with it)
 };
 SentSlot s_sent;
 // Power found to work by the automatic fallback or optimize(); kept for the boot.
@@ -208,8 +209,10 @@ void onSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
 #else
 void onSent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
+    uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
     CallbackGuard guard;
     if (!s_events.load()) return;
+    s_sent.timeUs = t;
     if (mac) {
         memcpy(s_sent.mac, mac, sizeof(s_sent.mac));
     } else {
@@ -582,12 +585,13 @@ void EspNowTransport::checkSent() {
     if (count == sentSeen_) return;
     Mac mac = Mac::from(s_sent.mac);
     bool delivered = s_sent.delivered.load(std::memory_order_relaxed);
+    uint64_t sentUs = s_sent.timeUs;
     if (s_sent.count.load(std::memory_order_acquire) != count) return;  // being written; it wakes us again
     sentSeen_ = count;
     notePeerSendResult(mac, delivered);
     if (!sendTracker_.reports(count, mac)) return;  // a late report for a frame the engine gave up on
     peerTable_->clearInFlight();
-    engine_->onFrameSent(delivered, nowMs());
+    engine_->onFrameSent(delivered, nowMs(), sentUs);
 }
 
 bool EspNowTransport::processEvents(TickType_t wait) {

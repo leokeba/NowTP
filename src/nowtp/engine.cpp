@@ -197,9 +197,9 @@ size_t Engine::peerMessageLimit(const Mac& peer) const {
 // Sending
 
 Status Engine::send(const Mac& dst, uint8_t port, const uint8_t* data, size_t len, const SendOptions& options,
-                    CompletionHandler done, uint32_t now) {
+                    CompletionHandler done, uint32_t now, uint32_t* messageId) {
     if (data == nullptr && len > 0) return Status::InvalidArgument;
-    return queue(dst, port, data, Bytes(), len, 0, options, std::move(done), now);
+    return queue(dst, port, data, Bytes(), len, 0, options, std::move(done), now, messageId);
 }
 
 Status Engine::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
@@ -211,7 +211,7 @@ Status Engine::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t 
 
 // The payload is `data`, copied, or the first `len` bytes of `owned`.
 Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
-                     const SendOptions& options, CompletionHandler done, uint32_t now) {
+                     const SendOptions& options, CompletionHandler done, uint32_t now, uint32_t* messageId) {
     if (options.reliable && dst.isBroadcast()) return Status::InvalidArgument;
     if (len > config_.maxMessageSize) return Status::TooLarge;
     size_t peerLimit = peerMessageLimit(dst);
@@ -295,6 +295,7 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     if (count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
 
     tx->id = nextId_++;
+    if (messageId) *messageId = tx->id;
     tx->deadline = now + (options.timeoutMs ? options.timeoutMs : config_.sendTimeoutMs);
     tx->done = std::move(done);
     txBytes_ += tx->streamLen;
@@ -449,13 +450,13 @@ Engine::Backoff* Engine::backoff(const Mac& dst) {
     return nullptr;
 }
 
-void Engine::onFrameSent(bool delivered, uint32_t now) {
-    frameSent(delivered, now);
+void Engine::onFrameSent(bool delivered, uint32_t now, uint64_t sentUs) {
+    frameSent(delivered, now, sentUs);
     pump(now);
     flushCompletions();
 }
 
-void Engine::frameSent(bool delivered, uint32_t now) {
+void Engine::frameSent(bool delivered, uint32_t now, uint64_t sentUs) {
     if (!inflight_.active) return;
     InFlight f = inflight_;
     inflight_.active = false;
@@ -485,6 +486,11 @@ void Engine::frameSent(bool delivered, uint32_t now) {
 
     if (b) backoffs_.erase(backoffs_.begin() + (b - backoffs_.data()));
     tx->frameFailures = 0;
+    // Reported once the frame's bookkeeping is done: tx may be gone by then.
+    bool report = sentUs != 0 && tx->count == 1 && sent_;
+    Mac dst = tx->dst;
+    uint8_t port = tx->port;
+    uint32_t id = tx->id;
     if (f.firstPass) {
         // Not backwards: a Busy ack may have ended the first pass meanwhile.
         tx->nextIndex = std::max(tx->nextIndex, static_cast<uint16_t>(f.index + 1));
@@ -492,15 +498,17 @@ void Engine::frameSent(bool delivered, uint32_t now) {
         tx->sentResend(f.index);
     }
 
-    if (tx->hasPendingFrame()) return;
-    if (tx->reliable()) {
-        if (!tx->awaitingAck) {  // already set by a Busy ack: keep its backoff
-            tx->awaitingAck = true;
-            tx->ackDeadline = now + config_.ackTimeoutMs;
+    if (!tx->hasPendingFrame()) {
+        if (tx->reliable()) {
+            if (!tx->awaitingAck) {  // already set by a Busy ack: keep its backoff
+                tx->awaitingAck = true;
+                tx->ackDeadline = now + config_.ackTimeoutMs;
+            }
+        } else {
+            finish(tx, Status::Ok);
         }
-    } else {
-        finish(tx, Status::Ok);
     }
+    if (report) sent_(dst, port, id, sentUs);
 }
 
 void Engine::finish(TxMessage* tx, Status status) {
@@ -561,7 +569,7 @@ void Engine::reseal(const Mac& dst) {
 
 void Engine::tick(uint32_t now) {
     if (inflight_.active && reached(now, inflight_.deadline)) {
-        frameSent(false, now);  // the radio never reported back; treat as lost
+        frameSent(false, now, 0);  // the radio never reported back; treat as lost
     }
 
     for (size_t i = 0; i < tx_.size();) {

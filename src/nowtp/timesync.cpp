@@ -4,11 +4,13 @@
 
 #include <string.h>
 
+#include <algorithm>
+
 namespace nowtp {
 
 namespace {
 
-constexpr size_t kMaxSamples = 8;
+constexpr size_t kMaxSamples = 16;     // rounds in the fit: ~80 s at the 5 s interval
 constexpr size_t kMaxOffers = 16;     // peers acting as the reference or offering to, tracked
 constexpr uint32_t kRoundGraceMs = 300;   // wait for late responses after the last request
 constexpr uint32_t kFastRounds = 8;       // first rounds run every second: a drift fit over a 7 s baseline
@@ -16,6 +18,11 @@ constexpr uint32_t kFastIntervalMs = 1000;
 constexpr double kMaxDrift = 500e-6;      // crystals are within ±50 ppm; anything more is noise
 constexpr uint64_t kMinFitSpanUs = 2000000;
 constexpr uint8_t kRejectLimit = 3;       // consecutive outliers that mean the reference's clock jumped
+constexpr size_t kRequestSize = 37;       // padded to the response's length
+constexpr size_t kResponseSize = 37;      // with the previous response's send time
+constexpr size_t kBasicResponseSize = 27; // from responders without send times
+constexpr uint8_t kNoIndex = 0xFF;
+constexpr uint8_t kMinStamped = 3;        // stamped exchanges a round needs to use them
 
 inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
@@ -50,6 +57,8 @@ const char* toString(TimeRole role) {
     return "?";
 }
 
+constexpr size_t TimeSync::kMaxExchanges;
+
 TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& config, const Mac& localMac)
     : engine_(engine),
       clock_(std::move(localClockUs)),
@@ -57,6 +66,7 @@ TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& con
       self_(localMac),
       role_(config.reference ? TimeRole::Reference : config.role) {
     if (config_.samples == 0) config_.samples = 1;
+    if (config_.samples > kMaxExchanges) config_.samples = static_cast<uint8_t>(kMaxExchanges);
     // Both grow on what the network does: reserved here, never grown.
     samples_.reserve(kMaxSamples);
     offers_.reserve(kMaxOffers);
@@ -81,12 +91,16 @@ void TimeSync::start(uint32_t now) {
     vacant_ = true;  // a candidate listens for a reference before taking over
     vacantSince_ = now;
     engine_.listen(kTimeSyncPort, [this](const Message& m) { handle(m); });
+    engine_.setSentObserver([this](const Mac& dst, uint8_t port, uint32_t id, uint64_t sentUs) {
+        if (port == kTimeSyncPort) onSent(dst, id, sentUs);
+    });
     evaluate(now);
 }
 
 void TimeSync::stop() {
     if (!running_) return;
     engine_.listen(kTimeSyncPort, ReceiveHandler());
+    engine_.setSentObserver(SentObserver());
     running_ = false;
     roundActive_ = false;
 }
@@ -250,6 +264,7 @@ void TimeSync::publish() {
 void TimeSync::switchTo(const Mac& mac, uint32_t now) {
     haveRef_ = true;
     ref_ = mac;
+    refStamps_ = false;
     carried_ = haveEstimate_;
     samples_.clear();
     rounds_ = 0;
@@ -285,7 +300,6 @@ void TimeSync::tick(uint32_t now) {
         roundActive_ = true;
         round_++;
         sent_ = 0;
-        haveBest_ = false;
         nextSampleAt_ = now;
     }
     if (sent_ < config_.samples) {
@@ -297,21 +311,47 @@ void TimeSync::tick(uint32_t now) {
 
 void TimeSync::sendRequest(uint32_t now) {
     // type | round | index | t1 (8), padded to the response's length: both
-    // directions then take the same air time, which the offset assumes.
-    uint8_t msg[27];
+    // directions then take the same air time.
+    uint8_t msg[kRequestSize];
     memset(msg, 0, sizeof(msg));
     msg[0] = kRequest;
     msg[1] = round_;
     msg[2] = sent_;
-    putU64(msg + 3, clock_());
-    Status st = engine_.send(ref_, kTimeSyncPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now);
+    uint64_t t1 = clock_();
+    putU64(msg + 3, t1);
+    uint32_t id = 0;
+    Status st = engine_.send(ref_, kTimeSyncPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now, &id);
     if (st == Status::QueueFull) {
         nextSampleAt_ = now + 2;
         return;
     }
+    Exchange& e = exchanges_[sent_];
+    e = Exchange();
+    e.requestId = id;
+    e.t1 = t1;
     sent_++;
     lastSentAt_ = now;
     nextSampleAt_ = now + config_.sampleSpacingMs;
+}
+
+// The radio reported one of our messages on air. Stamped there, an exchange
+// leaves out the time spent in queues and waiting for the channel, which
+// differ between the two directions; what remains is the same on both sides
+// (the driver's reporting and receive latencies) and cancels out.
+void TimeSync::onSent(const Mac& dst, uint32_t messageId, uint64_t sentUs) {
+    if (roundActive_ && haveRef_ && dst == ref_) {
+        for (uint8_t i = 0; i < sent_; ++i) {
+            if (exchanges_[i].requestId != messageId) continue;
+            exchanges_[i].sentUs = sentUs;
+            return;
+        }
+    }
+    for (Answer& a : answers_) {
+        if (a.messageId == messageId && a.to == dst) {
+            a.sentUs = sentUs;
+            return;
+        }
+    }
 }
 
 void TimeSync::handle(const Message& m) {
@@ -324,42 +364,125 @@ void TimeSync::handle(const Message& m) {
         // (or the one we serve). A node set to synchronize with us thereby
         // joins the same network time.
         bool chained = synced();
-        uint8_t out[27];
+        // The previous response to this requester, whose send time we now know.
+        Answer* slot = nullptr;
+        for (Answer& a : answers_) {
+            if (a.to == m.src) slot = &a;
+        }
+        if (!slot) {
+            slot = &answers_[nextAnswer_];
+            nextAnswer_ = static_cast<uint8_t>((nextAnswer_ + 1) % kMaxAnswers);
+            *slot = Answer();
+            slot->to = m.src;
+            slot->index = kNoIndex;
+        }
+        // type | round | index | t1 (echoed) | t2 | t3 | previous round | index | its send time
+        uint8_t out[kResponseSize];
         out[0] = kResponse;
         out[1] = d[1];
         out[2] = d[2];
         memcpy(out + 3, d + 3, 8);
         putU64(out + 11, chained ? toNetwork(t2) : t2);
+        out[27] = slot->round;
+        out[28] = slot->sentUs ? slot->index : kNoIndex;
+        putU64(out + 29, !slot->sentUs ? 0 : chained ? toNetwork(slot->sentUs) : slot->sentUs);
         uint64_t t3 = clock_();
         putU64(out + 19, chained ? toNetwork(t3) : t3);
-        engine_.send(m.src, kTimeSyncPort, out, sizeof(out), SendOptions(), CompletionHandler(), now_);
+        uint32_t id = 0;
+        Status st = engine_.send(m.src, kTimeSyncPort, out, sizeof(out), SendOptions(), CompletionHandler(), now_, &id);
+        slot->round = d[1];
+        slot->index = d[2];
+        slot->messageId = id;
+        slot->sentUs = 0;
+        if (st != Status::Ok) slot->index = kNoIndex;
         return;
     }
-    if (d[0] != kResponse || m.len < 27) return;
+    if (d[0] != kResponse || m.len < kBasicResponseSize) return;
     uint64_t t4 = m.timestampUs ? m.timestampUs : clock_();
     if (!roundActive_ || !haveRef_ || m.src != ref_ || d[1] != round_) return;
-    uint64_t t1 = getU64(d + 3);
-    uint64_t t2 = getU64(d + 11);
-    uint64_t t3 = getU64(d + 19);
-    int64_t rtt = static_cast<int64_t>(t4 - t1) - static_cast<int64_t>(t3 - t2);
-    if (t4 < t1 || rtt < 0 || rtt > 1000000) return;
-    // Offset = reference clock - local clock, assuming symmetric delays.
-    int64_t offset = (static_cast<int64_t>(t2 - t1) + static_cast<int64_t>(t3 - t4)) / 2;
-    if (!haveBest_ || static_cast<uint32_t>(rtt) < bestRtt_) {
-        haveBest_ = true;
-        bestRtt_ = static_cast<uint32_t>(rtt);
-        bestOffset_ = offset;
-        bestLocal_ = t1 + static_cast<uint64_t>(rtt / 2);
+    if (m.len >= kResponseSize && d[27] == round_ && d[28] < sent_) {
+        exchanges_[d[28]].answerSentUs = getU64(d + 29);
+        refStamps_ = true;
     }
+    if (d[2] >= sent_) return;
+    Exchange& e = exchanges_[d[2]];
+    if (getU64(d + 3) != e.t1) return;  // not the request we sent under this index
+    e.answered = true;
+    e.t2 = getU64(d + 11);
+    e.t3 = getU64(d + 19);
+    e.t4 = t4;
 }
+
+namespace {
+
+int64_t median(int64_t* v, size_t n) {
+    std::sort(v, v + n);
+    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+}
+
+}  // namespace
 
 void TimeSync::endRound(uint32_t now) {
     roundActive_ = false;
-    if (!haveBest_) {
+    // Queue-time round trips: queueing only ever adds to them, so the fastest
+    // exchanges carry the least asymmetry.
+    uint32_t fastest = 0;
+    uint8_t answered = 0;
+    for (uint8_t i = 0; i < sent_; ++i) {
+        const Exchange& e = exchanges_[i];
+        if (!e.answered) continue;
+        int64_t rtt = static_cast<int64_t>(e.t4 - e.t1) - static_cast<int64_t>(e.t3 - e.t2);
+        if (e.t4 < e.t1 || rtt < 0 || rtt > 1000000) continue;
+        if (answered == 0 || static_cast<uint32_t>(rtt) < fastest) fastest = static_cast<uint32_t>(rtt);
+        answered++;
+    }
+    if (answered == 0) {
         nextRoundAt_ = now + kFastIntervalMs;
         return;
     }
-    bool taken = addSample(bestLocal_, bestOffset_, bestRtt_);
+    int64_t offsets[kMaxExchanges];
+    uint64_t base = 0;
+    int64_t sumLocal = 0;
+    size_t n = 0;
+    // Exchanges stamped on air at both ends (when the responder reports its
+    // send times): the median of their offsets.
+    for (uint8_t i = 0; i < sent_; ++i) {
+        const Exchange& e = exchanges_[i];
+        if (!e.answered || !e.sentUs || !e.answerSentUs) continue;
+        if (n == 0) base = e.sentUs;
+        offsets[n++] = (static_cast<int64_t>(e.t2 - e.sentUs) + static_cast<int64_t>(e.answerSentUs - e.t4)) / 2;
+        sumLocal += static_cast<int64_t>((e.sentUs + e.t4) / 2 - base);
+    }
+    if (n < kMinStamped && refStamps_) {
+        // Mixing in queue-time rounds, biased differently, would make the
+        // estimate jump between the two: try again shortly instead.
+        nextRoundAt_ = now + kFastIntervalMs;
+        return;
+    }
+    if (n < kMinStamped) {
+        // Queue-time stamps (a responder without send times): the fastest
+        // exchange. Averaging those close to it measured worse on hardware:
+        // a slightly slower exchange mostly waited on one side, so they pull
+        // the offset one way.
+        n = 0;
+        for (uint8_t i = 0; i < sent_; ++i) {
+            const Exchange& e = exchanges_[i];
+            if (!e.answered) continue;
+            int64_t rtt = static_cast<int64_t>(e.t4 - e.t1) - static_cast<int64_t>(e.t3 - e.t2);
+            if (e.t4 < e.t1 || rtt != static_cast<int64_t>(fastest)) continue;
+            base = e.t1 + static_cast<uint64_t>(rtt / 2);
+            offsets[0] = (static_cast<int64_t>(e.t2 - e.t1) + static_cast<int64_t>(e.t3 - e.t4)) / 2;
+            sumLocal = 0;
+            n = 1;
+            break;
+        }
+    }
+    if (n == 0) {
+        nextRoundAt_ = now + kFastIntervalMs;
+        return;
+    }
+    uint64_t local = base + static_cast<uint64_t>(sumLocal / static_cast<int64_t>(n));
+    bool taken = addSample(local, median(offsets, n), fastest);
     nextRoundAt_ = now + (!taken || rounds_ < kFastRounds ? kFastIntervalMs : config_.intervalMs);
 }
 
@@ -373,11 +496,11 @@ bool TimeSync::addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs) {
         return false;
     }
     if (haveEstimate_ && (samples_.size() >= 3 || carried_)) {
-        // A sample far from the prediction is a delayed exchange, or the
-        // reference rebooted; after a few in a row, believe them.
         int64_t error = offsetUs - offsetAt(localUs);
-        int64_t tolerance = 2000 + 4 * static_cast<int64_t>(rttUs);
-        if (error > tolerance || error < -tolerance) {
+        int64_t magnitude = error < 0 ? -error : error;
+        // Far from the prediction: a delayed exchange, or the reference
+        // rebooted; after a few in a row, believe them.
+        if (magnitude > 2000 + 4 * static_cast<int64_t>(rttUs)) {
             if (++rejected_ < kRejectLimit) return false;
             samples_.clear();
             drift_ = 0;

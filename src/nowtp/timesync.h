@@ -40,7 +40,7 @@ struct TimeSyncConfig {
     uint32_t intervalMs = 5000;
     /// Request/response exchanges per round; the one with the shortest round
     /// trip is used, since queueing delays only ever add to it.
-    uint8_t samples = 8;
+    uint8_t samples = 8;  ///< At most 16.
     uint32_t sampleSpacingMs = 15;
     /// Synchronization counts as lost after this long without a successful round.
     uint32_t staleAfterMs = 60000;
@@ -130,6 +130,23 @@ private:
         uint64_t localUs;
         int64_t offsetUs;
     };
+    /// One request/response of the current round, by request index.
+    struct Exchange {
+        uint32_t requestId;  ///< Engine message id of the request.
+        bool answered;
+        uint64_t t1, t2, t3, t4;  ///< Request queued, request received, response queued, response received.
+        uint64_t sentUs;          ///< When the request went out (0: not reported).
+        uint64_t answerSentUs;    ///< When the response went out, as the responder reported later (0: not yet).
+    };
+    static constexpr size_t kMaxExchanges = 16;
+    /// The last response to a requester: its send time goes in the next one.
+    struct Answer {
+        Mac to;
+        uint8_t round, index;
+        uint32_t messageId;
+        uint64_t sentUs;  ///< 0 until the radio reports it.
+    };
+    static constexpr size_t kMaxAnswers = 4;
     /// A peer that acts as the reference or offers to.
     struct Offer {
         Mac mac;
@@ -139,6 +156,7 @@ private:
     };
 
     void handle(const Message& m);
+    void onSent(const Mac& dst, uint32_t messageId, uint64_t sentUs);
     void evaluate(uint32_t now);
     const Offer* bestActing() const;
     bool aheadOfUs(const Offer& o) const;
@@ -178,10 +196,10 @@ private:
     uint32_t nextSampleAt_ = 0;
     uint32_t lastSentAt_ = 0;
     uint32_t nextRoundAt_ = 0;
-    bool haveBest_ = false;
-    uint64_t bestLocal_ = 0;
-    int64_t bestOffset_ = 0;
-    uint32_t bestRtt_ = 0;
+    Exchange exchanges_[kMaxExchanges];
+    bool refStamps_ = false;  // the reference reports its send times
+    Answer answers_[kMaxAnswers];
+    uint8_t nextAnswer_ = 0;
 
     // Estimate: offset(t) = base_ + drift_ * (t - baseLocal_). Frozen while acting.
     std::vector<Sample> samples_;

@@ -167,6 +167,9 @@ struct Node {
     nowtp::Engine engine;
     SimRadio radio;
     bool online = true;
+    /// Time its frames wait in the driver before going on air: delivery and
+    /// the "sent" report come this much later (one direction only, unlike air time).
+    uint32_t txQueueMs = 0;
     /// Local clock: offset and rate error against the simulation's time.
     uint64_t clockOffsetUs = 1000000000;
     double clockSkew = 0;  // e.g. 40e-6 for a crystal 40 ppm fast
@@ -241,6 +244,7 @@ public:
         bool forced = dropIf && dropIf(f);
 
         bool ok = true;
+        uint32_t onAir = now_ + nodes_[from]->txQueueMs;  // when the frame leaves
         const SimRadio& tx = nodes_[from]->radio;
         nowtp::PhyRate rate = tx.rateFor(dst);
         if (!nodes_[from]->online) {
@@ -249,7 +253,7 @@ public:
             for (size_t i = 0; i < nodes_.size(); ++i) {
                 if (i == from || !hears(from, i, rate)) continue;
                 if (forced || chance(airLoss) || chance(appLoss)) continue;
-                schedule(Event{now_ + 1, Event::Deliver, i, from, f.data, true, rssi(from, i)});
+                schedule(Event{onAir + 1, Event::Deliver, i, from, f.data, true, rssi(from, i)});
             }
         } else {
             size_t to = find(dst);
@@ -257,13 +261,13 @@ public:
             if (!reachable || chance(airLoss)) {
                 ok = false;
             } else {
-                if (!forced && !chance(appLoss)) schedule(Event{now_ + 1, Event::Deliver, to, from, f.data, true, rssi(from, to)});
+                if (!forced && !chance(appLoss)) schedule(Event{onAir + 1, Event::Deliver, to, from, f.data, true, rssi(from, to)});
                 // The receiver's MAC acknowledgement must make it back.
                 if (chance(macAckLoss) || !hears(to, from, nowtp::PhyRate::B1M)) ok = false;
             }
         }
         uint32_t latency = ok ? 1 : std::max<uint32_t>(1, failLatencyMs);
-        schedule(Event{now_ + latency, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
+        schedule(Event{onAir + latency, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
         return Status::Ok;
     }
 
@@ -285,7 +289,7 @@ public:
                 n.link.inFlight = false;
                 Counted counted;
                 n.link.peers.clearInFlight();
-                n.engine.onFrameSent(e.ok, now_);
+                n.engine.onFrameSent(e.ok, now_, n.clockUs(now_));
             } else if (n.online) {
                 Counted counted;
                 n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,

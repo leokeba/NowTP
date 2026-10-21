@@ -43,6 +43,8 @@ struct FrameInfo {
 using FrameObserver = std::function<void(const FrameInfo&)>;
 /// `src` was heard: see Engine::setHeardObserver().
 using HeardObserver = std::function<void(const Mac& src, bool authenticated, uint32_t nowMs)>;
+/// A single-frame message went out: see Engine::setSentObserver().
+using SentObserver = std::function<void(const Mac& dst, uint8_t port, uint32_t messageId, uint64_t sentUs)>;
 
 /// Message authentication, plugged into the engine by Security.
 ///
@@ -122,8 +124,9 @@ public:
 
     /// Queues a message. The payload is copied. `done` (optional) is called once
     /// with the final outcome; it may run before send() returns.
+    /// `messageId`, if given, receives the message's id (see setSentObserver()).
     Status send(const Mac& dst, uint8_t port, const uint8_t* data, size_t len, const SendOptions& options,
-                CompletionHandler done, uint32_t nowMs);
+                CompletionHandler done, uint32_t nowMs, uint32_t* messageId = nullptr);
     /// Like send(), but takes `buffer`: a malloc()ed block of `capacity` bytes
     /// whose first `len` are the payload. With capacity >= len + kSendOverhead
     /// it is used without a copy; otherwise it is realloc()ed. It is freed in
@@ -142,7 +145,8 @@ public:
 
     /// Reports the outcome of the last frame accepted by Link::sendFrame().
     /// `delivered` is the radio's view: MAC-level ack for unicast, always true for broadcast.
-    void onFrameSent(bool delivered, uint32_t nowMs);
+    /// `sentUs` is the local clock when the radio reported it, 0 if unknown.
+    void onFrameSent(bool delivered, uint32_t nowMs, uint64_t sentUs = 0);
 
     /// Drives timeouts and retransmissions.
     void tick(uint32_t nowMs);
@@ -156,6 +160,10 @@ public:
     /// verified). Discovery sets it, so that a peer whose announcements go
     /// missing while it exchanges messages with us isn't reported lost. One at a time.
     void setHeardObserver(HeardObserver observer) { heard_.set(std::move(observer)); }
+    /// Called when the radio reports a single-frame message of ours delivered,
+    /// with the time it reported it (see onFrameSent()): time sync stamps its
+    /// exchanges with it. One at a time.
+    void setSentObserver(SentObserver observer) { sent_.set(std::move(observer)); }
 
     /// Authenticates outgoing messages and checks incoming ones (null: none).
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
@@ -274,9 +282,9 @@ private:
     TxMessage* nextMessage(uint32_t now);
     Backoff* backoff(const Mac& dst);
     size_t buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest);
-    void frameSent(bool delivered, uint32_t now);
+    void frameSent(bool delivered, uint32_t now, uint64_t sentUs);
     Status queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
-                 const SendOptions& options, CompletionHandler done, uint32_t now);
+                 const SendOptions& options, CompletionHandler done, uint32_t now, uint32_t* messageId = nullptr);
     void finish(TxMessage* tx, Status status);
     void flushCompletions();
 
@@ -357,6 +365,7 @@ private:
     uint64_t rxTimeUs_ = 0;
     Callback<void(const FrameInfo&)> observer_;
     Callback<void(const Mac&, bool, uint32_t)> heard_;
+    Callback<void(const Mac&, uint8_t, uint32_t, uint64_t)> sent_;
     Authenticator* auth_ = nullptr;
 };
 
