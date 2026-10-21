@@ -49,6 +49,11 @@ struct TimeSyncConfig {
     uint32_t takeoverAfterMs = 5000;
     /// Answer other nodes' time requests.
     bool respond = true;
+    /// Ask the reference to measure, every this often, how far our network
+    /// time is from its own (a round in the other direction), and correct the
+    /// difference: what remains of the radio driver's delays after send-time
+    /// stamps differs between requests and responses (~20 µs on ESP32). 0: never.
+    uint32_t calibrationIntervalMs = 10000;
 };
 
 struct TimeSyncStatus {
@@ -63,6 +68,10 @@ struct TimeSyncStatus {
     float driftPpm = 0;        ///< How fast the offset grows, in µs per second.
     uint32_t ageMs = 0;        ///< Since the last successful round (0 while acting).
     uint32_t rounds = 0;       ///< Successful rounds with the current reference.
+    /// Correction from the reference's measurements, subtracted from the
+    /// estimate (see TimeSyncConfig::calibrationIntervalMs), µs.
+    int32_t calibrationUs = 0;
+    uint8_t calibrations = 0;  ///< Reference measurements held (up to 9).
 };
 
 /// Network time: every node estimates the offset between its clock and the
@@ -124,7 +133,7 @@ public:
     TimeSyncStatus status() const;
 
 private:
-    enum MsgType : uint8_t { kRequest = 1, kResponse = 2 };
+    enum MsgType : uint8_t { kRequest = 1, kResponse = 2, kCalibration = 3 };
 
     struct Sample {
         uint64_t localUs;
@@ -139,14 +148,20 @@ private:
         uint64_t answerSentUs;    ///< When the response went out, as the responder reported later (0: not yet).
     };
     static constexpr size_t kMaxExchanges = 16;
-    /// The last response to a requester: its send time goes in the next one.
+    /// A requester: our last response to it, whose send time goes in the
+    /// next one, and the calibration rounds it asked for.
     struct Answer {
         Mac to;
+        bool used;
         uint8_t round, index;
         uint32_t messageId;
         uint64_t sentUs;  ///< 0 until the radio reports it.
+        uint32_t lastMs;  ///< Its last request.
+        uint32_t calibrateEveryMs;  ///< 0: it didn't ask.
+        uint32_t nextCalibrationMs;
     };
-    static constexpr size_t kMaxAnswers = 4;
+    static constexpr size_t kMaxAnswers = 8;
+    static constexpr size_t kMaxCalibrations = 9;
     /// A peer that acts as the reference or offers to.
     struct Offer {
         Mac mac;
@@ -166,9 +181,16 @@ private:
     void forget();
     void sendRequest(uint32_t now);
     void endRound(uint32_t now);
+    void endCalibration(int64_t offsetUs, size_t stamped, uint32_t now);
+    void calibrate(int32_t reportedUs);
+    /// Where this round's requests go: the reference, or (while acting) the
+    /// follower a calibration round measures.
+    const Mac& target() const { return acting_ ? peer_ : ref_; }
     bool addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs);
     void fit();
     int64_t offsetAt(uint64_t localUs) const;
+    /// The estimate as served: corrected by the calibration.
+    int64_t servedAt(uint64_t localUs) const { return haveEstimate_ ? offsetAt(localUs) - bias_ : 0; }
 
     Engine& engine_;
     Clock clock_;
@@ -199,7 +221,15 @@ private:
     Exchange exchanges_[kMaxExchanges];
     bool refStamps_ = false;  // the reference reports its send times
     Answer answers_[kMaxAnswers];
-    uint8_t nextAnswer_ = 0;
+    Mac peer_ = Mac();  // the follower measured by the current calibration round
+
+    // Calibration (followers): the reference's measurements, as the bias
+    // each implies, and the correction applied.
+    int32_t implied_[kMaxCalibrations];
+    uint8_t impliedCount_ = 0;
+    uint8_t impliedNext_ = 0;
+    int32_t bias_ = 0;
+    bool biasSet_ = false;
 
     // Estimate: offset(t) = base_ + drift_ * (t - baseLocal_). Frozen while acting.
     std::vector<Sample> samples_;

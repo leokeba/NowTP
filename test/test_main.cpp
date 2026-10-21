@@ -2876,6 +2876,7 @@ struct TimeRig {
     std::vector<std::unique_ptr<Discovery>> disc;
     std::vector<std::unique_ptr<TimeSync>> ts;
     std::vector<TimeRole> roles;
+    std::function<void(size_t, TimeSyncConfig&)> configure;  // applied when a node is built
 
     size_t add(TimeRole role, uint64_t clockOffsetUs, double skew) {
         size_t i = net.addNode();
@@ -2902,6 +2903,7 @@ struct TimeRig {
         disc[i].reset(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
         TimeSyncConfig tc;
         tc.role = roles[i];
+        if (configure) configure(i, tc);
         sim::Node* node = &net.node(i);
         sim::Network* nw = &net;
         ts[i].reset(new TimeSync(net.engine(i), [node, nw] { return node->clockUs(nw->now()); }, tc, net.mac(i)));
@@ -3089,6 +3091,112 @@ TEST(timesync_works_with_older_responders) {
     rig.net.run(30000);
     int64_t e = rig.error(b, old);
     CHECK(e > -2000 - kHopUs && e < -2000 + kHopUs);
+    CHECK_EQ(rig.ts[b]->status().calibrations, 0u);  // it never measures us
+}
+
+namespace {
+
+// Time requests arrive 2 ms after their "sent" report, responses at once: a
+// delay that depends on the direction, which send-time stamps can't see. A
+// follower's own rounds then put half of it into its estimate.
+void delayTimeRequests(sim::Network& net) {
+    net.deliveryDelayMs = [](const sim::Frame& f) -> uint32_t {
+        return f.data.size() > 5 && f.data[2] == kTimeSyncPort && f.data[5] == 1 ? 2 : 0;
+    };
+}
+
+}  // namespace
+
+TEST(timesync_calibration_cancels_a_direction_delay) {
+    for (bool calibrate : {false, true}) {
+        TimeRig rig;
+        rig.configure = [calibrate](size_t, TimeSyncConfig& c) { c.calibrationIntervalMs = calibrate ? 10000 : 0; };
+        size_t ref = rig.add(true, 8000000000ull, 0), b = rig.add(false, 1234ull, 35e-6);
+        delayTimeRequests(rig.net);
+        rig.start();
+        rig.net.run(90000);
+        TimeSyncStatus s = rig.ts[b]->status();
+        CHECK(s.synced);
+        if (!calibrate) {
+            CHECK(rig.error(b, ref) > 900 && rig.error(b, ref) < 1100);  // half the delay
+            CHECK_EQ(s.calibrations, 0u);
+        } else {
+            CHECK(absValue(rig.error(b, ref)) < 50);
+            CHECK(s.calibrationUs > 900 && s.calibrationUs < 1100);
+            CHECK(s.calibrations >= 5u);
+        }
+    }
+}
+
+TEST(timesync_calibration_ignores_whatever_memory_held) {
+    // Its tables start empty, whatever the memory held: built over garbage, a
+    // reference measures only the follower that asked.
+    TimeRig rig;
+    size_t ref = rig.add(true, 8000000000ull, 0), b = rig.add(false, 1234ull, 35e-6);
+    alignas(TimeSync) static unsigned char storage[sizeof(TimeSync)];
+    memset(storage, 0xFF, sizeof(storage));  // slots that look heard just now, and due
+    TimeSyncConfig tc;
+    tc.role = TimeRole::Reference;
+    sim::Node* node = &rig.net.node(ref);
+    sim::Network* nw = &rig.net;
+    TimeSync* dirty = new (storage) TimeSync(rig.net.engine(ref), [node, nw] { return node->clockUs(nw->now()); }, tc,
+                                             rig.net.mac(ref));
+    struct Destroy {
+        TimeSync* t;
+        ~Destroy() { t->~TimeSync(); }
+    } destroy{dirty};
+    rig.ts[ref].reset();
+    rig.disc[ref]->onPeerEvent([dirty, &rig](PeerEvent e, const PeerInfo& p) { dirty->onPeerEvent(e, p, rig.net.now()); });
+    dirty->setDiscovery(rig.disc[ref].get());
+    rig.net.tickers[ref] = [&rig, ref, dirty](uint32_t now) {
+        rig.disc[ref]->tick(now);
+        dirty->tick(now);
+    };
+    rig.disc[ref]->start(rig.net.now());
+    dirty->start(rig.net.now());
+    rig.start(b);
+    rig.net.run(60000);
+    for (const sim::Frame& f : rig.net.log) {
+        if (f.from == ref && f.data.size() > 2 && f.data[2] == kTimeSyncPort) CHECK(f.dst == rig.net.mac(b));
+    }
+    CHECK(rig.ts[b]->status().calibrations >= 3u);
+    rig.disc[ref]->stop(rig.net.now());
+}
+
+TEST(timesync_calibration_serves_several_followers) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 8000000000ull, 0);
+    const double skews[] = {20e-6, -30e-6, 45e-6};
+    for (double skew : skews) rig.add(false, 1000ull, skew);
+    delayTimeRequests(rig.net);
+    rig.start();
+    rig.net.run(120000);
+    for (size_t i = 1; i < 4; ++i) {
+        CHECK(absValue(rig.error(i, ref)) < 50);
+        CHECK(rig.ts[i]->status().calibrations >= 5u);
+    }
+}
+
+TEST(timesync_calibration_carries_into_a_takeover) {
+    // b corrects its estimate, then takes over: the network time it serves
+    // keeps the correction, rather than stepping back by the delay.
+    TimeRig rig;
+    size_t a = rig.add(TimeRole::Candidate, 5000000000ull, 0), b = rig.add(TimeRole::Candidate, 1000ull, 25e-6),
+           c = rig.add(TimeRole::Candidate, 2000ull, -25e-6);
+    delayTimeRequests(rig.net);
+    rig.start();
+    rig.net.run(90000);
+    CHECK(rig.ts[a]->isReference());
+    CHECK(absValue(rig.error(b, a)) < 50);
+    rig.net.node(a).online = false;
+    sim::Node* na = &rig.net.node(a);
+    StepWatch wb{rig, b, [&] { return na->clockUs(rig.net.now()); }};
+    wb.run(60000);
+    CHECK(rig.ts[b]->isReference());
+    CHECK_EQ(rig.ts[b]->status().calibrationUs, 0);  // folded into the network time it serves
+    CHECK(wb.maxError < 100);
+    // c now calibrates against b.
+    CHECK(absValue(static_cast<int64_t>(rig.ts[c]->networkTime() - na->clockUs(rig.net.now()))) < 100);
 }
 
 TEST(timesync_candidates_agree_on_one_reference) {

@@ -171,6 +171,9 @@ esp_err_t addPlainPeer(const Mac& mac, wifi_interface_t interface) {
 
 // Runs in the Wi-Fi driver task: copy the frame out and return quickly.
 void pushReceived(const uint8_t* mac, int8_t rssi, const uint8_t* data, size_t len) {
+    // First, like the "sent" callback: time sync compares the two, and taking
+    // the ring buffer's lock can wait.
+    uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
     CallbackGuard guard;
     RingbufHandle_t rb = s_events;
     if (!rb) return;
@@ -180,7 +183,6 @@ void pushReceived(const uint8_t* mac, int8_t rssi, const uint8_t* data, size_t l
         return;
     }
     EventHeader* h = static_cast<EventHeader*>(slot);
-    uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
     h->timeLo = static_cast<uint32_t>(t);
     h->timeHi = static_cast<uint32_t>(t >> 32);
     h->rssi = rssi;

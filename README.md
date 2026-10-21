@@ -287,9 +287,10 @@ esp_timer_start_once(timer, local - esp_timer_get_time());
 ```
 
 - **Estimation.** Nodes run NTP-style exchanges with the reference, 8 per round. Each exchange is stamped when the radio reports the frames sent and received, so time spent in queues and waiting for the channel drops out; a round takes the median of its exchanges. A fit over recent rounds tracks clock drift, so the estimate holds between rounds and through short outages. Older nodes answer without send times, and rounds with them use queue times instead.
+- **Calibration.** Even stamped on air, an exchange keeps a small bias: the radio driver reports requests and responses with slightly different delays, which put the follower about 20 µs behind on ESP32. So every `timeSync.calibrationIntervalMs` (10 s) the reference also measures each follower, in the other direction, where the bias shows up with the opposite sign. It tells the follower the difference, and the follower corrects its network time by the median of the last few measurements. `timeSyncStatus().calibrationUs` shows the correction.
 - **Accuracy.** Measured with a wire between two boards: each one pulls a GPIO low at whole seconds of network time, and the other timestamps the edge in an interrupt.
-  - Two ESP32-D0WD-V3 DEVKITs: 95 % of the time within 28–32 µs, at worst 37 µs. The follower runs about 18 µs behind its reference.
-  - Different chips (an ESP32-D0WDQ6 rev 1 with a D0WD-V3): 95 % within 26–53 µs depending on which board is the reference, since their radios report with slightly different delays.
+  - Two ESP32-D0WD-V3 DEVKITs, with calibration: median within 2 µs, 95 % of the time within 12–16 µs, at worst 20 µs, whichever board is the reference. The correction settles at about −22 µs within 30 s. Without calibration, the follower runs about 18 µs behind, and 95 % stays within 28–32 µs.
+  - Different chips (an ESP32-D0WDQ6 rev 1 with a D0WD-V3, before calibration): 95 % within 26–53 µs depending on which board is the reference. Their radios report with slightly different delays, and part of that is a fixed per-board offset that no exchange can see.
   - Without send times (older nodes): 95 % within about 42 µs on the same boards, with occasional rounds that delay one direction and throw the clock off by several hundred µs for half a minute.
   - Right after a node joins, the error is larger while the drift estimate settles.
 - **Roles.** `timeSync.role` (or `setTimeRole()` at runtime, without a restart) says what a node does:
@@ -404,7 +405,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `channel.follow`, `channel.findAnchor`, `channel.anchor` | true, false, false | Channel following (see above) |
 | `channel.searchAfterMs`, `channel.dwellMs`, `channel.retryMs`, `channel.channels` | 2000, 250, 15000, 1–13 | Channel search timing |
 | `security.key`, `security.requireAuthentication`, `security.pairingCode`, `persistSecurityKey` | none, true, "", true | Security (see above) |
-| `enableTimeSync`, `timeSync.role`, `timeSync.intervalMs`, `timeSync.takeoverAfterMs` | true, Follow, 5000, 5000 | Network time (see above) |
+| `enableTimeSync`, `timeSync.role`, `timeSync.intervalMs`, `timeSync.takeoverAfterMs`, `timeSync.calibrationIntervalMs` | true, Follow, 5000, 5000, 10000 | Network time (see above) |
 | `enableStreams` | true | Streams (see above) |
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |

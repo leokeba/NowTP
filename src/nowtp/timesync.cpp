@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "timesync.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include <algorithm>
@@ -23,6 +24,13 @@ constexpr size_t kResponseSize = 37;      // with the previous response's send t
 constexpr size_t kBasicResponseSize = 27; // from responders without send times
 constexpr uint8_t kNoIndex = 0xFF;
 constexpr uint8_t kMinStamped = 3;        // stamped exchanges a round needs to use them
+constexpr size_t kCalibrationSize = 8;    // type | round | stamped | offset (int32) | pad
+constexpr uint32_t kMinCalibrationMs = 5000;     // per follower, whatever it asks
+constexpr uint32_t kCalibrationGapMs = 1000;     // between calibration rounds, at the reference
+constexpr uint32_t kRequesterTimeoutMs = 30000;  // a follower not heard for this long isn't measured
+constexpr int32_t kMaxBiasUs = 2000;             // implied biases beyond are discarded
+constexpr uint8_t kMinCalibrations = 3;          // measurements before the first correction
+constexpr int32_t kMaxBiasStepUs = 10;           // later corrections move by at most this much
 
 inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
@@ -58,6 +66,8 @@ const char* toString(TimeRole role) {
 }
 
 constexpr size_t TimeSync::kMaxExchanges;
+constexpr size_t TimeSync::kMaxAnswers;
+constexpr size_t TimeSync::kMaxCalibrations;
 
 TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& config, const Mac& localMac)
     : engine_(engine),
@@ -72,6 +82,7 @@ TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& con
     offers_.reserve(kMaxOffers);
     if (config_.intervalMs < kFastIntervalMs) config_.intervalMs = kFastIntervalMs;
     acting_ = role_ == TimeRole::Reference;
+    for (Answer& a : answers_) a = Answer();  // a member array isn't zeroed by itself
 }
 
 TimeSync::~TimeSync() {
@@ -224,8 +235,13 @@ void TimeSync::act(bool acting, uint32_t now) {
     roundActive_ = false;
     if (acting) {
         // Keeps serving the network time it had: the estimate, extrapolated
-        // with the drift and no longer updated (none: the local clock).
+        // with the drift and no longer updated (none: the local clock), its
+        // calibration included.
         haveRef_ = false;
+        base_ -= bias_;
+        bias_ = 0;
+        biasSet_ = false;
+        impliedCount_ = 0;
         return;
     }
     // What it served as the network time is where its estimate starts.
@@ -266,6 +282,9 @@ void TimeSync::switchTo(const Mac& mac, uint32_t now) {
     ref_ = mac;
     refStamps_ = false;
     carried_ = haveEstimate_;
+    // The correction stays until the new reference's measurements replace it.
+    biasSet_ = false;
+    impliedCount_ = 0;
     samples_.clear();
     rounds_ = 0;
     rejected_ = 0;
@@ -285,6 +304,9 @@ void TimeSync::forget() {
     rejected_ = 0;
     lastRtt_ = 0;
     roundActive_ = false;
+    bias_ = 0;
+    biasSet_ = false;
+    impliedCount_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,9 +316,25 @@ void TimeSync::tick(uint32_t now) {
     now_ = now;
     if (!running_) return;
     evaluate(now);  // a candidate's takeover is due by time
-    if (acting_ || role_ == TimeRole::Off || !haveRef_) return;
+    if (role_ == TimeRole::Off || (!acting_ && !haveRef_)) return;
     if (!roundActive_) {
         if (!reached(now, nextRoundAt_)) return;
+        if (acting_) {
+            // The reference measures its followers that asked, in turn: a
+            // round in the other direction (see calibrate()).
+            Answer* due = nullptr;
+            for (Answer& a : answers_) {
+                if (!a.used || !a.calibrateEveryMs || !reached(now, a.nextCalibrationMs)) continue;
+                if (reached(now, a.lastMs + kRequesterTimeoutMs)) continue;
+                if (!due || static_cast<int32_t>(a.nextCalibrationMs - due->nextCalibrationMs) < 0) due = &a;
+            }
+            if (!due) {
+                nextRoundAt_ = now + 100;
+                return;
+            }
+            due->nextCalibrationMs = now + due->calibrateEveryMs;
+            peer_ = due->to;
+        }
         roundActive_ = true;
         round_++;
         sent_ = 0;
@@ -310,8 +348,8 @@ void TimeSync::tick(uint32_t now) {
 }
 
 void TimeSync::sendRequest(uint32_t now) {
-    // type | round | index | t1 (8), padded to the response's length: both
-    // directions then take the same air time.
+    // type | round | index | t1 (8) | calibration interval (s; 0: none), padded
+    // to the response's length: both directions then take the same air time.
     uint8_t msg[kRequestSize];
     memset(msg, 0, sizeof(msg));
     msg[0] = kRequest;
@@ -319,8 +357,12 @@ void TimeSync::sendRequest(uint32_t now) {
     msg[2] = sent_;
     uint64_t t1 = clock_();
     putU64(msg + 3, t1);
+    if (!acting_ && config_.calibrationIntervalMs) {
+        uint32_t s = (config_.calibrationIntervalMs + 999) / 1000;
+        msg[11] = static_cast<uint8_t>(s > 255 ? 255 : s);
+    }
     uint32_t id = 0;
-    Status st = engine_.send(ref_, kTimeSyncPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now, &id);
+    Status st = engine_.send(target(), kTimeSyncPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now, &id);
     if (st == Status::QueueFull) {
         nextSampleAt_ = now + 2;
         return;
@@ -339,7 +381,7 @@ void TimeSync::sendRequest(uint32_t now) {
 // differ between the two directions; what remains is the same on both sides
 // (the driver's reporting and receive latencies) and cancels out.
 void TimeSync::onSent(const Mac& dst, uint32_t messageId, uint64_t sentUs) {
-    if (roundActive_ && haveRef_ && dst == ref_) {
+    if (roundActive_ && (acting_ || haveRef_) && dst == target()) {
         for (uint8_t i = 0; i < sent_; ++i) {
             if (exchanges_[i].requestId != messageId) continue;
             exchanges_[i].sentUs = sentUs;
@@ -364,18 +406,27 @@ void TimeSync::handle(const Message& m) {
         // (or the one we serve). A node set to synchronize with us thereby
         // joins the same network time.
         bool chained = synced();
-        // The previous response to this requester, whose send time we now know.
+        // The previous response to this requester, whose send time we now
+        // know. A new one takes the slot heard from least recently.
         Answer* slot = nullptr;
         for (Answer& a : answers_) {
-            if (a.to == m.src) slot = &a;
+            if (a.used && a.to == m.src) slot = &a;
         }
         if (!slot) {
-            slot = &answers_[nextAnswer_];
-            nextAnswer_ = static_cast<uint8_t>((nextAnswer_ + 1) % kMaxAnswers);
+            for (Answer& a : answers_) {
+                if (!slot || !a.used || (slot->used && static_cast<int32_t>(a.lastMs - slot->lastMs) < 0)) slot = &a;
+                if (!slot->used) break;
+            }
             *slot = Answer();
+            slot->used = true;
             slot->to = m.src;
             slot->index = kNoIndex;
+            slot->nextCalibrationMs = now_ + 2000;
         }
+        slot->lastMs = now_;
+        // Calibration rounds asked for, served while we act as the reference.
+        uint32_t every = m.len >= 12 ? static_cast<uint32_t>(d[11]) * 1000 : 0;
+        slot->calibrateEveryMs = every ? std::max(every, kMinCalibrationMs) : 0;
         // type | round | index | t1 (echoed) | t2 | t3 | previous round | index | its send time
         uint8_t out[kResponseSize];
         out[0] = kResponse;
@@ -397,9 +448,15 @@ void TimeSync::handle(const Message& m) {
         if (st != Status::Ok) slot->index = kNoIndex;
         return;
     }
+    if (d[0] == kCalibration) {
+        // The reference measured our network time against its own.
+        if (m.len < kCalibrationSize || acting_ || !haveRef_ || m.src != ref_ || !synced()) return;
+        calibrate(static_cast<int32_t>(wire::getU32(d + 3)));
+        return;
+    }
     if (d[0] != kResponse || m.len < kBasicResponseSize) return;
     uint64_t t4 = m.timestampUs ? m.timestampUs : clock_();
-    if (!roundActive_ || !haveRef_ || m.src != ref_ || d[1] != round_) return;
+    if (!roundActive_ || (!acting_ && !haveRef_) || m.src != target() || d[1] != round_) return;
     if (m.len >= kResponseSize && d[27] == round_ && d[28] < sent_) {
         exchanges_[d[28]].answerSentUs = getU64(d + 29);
         refStamps_ = true;
@@ -453,6 +510,10 @@ void TimeSync::endRound(uint32_t now) {
         offsets[n++] = (static_cast<int64_t>(e.t2 - e.sentUs) + static_cast<int64_t>(e.answerSentUs - e.t4)) / 2;
         sumLocal += static_cast<int64_t>((e.sentUs + e.t4) / 2 - base);
     }
+    if (acting_) {
+        endCalibration(n ? median(offsets, n) : 0, n, now);
+        return;
+    }
     if (n < kMinStamped && refStamps_) {
         // Mixing in queue-time rounds, biased differently, would make the
         // estimate jump between the two: try again shortly instead.
@@ -484,6 +545,52 @@ void TimeSync::endRound(uint32_t now) {
     uint64_t local = base + static_cast<uint64_t>(sumLocal / static_cast<int64_t>(n));
     bool taken = addSample(local, median(offsets, n), fastest);
     nextRoundAt_ = now + (!taken || rounds_ < kFastRounds ? kFastIntervalMs : config_.intervalMs);
+}
+
+// A calibration round, run while acting: the follower answered in its
+// network time, so the offset is its network time minus our local clock.
+void TimeSync::endCalibration(int64_t offsetUs, size_t stamped, uint32_t now) {
+    nextRoundAt_ = now + kCalibrationGapMs;
+    if (stamped < kMinStamped) return;
+    // Ours is the network time: local plus the estimate we serve (if any).
+    int64_t diff = offsetUs - servedAt(clock_());
+    if (diff > INT32_MAX || diff < INT32_MIN) return;
+    uint8_t msg[kCalibrationSize];
+    memset(msg, 0, sizeof(msg));
+    msg[0] = kCalibration;
+    msg[1] = round_;
+    msg[2] = static_cast<uint8_t>(stamped);
+    wire::putU32(msg + 3, static_cast<uint32_t>(static_cast<int32_t>(diff)));
+    engine_.send(peer_, kTimeSyncPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now);
+}
+
+// The reference measured our network time minus its own: `reportedUs`. What
+// is left of the drivers' delays after send-time stamps depends on which side
+// asks, by some b: our rounds put b into our estimate, and the reference's
+// round, in the other direction, measures that error plus b again. With our
+// correction c applied, it reports 2b - c, so b = (report + c) / 2. The
+// median over recent reports becomes the correction.
+void TimeSync::calibrate(int32_t reportedUs) {
+    int32_t implied = static_cast<int32_t>((static_cast<int64_t>(reportedUs) + bias_) / 2);
+    if (implied > kMaxBiasUs || implied < -kMaxBiasUs) return;
+    implied_[impliedNext_] = implied;
+    impliedNext_ = static_cast<uint8_t>((impliedNext_ + 1) % kMaxCalibrations);
+    if (impliedCount_ < kMaxCalibrations) impliedCount_++;
+    if (impliedCount_ < kMinCalibrations) return;
+    int64_t v[kMaxCalibrations];
+    for (uint8_t i = 0; i < impliedCount_; ++i) v[i] = implied_[i];
+    int32_t target = static_cast<int32_t>(median(v, impliedCount_));
+    if (!biasSet_) {
+        bias_ = target;  // the first correction applies at once
+        biasSet_ = true;
+        return;
+    }
+    // Then gently: single rounds spread over ~50 µs, and a step in network
+    // time disturbs whatever was scheduled on it.
+    int32_t step = (target - bias_) / 4;
+    if (step > kMaxBiasStepUs) step = kMaxBiasStepUs;
+    if (step < -kMaxBiasStepUs) step = -kMaxBiasStepUs;
+    bias_ += step;
 }
 
 bool TimeSync::addSample(uint64_t localUs, int64_t offsetUs, uint32_t rttUs) {
@@ -568,14 +675,14 @@ bool TimeSync::synced() const {
 }
 
 uint64_t TimeSync::toNetwork(uint64_t localUs) const {
-    return localUs + static_cast<uint64_t>(offsetAt(localUs));
+    return localUs + static_cast<uint64_t>(servedAt(localUs));
 }
 
 uint64_t TimeSync::toLocal(uint64_t networkUs) const {
     if (!haveEstimate_) return networkUs;
     // The offset barely changes over the gap, so evaluating it near the answer is exact enough.
     uint64_t guess = networkUs - static_cast<uint64_t>(base_);
-    return networkUs - static_cast<uint64_t>(offsetAt(guess));
+    return networkUs - static_cast<uint64_t>(servedAt(guess));
 }
 
 TimeSyncStatus TimeSync::status() const {
@@ -586,9 +693,11 @@ TimeSyncStatus TimeSync::status() const {
     s.synced = synced();
     s.reference = acting_ ? self_ : ref_;
     uint64_t now = clock_();
-    s.offsetUs = offsetAt(now);
+    s.offsetUs = servedAt(now);
     s.driftPpm = static_cast<float>(drift_ * 1e6);
     s.rounds = rounds_;
+    s.calibrationUs = bias_;
+    s.calibrations = impliedCount_;
     if (!acting_) {
         s.roundTripUs = lastRtt_;
         s.ageMs = haveEstimate_ ? static_cast<uint32_t>((now - lastSyncLocal_) / 1000) : 0;

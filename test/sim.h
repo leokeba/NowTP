@@ -211,6 +211,9 @@ public:
     uint32_t failLatencyMs = 100;
     /// Return true to drop a specific frame (applied before random loss).
     std::function<bool(const Frame&)> dropIf;
+    /// Extra milliseconds before a specific frame is delivered, after its
+    /// "sent" report: an asymmetry that send-time stamps can't see.
+    std::function<uint32_t(const Frame&)> deliveryDelayMs;
     /// Rate/power-dependent delivery (default: always).
     LinkModel linkModel;
     /// RSSI seen by `to` for a frame from `from` (default: -60 dBm + power).
@@ -245,6 +248,7 @@ public:
 
         bool ok = true;
         uint32_t onAir = now_ + nodes_[from]->txQueueMs;  // when the frame leaves
+        uint32_t arrives = onAir + 1 + (deliveryDelayMs ? deliveryDelayMs(f) : 0);
         const SimRadio& tx = nodes_[from]->radio;
         nowtp::PhyRate rate = tx.rateFor(dst);
         if (!nodes_[from]->online) {
@@ -253,7 +257,7 @@ public:
             for (size_t i = 0; i < nodes_.size(); ++i) {
                 if (i == from || !hears(from, i, rate)) continue;
                 if (forced || chance(airLoss) || chance(appLoss)) continue;
-                schedule(Event{onAir + 1, Event::Deliver, i, from, f.data, true, rssi(from, i)});
+                schedule(Event{arrives, Event::Deliver, i, from, f.data, true, rssi(from, i)});
             }
         } else {
             size_t to = find(dst);
@@ -261,7 +265,7 @@ public:
             if (!reachable || chance(airLoss)) {
                 ok = false;
             } else {
-                if (!forced && !chance(appLoss)) schedule(Event{onAir + 1, Event::Deliver, to, from, f.data, true, rssi(from, to)});
+                if (!forced && !chance(appLoss)) schedule(Event{arrives, Event::Deliver, to, from, f.data, true, rssi(from, to)});
                 // The receiver's MAC acknowledgement must make it back.
                 if (chance(macAckLoss) || !hears(to, from, nowtp::PhyRate::B1M)) ok = false;
             }
