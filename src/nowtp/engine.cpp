@@ -212,6 +212,7 @@ Status Engine::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t 
 // The payload is `data`, copied, or the first `len` bytes of `owned`.
 Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
                      const SendOptions& options, CompletionHandler done, uint32_t now, uint32_t* messageId) {
+    now_ = now;
     if (options.reliable && dst.isBroadcast()) return Status::InvalidArgument;
     if (len > config_.maxMessageSize) return Status::TooLarge;
     size_t peerLimit = peerMessageLimit(dst);
@@ -451,6 +452,7 @@ Engine::Backoff* Engine::backoff(const Mac& dst) {
 }
 
 void Engine::onFrameSent(bool delivered, uint32_t now, uint64_t sentUs) {
+    now_ = now;
     frameSent(delivered, now, sentUs);
     pump(now);
     flushCompletions();
@@ -568,6 +570,7 @@ void Engine::reseal(const Mac& dst) {
 }
 
 void Engine::tick(uint32_t now) {
+    now_ = now;
     if (inflight_.active && reached(now, inflight_.deadline)) {
         frameSent(false, now, 0);  // the radio never reported back; treat as lost
     }
@@ -608,6 +611,21 @@ void Engine::tick(uint32_t now) {
 
     pump(now);
     flushCompletions();
+}
+
+// What tick() checks, as times. Sending needs no tick while a frame is in
+// flight (its report pumps the next one) or nothing is pending.
+void Engine::nextTick(Deadline& d) const {
+    if (inflight_.active) d.at(inflight_.deadline);
+    bool pending = controlCount_ > 0;
+    for (const auto& t : tx_) {
+        d.at(t->deadline);
+        if (t->awaitingAck) d.at(t->ackDeadline);
+        pending = pending || t->hasPendingFrame();
+    }
+    if (pending && !inflight_.active) d.at(linkBusy_ ? linkBusyUntil_ : d.now());
+    for (const Backoff& b : backoffs_) d.at(b.retryAt);  // forgotten then, if idle
+    for (const auto& r : rx_) d.at(r->lastActivity + config_.rxTimeoutMs);
 }
 
 void Engine::cancelAll(Status reason) {
@@ -728,6 +746,7 @@ Engine::Auth Engine::authorize(const Mac& src, uint8_t port, uint8_t flags, cons
 
 void Engine::onFrameReceived(const Mac& src, const uint8_t* data, size_t len, uint32_t now, int8_t rssi,
                              uint64_t timestampUs) {
+    now_ = now;
     stats_.framesReceived++;
     rxRssi_ = rssi;
     rxTimeUs_ = timestampUs;

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "callback.h"
+#include "deadline.h"
 #include "heap.h"
 #include "link.h"
 #include "table.h"
@@ -150,6 +151,14 @@ public:
 
     /// Drives timeouts and retransmissions.
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next to `d`: a frame the radio never
+    /// reported, an ack timeout, a message deadline, a send to retry. Frames
+    /// received and sent bring their own work; nothing is added for them.
+    void nextTick(Deadline& d) const;
+    /// The time passed to the latest call into the engine: during a callback,
+    /// the time of the event that triggered it. Services timestamp what their
+    /// handlers do with it, however long ago their own tick() ran.
+    uint32_t now() const { return now_; }
 
     /// Sees every received frame before filtering (other network ids, other
     /// protocol versions, non-NowTP ESP-NOW traffic). For diagnostics; one at a time.
@@ -361,6 +370,7 @@ private:
     uint32_t linkBusyUntil_ = 0;
     bool pumping_ = false;
     bool flushing_ = false;
+    uint32_t now_ = 0;   // see now()
     int8_t rxRssi_ = 0;  // RSSI of the frame being processed
     uint64_t rxTimeUs_ = 0;
     Callback<void(const FrameInfo&)> observer_;

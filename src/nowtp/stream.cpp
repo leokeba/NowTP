@@ -25,6 +25,8 @@ inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
 }
 
+constexpr uint32_t kRetryMs = 5;  // a chunk the send queue (or the heap) refused
+
 SendOptions reliableWithin(uint32_t timeoutMs) {
     SendOptions o;
     o.reliable = true;
@@ -203,6 +205,7 @@ Status Streams::sendOffer(uint32_t id) {
     o->deadline = now_ + 2 * o->options.timeoutMs;  // the engine reports a lost offer first
     return engine_.send(o->dst, kStreamPort, o->offer.data(), o->offer.size(), reliableWithin(o->options.timeoutMs),
                         [this, id](Status s) {
+                            now_ = engine_.now();
                             Out* x = findOut(id);
                             if (!x || x->phase != Out::Offering) return;
                             if (s == Status::Ok) {
@@ -228,6 +231,7 @@ Status Streams::cancel(uint32_t id, uint32_t now) {
 // `key`: the stream's tag, then the chunk's index (both 16 bits; only
 // `window` chunks are in flight, so the index can't be mistaken).
 void Streams::chunkDone(uint32_t key, Status s) {
+    now_ = engine_.now();
     Out* o = nullptr;
     for (auto& x : out_) {
         if (x->tag == key >> 16) o = x.get();
@@ -266,6 +270,7 @@ void Streams::pump(uint32_t id) {
             o->endAttempts++;
             Status st = engine_.send(o->dst, kStreamPort, end, sizeof(end), reliableWithin(o->options.timeoutMs),
                                      [this, id](Status s) {
+                                         now_ = engine_.now();
                                          Out* x = findOut(id);
                                          if (!x) return;
                                          if (s == Status::Ok) {
@@ -379,6 +384,7 @@ void Streams::finishIn(const Mac& src, uint32_t id, Status status) {
 }
 
 void Streams::handle(const Message& m) {
+    now_ = engine_.now();  // our last tick() may be long past
     if (m.len < 5) return;
     const uint8_t* d = m.data;
     uint32_t id = getU32(d + 1);
@@ -538,6 +544,24 @@ void Streams::handle(const Message& m) {
         }
         default: return;
     }
+}
+
+// Chunks go out as earlier ones are acknowledged, which brings a tick(); only
+// one the queue or the heap refused waits for one by time.
+void Streams::nextTick(Deadline& d) const {
+    if (!running_) return;
+    for (const auto& o : out_) {
+        if (o->phase == Out::Offering || o->endQueued) {
+            d.at(o->deadline);
+            continue;
+        }
+        bool more = o->confirmed == o->size && o->chunks.empty();  // the end, not queued
+        for (const Out::Chunk& c : o->chunks) more = more || !c.queued;
+        uint64_t span = o->chunks.empty() ? 0 : o->next - o->chunks.front().offset;
+        more = more || (o->next < o->size && span < static_cast<uint64_t>(o->options.window) * o->options.chunkSize);
+        if (more) d.in(kRetryMs);
+    }
+    for (const auto& i : in_) d.at(i->lastActivity + kIdleTimeoutMs);
 }
 
 void Streams::tick(uint32_t now) {

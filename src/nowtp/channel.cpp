@@ -72,6 +72,8 @@ void ChannelFollower::onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_
         for (size_t i = 0; i < peers_.size(); ++i) {
             if (peers_[i].mac == peer.mac) {
                 peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
+                // Present until now, however long ago tick() last saw it.
+                if (!anchorPresent()) okSince_ = now;
                 break;
             }
         }
@@ -186,6 +188,18 @@ void ChannelFollower::tick(uint32_t now) {
         return;
     }
     if (reached(now, okSince_ + config_.searchAfterMs) && reached(now, nextSearchAt_)) beginSearch(false, now);
+}
+
+void ChannelFollower::nextTick(Deadline& d) const {
+    if (!running_ || suspended_) return;
+    if (searching_) {
+        d.at(stepEnd_);
+        return;
+    }
+    bool wanted = hadAnchor_ || config_.findAnchor;
+    if (!free() || !wanted || anchorPresent()) return;
+    uint32_t at = okSince_ + config_.searchAfterMs;
+    d.at(static_cast<int32_t>(nextSearchAt_ - at) > 0 ? nextSearchAt_ : at);
 }
 
 }  // namespace nowtp

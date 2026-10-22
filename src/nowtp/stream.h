@@ -78,6 +78,8 @@ public:
     void start();
     void stop();
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next (timeouts, a chunk the queue refused).
+    void nextTick(Deadline& d) const;
 
     /// Starts sending `size` bytes to `dst`. `done` runs once with the outcome:
     /// Ok when the receiver confirmed the whole stream, Rejected if it refused

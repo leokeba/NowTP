@@ -322,7 +322,7 @@ void Security::ackTag(const Mac& acker, const Mac& ackee, const uint8_t* frame, 
 
 void Security::sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) {
     // Bound only for a sender that said it checks bound acks.
-    Peer* p = bind ? peer(dst, false, now_) : nullptr;
+    Peer* p = bind ? peer(dst, false, engine_.now()) : nullptr;
     ackTag(local_, dst, frame, len, p && (p->caps & kCapBoundAcks) ? bind : nullptr, tag);
 }
 
@@ -338,7 +338,7 @@ bool Security::openAck(const Mac& src, const uint8_t* frame, size_t len, const u
     }
     // Unbound: from receivers that predate bound acks, and for acks other
     // than "complete". A receiver that told us it binds must bind those.
-    Peer* p = peer(src, false, now_);
+    Peer* p = peer(src, false, engine_.now());
     bool complete = len > wire::kCommonHeaderSize &&
                     frame[wire::kCommonHeaderSize] == static_cast<uint8_t>(wire::AckStatus::Complete);
     if (!(complete && p && p->verified && (p->caps & kCapBoundAcks))) {
@@ -481,6 +481,7 @@ void Security::tick(uint32_t now) {
 }
 
 void Security::handle(const Message& m) {
+    now_ = engine_.now();  // our last tick() may be long past
     if (m.len < 1) return;
     const uint8_t* d = m.data;
     switch (d[0]) {

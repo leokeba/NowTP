@@ -1604,10 +1604,16 @@ struct DiagRig {
         diag.back()->setDiscovery(disc.back().get());
         Diagnostics* d = diag.back().get();
         Discovery* ds = disc.back().get();
-        net.tickers.push_back([d, ds](uint32_t now) {
-            d->tick(now);
-            ds->tick(now);
-        });
+        net.tickers.push_back(sim::Ticker(
+            [d, ds](uint32_t now) {
+                d->tick(now);
+                ds->tick(now);
+            },
+            [d, ds](Deadline& dl) {
+                d->nextTick(dl);
+                ds->nextTick(dl);
+            },
+            i));
         return i;
     }
     void startDiscovery() {
@@ -2094,7 +2100,8 @@ struct SecureRig {
         size_t i = net.addNode();
         sec.emplace_back();
         reboot(i, key, require, code);
-        net.tickers.push_back([this, i](uint32_t now) { sec[i]->tick(now); });
+        // No timers: what it does follows messages.
+        net.tickers.push_back(sim::Ticker([this, i](uint32_t now) { sec[i]->tick(now); }, [](Deadline&) {}, i));
         return i;
     }
     // A fresh Security object, as after a reboot: new epoch, no replay state.
@@ -2184,10 +2191,15 @@ TEST(secure_discovery_peer_is_kept_by_authenticated_traffic_only) {
     Discovery db(rig.net.engine(b), cfg, 250, [] { return 0u; });
     size_t lost = 0;
     da.onPeerEvent([&](PeerEvent e, const PeerInfo&) { lost += e == PeerEvent::Lost; });
-    rig.net.tickers.push_back([&](uint32_t now) {
-        da.tick(now);
-        db.tick(now);
-    });
+    rig.net.tickers.push_back(sim::Ticker(
+        [&](uint32_t now) {
+            da.tick(now);
+            db.tick(now);
+        },
+        [&](Deadline& d) {
+            da.nextTick(d);
+            db.nextTick(d);
+        }));
     da.start(rig.net.now());
     db.start(rig.net.now());
     rig.net.run(3000);
@@ -2826,10 +2838,15 @@ TEST(discovery_shares_message_limits) {
     Discovery ds(net.engine(small), dc, 250, random);
     dc.name = "big";
     Discovery db(net.engine(big), dc, 250, random);
-    net.tickers.push_back([&](uint32_t now) {
-        ds.tick(now);
-        db.tick(now);
-    });
+    net.tickers.push_back(sim::Ticker(
+        [&](uint32_t now) {
+            ds.tick(now);
+            db.tick(now);
+        },
+        [&](Deadline& d) {
+            ds.nextTick(d);
+            db.nextTick(d);
+        }));
     ds.start(net.now());
     db.start(net.now());
     net.run(100);
@@ -2886,10 +2903,16 @@ struct TimeRig {
         ts.emplace_back();
         roles.push_back(role);
         build(i);
-        net.tickers.push_back([this, i](uint32_t now) {
-            disc[i]->tick(now);
-            ts[i]->tick(now);
-        });
+        net.tickers.push_back(sim::Ticker(
+            [this, i](uint32_t now) {
+                disc[i]->tick(now);
+                ts[i]->tick(now);
+            },
+            [this, i](Deadline& d) {
+                disc[i]->nextTick(d);
+                if (ts[i]) ts[i]->nextTick(d);
+            },
+            i));
         return i;
     }
     size_t add(bool reference, uint64_t clockOffsetUs, double skew) {
@@ -3148,10 +3171,16 @@ TEST(timesync_calibration_ignores_whatever_memory_held) {
     rig.ts[ref].reset();
     rig.disc[ref]->onPeerEvent([dirty, &rig](PeerEvent e, const PeerInfo& p) { dirty->onPeerEvent(e, p, rig.net.now()); });
     dirty->setDiscovery(rig.disc[ref].get());
-    rig.net.tickers[ref] = [&rig, ref, dirty](uint32_t now) {
-        rig.disc[ref]->tick(now);
-        dirty->tick(now);
-    };
+    rig.net.tickers[ref] = sim::Ticker(
+        [&rig, ref, dirty](uint32_t now) {
+            rig.disc[ref]->tick(now);
+            dirty->tick(now);
+        },
+        [&rig, ref, dirty](Deadline& d) {
+            rig.disc[ref]->nextTick(d);
+            dirty->nextTick(d);
+        },
+        ref);
     rig.disc[ref]->start(rig.net.now());
     dirty->start(rig.net.now());
     rig.start(b);
@@ -3413,7 +3442,8 @@ struct StreamRig {
         size_t i = net.addNode(cfg);
         st.emplace_back(new Streams(net.engine(i), [this] { return static_cast<uint32_t>(rng()); }));
         st[i]->start();
-        net.tickers.push_back([this, i](uint32_t now) { st[i]->tick(now); });
+        net.tickers.push_back(
+            sim::Ticker([this, i](uint32_t now) { st[i]->tick(now); }, [this, i](Deadline& d) { st[i]->nextTick(d); }, i));
         return i;
     }
 };
@@ -3567,10 +3597,15 @@ TEST(stream_over_secured_link) {
     Streams sa(rig.net.engine(a), [] { return 77u; }), sb(rig.net.engine(b), [] { return 78u; });
     sa.start();
     sb.start();
-    rig.net.tickers.push_back([&](uint32_t now) {
-        sa.tick(now);
-        sb.tick(now);
-    });
+    rig.net.tickers.push_back(sim::Ticker(
+        [&](uint32_t now) {
+            sa.tick(now);
+            sb.tick(now);
+        },
+        [&](Deadline& d) {
+            sa.nextTick(d);
+            sb.nextTick(d);
+        }));
     sb.onIncoming(collectInto(r));
     sa.send(rig.net.mac(b), 50000,
             [&](uint32_t offset, uint8_t* buf, size_t n) {
@@ -3599,6 +3634,99 @@ TEST(engine_reports_receive_timestamps) {
 }
 
 // ---------------------------------------------------------------------------
+// Deadlines: when tick() has work next, so that a poller can sleep until then
+// (EspNowTransport::pollDelayMs()). NOWTP_SPARSE_TICKS=1 runs every test
+// ticking only then; these check that idle nodes do sleep.
+
+TEST(deadline_takes_the_earliest_time) {
+    Deadline d(1000);
+    CHECK(!d.set());
+    CHECK_EQ(d.delay(), UINT32_MAX);
+    CHECK_EQ(d.delay(250), 250u);
+    d.at(1500);
+    CHECK_EQ(d.delay(), 500u);
+    d.in(20);
+    d.at(1600);
+    CHECK_EQ(d.delay(), 20u);
+    d.at(900);  // already past: due now
+    CHECK_EQ(d.delay(), 0u);
+    Deadline w(0xFFFFFFF0u);
+    w.at(0x10);  // across the wrap
+    CHECK_EQ(w.delay(), 0x20u);
+}
+
+TEST(engine_reports_its_next_work) {
+    sim::Network net;
+    net.sparse = true;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    auto due = [&] {
+        Deadline d(net.now());
+        net.engine(a).nextTick(d);
+        return d;
+    };
+    CHECK(!due().set());
+
+    // Queued and sent at once: nothing for tick() while the frame is in flight but its timeout.
+    SendOptions reliable;
+    reliable.reliable = true;
+    uint8_t payload[600] = {};
+    Status result = Status::InvalidState;
+    CHECK(net.engine(a).send(net.mac(b), 1, payload, sizeof(payload), reliable, [&](Status s) { result = s; },
+                             net.now()) == Status::Ok);
+    CHECK_EQ(due().delay(), net.engine(a).config().frameSentTimeoutMs);
+    CHECK(net.runUntil([&] { return result != Status::InvalidState; }, 2000));
+    CHECK(result == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 1u);
+    CHECK(!due().set());
+
+    // An absent peer: retries back off, then the message fails; idle again afterwards.
+    net.node(b).online = false;
+    result = Status::InvalidState;
+    net.engine(a).send(net.mac(b), 1, payload, sizeof(payload), reliable, [&](Status s) { result = s; }, net.now());
+    size_t before = net.ticksRun;
+    CHECK(net.runUntil([&] { return result != Status::InvalidState; }, 10000));
+    CHECK(result == Status::SendFailed || result == Status::Timeout);
+    net.run(2000);
+    CHECK(!due().set());
+    CHECK(net.ticksRun - before < net.now() / 4);  // both engines, every ms: 2 per ms
+}
+
+TEST(handlers_stamp_with_the_events_time) {
+    // Services timestamp what a message does with the engine's time, not
+    // their last tick(), which a poller may have run long before.
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    DiscoveryConfig cfg;
+    Discovery da(net.engine(a), cfg, 250, [] { return 0u; });
+    Discovery db(net.engine(b), cfg, 250, [] { return 0u; });
+    da.start(net.now());  // never ticked again
+    db.start(net.now());
+    net.tickers.push_back([&](uint32_t now) { db.tick(now); });
+    net.run(5000);
+    const PeerInfo* p = da.find(net.mac(b));
+    CHECK(p != nullptr);
+    CHECK(p && static_cast<int32_t>(net.now() - p->lastSeenMs) < static_cast<int32_t>(cfg.announceIntervalMs * 2));
+}
+
+TEST(idle_services_sleep_between_their_timers) {
+    TimeRig rig;
+    rig.net.sparse = true;
+    size_t ref = rig.add(true, 5000000000ull, 0), b = rig.add(false, 1234567890ull, 20e-6);
+    rig.add(false, 777000000ull, -15e-6);
+    rig.start();
+    rig.net.run(30000);  // synchronized, past the fast first rounds
+    CHECK(rig.allSynced());
+    size_t run = rig.net.ticksRun, skipped = rig.net.ticksSkipped;
+    rig.net.run(60000);
+    CHECK(rig.allSynced());
+    CHECK(absValue(rig.error(b, ref)) < 2000);
+    run = rig.net.ticksRun - run;
+    skipped = rig.net.ticksSkipped - skipped;
+    std::printf("    3 nodes, 60 s idle: %zu of %zu ticks run\n", run, run + skipped);
+    CHECK(run * 20 < run + skipped);
+}
 
 // ---------------------------------------------------------------------------
 // Short heaps. Each test runs a scenario at every heap size from 0 to 24 KB

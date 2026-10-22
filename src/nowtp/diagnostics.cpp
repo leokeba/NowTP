@@ -23,6 +23,7 @@ constexpr uint32_t kAttemptWaitMs = 400;
 constexpr size_t kMaxCounters = 4;
 constexpr size_t kMaxScanNodes = 32;  // nodes a deep discovery reports
 constexpr float kCeilingRatio = 0.8f;
+constexpr uint32_t kRetryMs = 5;  // a burst frame the send queue refused
 
 inline int8_t toQuarter(float dbm) {
     return static_cast<int8_t>(dbm * 4.0f + (dbm >= 0 ? 0.5f : -0.5f));
@@ -215,6 +216,7 @@ void Diagnostics::restore(size_t slot) {
 }
 
 void Diagnostics::handle(const Message& m) {
+    now_ = engine_.now();  // our last tick() may be long past
     if (m.len < 3) return;
     const uint8_t* d = m.data;
     uint8_t type = d[0];
@@ -376,6 +378,19 @@ void Diagnostics::tick(uint32_t now) {
     if (burst_.completed >= burst_.perStep) {
         burst_.step++;
         burst_.stepReady = false;
+    }
+}
+
+// A burst moves on as its frames are reported sent, which brings a tick();
+// only a step to set up, or a frame the queue refused, needs one by time.
+void Diagnostics::nextTick(Deadline& d) const {
+    if (!burst_.active) return;
+    d.at(burst_.startedAt + 30001);
+    if (replyPowerOverrides_ > 0) return;
+    if (!burst_.stepReady) {
+        d.at(d.now());
+    } else if (burst_.sent < burst_.perStep && burst_.sent - burst_.completed < 2) {
+        d.in(kRetryMs);
     }
 }
 

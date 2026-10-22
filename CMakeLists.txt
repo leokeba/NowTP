@@ -40,4 +40,7 @@ if(NOWTP_BUILD_TESTS)
         endforeach()
     endif()
     add_test(NAME nowtp_tests COMMAND nowtp_tests)
+    # Again, ticking only what is due, as a poller sleeping on pollDelayMs() does.
+    add_test(NAME nowtp_tests_sparse COMMAND nowtp_tests)
+    set_tests_properties(nowtp_tests_sparse PROPERTIES ENVIRONMENT NOWTP_SPARSE_TICKS=1)
 endif()

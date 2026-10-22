@@ -347,6 +347,35 @@ void TimeSync::tick(uint32_t now) {
     if (reached(now, lastSentAt_ + kRoundGraceMs)) endRound(now);
 }
 
+void TimeSync::nextTick(Deadline& d) const {
+    if (!running_) return;
+    // The earliest a candidate takes over (later with others ahead of it).
+    if (role_ == TimeRole::Candidate && !explicitRef_ && !acting_ && !haveRef_ && vacant_) {
+        d.at(vacantSince_ + config_.takeoverAfterMs);
+    }
+    // What we announce changes when the estimate goes stale.
+    if (!acting_ && haveEstimate_) {
+        uint64_t age = clock_() - lastSyncLocal_;
+        uint64_t stale = static_cast<uint64_t>(config_.staleAfterMs) * 1000;
+        if (age < stale) d.in(static_cast<uint32_t>((stale - age + 999) / 1000));
+    }
+    if (role_ == TimeRole::Off || (!acting_ && !haveRef_)) return;
+    if (roundActive_) {
+        d.at(sent_ < config_.samples ? nextSampleAt_ : lastSentAt_ + kRoundGraceMs);
+        return;
+    }
+    if (!acting_) {
+        d.at(nextRoundAt_);
+        return;
+    }
+    // The reference runs rounds for the followers that asked to be measured.
+    for (const Answer& a : answers_) {
+        if (!a.used || !a.calibrateEveryMs) continue;
+        uint32_t at = static_cast<int32_t>(a.nextCalibrationMs - nextRoundAt_) > 0 ? a.nextCalibrationMs : nextRoundAt_;
+        if (static_cast<int32_t>(at - (a.lastMs + kRequesterTimeoutMs)) < 0) d.at(at);
+    }
+}
+
 void TimeSync::sendRequest(uint32_t now) {
     // type | round | index | t1 (8) | calibration interval (s; 0: none), padded
     // to the response's length: both directions then take the same air time.
@@ -397,6 +426,7 @@ void TimeSync::onSent(const Mac& dst, uint32_t messageId, uint64_t sentUs) {
 }
 
 void TimeSync::handle(const Message& m) {
+    now_ = engine_.now();  // our last tick() may be long past
     if (m.len < 1) return;
     const uint8_t* d = m.data;
     if (d[0] == kRequest) {

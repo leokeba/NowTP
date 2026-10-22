@@ -98,6 +98,8 @@ public:
     /// Asks every node in range to announce itself.
     void discover(uint32_t nowMs);
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next (announcements, replies, peers going quiet).
+    void nextTick(Deadline& d) const;
 
     void setMetadata(const uint8_t* data, size_t len, uint32_t nowMs);
     /// What this node announces about its radio; announced right away when it changes.

@@ -58,6 +58,8 @@ public:
     void start(uint32_t nowMs);
     void stop();
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next (a search step, a search to begin).
+    void nextTick(Deadline& d) const;
 
     /// Pauses following while something else moves the radio (deep discovery).
     void setSuspended(bool suspended, uint32_t nowMs);

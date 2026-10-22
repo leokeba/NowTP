@@ -188,6 +188,8 @@ public:
     void stop();
     /// Drives bursts requested by peers. Call with the engine's tick.
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next (a burst's next step).
+    void nextTick(Deadline& d) const;
     /// Used by deepDiscover() to query nodes.
     void setDiscovery(Discovery* discovery) { discovery_ = discovery; }
     /// A blocking procedure is running (it may move the radio to other channels).

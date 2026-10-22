@@ -3,6 +3,7 @@
 
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <random>
 #include <set>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "nowtp/diagnostics.h"
@@ -178,6 +180,33 @@ struct Node {
     }
 };
 
+/// Work run every simulated millisecond after the engines tick: services
+/// (discovery, diagnostics...) or the test's own. With `due`, it says when its
+/// work is next due, as the ESP-NOW transport asks before it lets a poller
+/// sleep; sparse ticking (sparseTicks()) then runs it only then, or when
+/// `node` (every node: SIZE_MAX) handled an event, as the transport does.
+struct Ticker {
+    template <class F, class = typename std::enable_if<
+                           !std::is_same<typename std::decay<F>::type, Ticker>::value>::type>
+    Ticker(F f) : tick(std::move(f)) {}
+    Ticker(std::function<void(uint32_t)> t, std::function<void(nowtp::Deadline&)> d, size_t n = SIZE_MAX)
+        : tick(std::move(t)), due(std::move(d)), node(n) {}
+    std::function<void(uint32_t)> tick;
+    std::function<void(nowtp::Deadline&)> due;  // empty: every millisecond
+    size_t node = SIZE_MAX;
+};
+
+/// NOWTP_SPARSE_TICKS=1: engines and tickers with a `due` run only when due
+/// or after an event of their node, as with EspNowTransport::pollDelayMs().
+/// Every test must pass that way too: a deadline reported late shows.
+inline bool sparseTicks() {
+    static const bool on = [] {
+        const char* v = std::getenv("NOWTP_SPARSE_TICKS");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
 /// Probability that a frame from node `from` reaches node `to`, given the
 /// sender's rate and power. Lets tests model weak boards and weak links.
 using LinkModel = std::function<double(size_t from, size_t to, nowtp::PhyRate rate, float powerDbm)>;
@@ -218,8 +247,12 @@ public:
     LinkModel linkModel;
     /// RSSI seen by `to` for a frame from `from` (default: -60 dBm + power).
     std::function<int(size_t from, size_t to, float powerDbm)> rssiModel;
-    /// Called every simulated millisecond after the engines tick (discovery, diagnostics...).
-    std::vector<std::function<void(uint32_t)>> tickers;
+    /// Run every simulated millisecond after the engines tick (see Ticker).
+    std::vector<Ticker> tickers;
+    /// Tick only what is due (see sparseTicks(), the default).
+    bool sparse = sparseTicks();
+    /// Engine and ticker ticks run and skipped (skipped only when sparse).
+    size_t ticksRun = 0, ticksSkipped = 0;
     /// Every frame handed to the radio, in order.
     std::vector<Frame> log;
 
@@ -285,9 +318,31 @@ public:
     void step() {
         Exempt own;
         now_++;
+        // What is due now, asked before this millisecond's events, as the
+        // transport asks before it sleeps; the events then wake their node.
+        due_.assign(nodes_.size(), !sparse);
+        tickerDue_.assign(tickers.size(), !sparse);
+        if (sparse) {
+            Counted counted;
+            for (size_t i = 0; i < nodes_.size(); ++i) {
+                nowtp::Deadline d(now_);
+                nodes_[i]->engine.nextTick(d);
+                due_[i] = d.set() && d.delay() == 0;
+            }
+            for (size_t i = 0; i < tickers.size(); ++i) {
+                nowtp::Deadline d(now_);
+                if (tickers[i].due) tickers[i].due(d);
+                tickerDue_[i] = !tickers[i].due || (d.set() && d.delay() == 0);
+            }
+        }
+        // The transport ticks everything of a node at once.
+        for (size_t i = 0; i < tickers.size(); ++i) {
+            if (tickerDue_[i] && tickers[i].node < due_.size()) due_[tickers[i].node] = true;
+        }
         while (!events_.empty() && events_.front().time <= now_) {
             Event e = events_.front();
             events_.pop_front();
+            due_[e.node] = true;
             Node& n = *nodes_[e.node];
             if (e.kind == Event::SendDone) {
                 n.link.inFlight = false;
@@ -301,8 +356,27 @@ public:
             }
         }
         Counted counted;
-        for (auto& n : nodes_) n->engine.tick(now_);
-        for (auto& t : tickers) t(now_);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!due_[i]) {
+                ticksSkipped++;
+                continue;
+            }
+            ticksRun++;
+            nodes_[i]->engine.tick(now_);
+        }
+        bool anyDue = false;
+        for (size_t i = 0; i < due_.size(); ++i) anyDue = anyDue || due_[i];
+        // Indexed: a ticker may add tickers (they run from the next millisecond).
+        for (size_t i = 0; i < tickerDue_.size(); ++i) {
+            size_t node = tickers[i].node;
+            bool woken = node == SIZE_MAX ? anyDue : node < due_.size() && due_[node];
+            if (!tickerDue_[i] && !woken) {
+                ticksSkipped++;
+                continue;
+            }
+            ticksRun++;
+            tickers[i].tick(now_);
+        }
     }
 
     void run(uint32_t ms) {
@@ -362,6 +436,7 @@ public:
 
 private:
     std::vector<std::unique_ptr<Node>> nodes_;
+    std::vector<bool> due_, tickerDue_;
     std::deque<Event> events_;
     std::mt19937 rng_;
     uint32_t now_ = 0;

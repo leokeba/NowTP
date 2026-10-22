@@ -193,6 +193,24 @@ void Discovery::tick(uint32_t now) {
     }
 }
 
+void Discovery::nextTick(Deadline& d) const {
+    if (!running_) return;
+    for (const PeerInfo& p : peers_) d.at(p.lastSeenMs + config_.peerTimeoutMs);
+    // The earliest announcement due, then no earlier than a retry allows.
+    bool due = false;
+    uint32_t at = 0;
+    auto consider = [&due, &at](uint32_t t) {
+        if (!due || static_cast<int32_t>(t - at) < 0) at = t;
+        due = true;
+    };
+    if (queryDue_ || announceDue_) consider(d.now());
+    if (replyDue_) consider(replyAt_);
+    if (config_.announceIntervalMs > 0) consider(nextAnnounce_);
+    if (!due) return;
+    if (retryPending_ && static_cast<int32_t>(at - retryAt_) < 0) at = retryAt_;
+    d.at(at);
+}
+
 bool Discovery::parse(const uint8_t* p, size_t len, Announcement& out) {
     if (!view(p, len, out)) return false;
     out.name.assign(out.nameData, out.nameLen);
@@ -238,6 +256,7 @@ bool Discovery::parseAnnouncement(const uint8_t* p, size_t len, std::string& nam
 // public std::string and std::vector, from operator new, which can't fail
 // softly: on a short heap the announcement is ignored (it comes again).
 void Discovery::handle(const Message& m) {
+    now_ = engine_.now();  // our last tick() may be long past
     Announcement a;
     if (!view(m.data, m.len, a)) return;
     // Held twice: in the table, and in the copy an event carries.

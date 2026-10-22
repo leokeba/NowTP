@@ -108,6 +108,9 @@ public:
     void start(uint32_t nowMs);
     void stop();
     void tick(uint32_t nowMs);
+    /// Adds when tick() has work next (rounds and their requests, a takeover,
+    /// the estimate going stale).
+    void nextTick(Deadline& d) const;
 
     /// Discovery events: picks the announced reference unless one was set.
     void onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_t nowMs);
