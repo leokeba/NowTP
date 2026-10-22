@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Manifests agree on the version
+        run: python3 scripts/version.py
       - name: Build and run tests (ASan + UBSan)
         run: |
           cmake -S . -B build
@@ -62,3 +64,20 @@ jobs:
           sketch-paths: examples/arduino
           libraries: |
             - source-path: ./
+
+  # Every push to main that passes becomes a release vX.Y.Z: a patch bump,
+  # or more with a "Release: minor" or "Release: major" trailer in a commit
+  # since the last tag. The version files are stamped in a commit only the
+  # tag points at; main never gets one.
+  release:
+    needs: [host-tests, esp-idf, arduino]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    uses: leokeba/TesserKIT/.github/workflows/firmware.yml@main
+    with:
+      version-command: jq -r .version library.json  # the floor: the first release is v0.5.0
+      stamp-command: python3 scripts/version.py "$VERSION"

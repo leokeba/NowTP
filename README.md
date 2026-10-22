@@ -537,6 +537,10 @@ A seventh phase covers:
 
 The tests contain no board-specific values. A board that can't sustain full power is handled by the library's own fallback and diagnosis, and that same code runs on every pair. Run the pair test with only the two boards under test running NowTP, and erase or power down the others: stray nodes running the same test firmware would confuse its sync.
 
+### Releases
+
+Every push to `main` that passes CI becomes a release `vX.Y.Z`, with a tag and a GitHub release. A release is a patch bump unless a commit since the last tag ends its message with a `Release: minor` or `Release: major` trailer; the largest wins. Nobody edits the version by hand: the release job runs `scripts/version.py X.Y.Z` on a commit that only the tag points at, so the manifests (`library.json`, `library.properties`, `idf_component.yml`) state the tag's version there, while `main` keeps the last version set on purpose. CI checks with `python3 scripts/version.py` that the manifests agree. TesserKIT's reusable workflow does the numbering, tagging and notes.
+
 ## Roadmap
 
 - Continuous per-peer rate adaptation from MAC-level acknowledgements (today `optimizeLink()` tunes on demand)
