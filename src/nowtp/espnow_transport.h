@@ -157,7 +157,8 @@ struct EspNowConfig {
     /// With runTask false: called whenever poll() has new work, so that the
     /// application can wake the task that polls (e.g. with xTaskNotifyGive()).
     /// That is when a frame arrived or the radio reported one sent (called in
-    /// the Wi-Fi driver's task), and when a call into NowTP from any task may
+    /// the Wi-Fi driver's task), when Wi-Fi changed mode (in the event loop's
+    /// task), and when a call into NowTP from any task may
     /// have given it work (called in that task, once NowTP's lock is released).
     /// Always task context, never an ISR. Keep it short, don't block in it and
     /// don't call NowTP from it.
@@ -184,7 +185,9 @@ struct RadioInfo {
     bool longRange = false;  ///< Long Range mode enabled on the interface.
     float txPowerLimitDbm = 0;     ///< Highest power the driver accepts on this chip.
     float learnedTxCeilingDbm = 0; ///< Power found to work by fallback or optimize() (0: none).
-    wifi_interface_t interface = WIFI_IF_STA;  ///< Interface ESP-NOW peers are bound to.
+    /// Interface ESP-NOW peers are bound to: the station's while it runs, else
+    /// the soft-AP's. Followed when Wi-Fi changes mode (see EspNowTransport).
+    wifi_interface_t interface = WIFI_IF_STA;
     bool stationConnected = false;             ///< Connected to an AP (channel follows it).
     bool softApActive = false;                 ///< Running a soft-AP (channel follows it).
     bool wifiStartedByNowTP = false;           ///< NowTP initialized/started Wi-Fi and will stop it.
@@ -193,7 +196,12 @@ struct RadioInfo {
 /// NowTP over the ESP-NOW driver, for both ESP-IDF and Arduino-ESP32.
 ///
 /// begin() works with whatever Wi-Fi state the application left: nothing set
-/// up, station (connected or not), soft-AP or both. Only one instance can be
+/// up, station (connected or not), soft-AP or both. The application may change
+/// the mode later: ESP-NOW then moves to the interface that runs (the
+/// station's, else the soft-AP's), within a few milliseconds of the event, or
+/// 250 ms without the default event loop. Peers address a node by the MAC
+/// of that interface, so this node's address (localMac()) changes with it:
+/// a soft-AP's MAC is the station's + 1. Only one instance can be
 /// active, since ESP-NOW has a single pair of driver callbacks. Receive and
 /// completion callbacks run in the NowTP task (or inside poll()), never in the
 /// Wi-Fi driver task; keep them short.
@@ -396,6 +404,7 @@ private:
     Status applyPeerRate(const Mac& mac);
     void releaseRadio();
     static void wifiEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data);
+    void followInterface();
     bool stationConnected() const;
     void handlePeerEvent(PeerEvent event, const PeerInfo& peer);
     class Host;
@@ -478,6 +487,7 @@ private:
         int8_t txPowerQuarterDbm = 0;
         bool protocol = false;
         uint8_t protocolBitmap = 0;
+        wifi_interface_t protocolInterface = WIFI_IF_STA;
         bool country = false;
         char countryCode[4] = {0, 0, 0, 0};  // the driver returns two letters plus an environment byte
     } saved_;
@@ -503,6 +513,7 @@ private:
     // warning on every call while the station is not associated.
     esp_event_handler_instance_t wifiEvents_ = nullptr;
     std::atomic<bool> staConnected_{false};
+    std::atomic<bool> modeChanged_{false};  // a Wi-Fi event may have changed the interface to use
     bool ratesChanged_ = false;
 };
 

@@ -549,6 +549,33 @@ void radioSettingsRestored() {
     ESP_ERROR_CHECK(esp_wifi_deinit());
 }
 
+// The application drops its soft-AP for the station: ESP-NOW moves along.
+void interfaceFollowsWifiMode() {
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    Status st = transport.begin();
+    uint8_t x[20] = {};
+    bool onAp = st == Status::Ok && transport.radioInfo().interface == WIFI_IF_AP &&
+                transport.sendAndWait(kAbsent, 1, x, sizeof(x)) == Status::SendFailed;  // a peer bound to the AP
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    uint8_t sta[6] = {};
+    esp_wifi_get_mac(WIFI_IF_STA, sta);
+    nowtp::RadioInfo r = transport.radioInfo();
+    Status bcast = transport.sendAndWait(Mac::broadcast(), 1, x, sizeof(x));
+    Status unicast = transport.sendAndWait(kAbsent, 1, x, sizeof(x));  // fails on air, not in the driver
+    report("interface_follows_wifi_mode",
+           onAp && r.interface == WIFI_IF_STA && !r.softApActive && transport.localMac() == Mac::from(sta) &&
+               bcast == Status::Ok && unicast == Status::SendFailed,
+           fmt("(%s, on AP %d, interface %d, broadcast %s, unicast %s)", nowtp::toString(st), onAp, r.interface,
+               nowtp::toString(bcast), nowtp::toString(unicast)));
+    transport.end();
+    esp_wifi_stop();
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+}
+
 // Diagnostics features that need no peer.
 void diagnosticsAlone() {
     Status st = transport.begin();
@@ -607,6 +634,7 @@ extern "C" void app_main() {
 
     radioSetupModes();
     radioSettingsRestored();
+    interfaceFollowsWifiMode();
     startWifi();
     printf("INFO free heap after Wi-Fi start %lu\n", (unsigned long)esp_get_free_heap_size());
     rawDriverLatency();

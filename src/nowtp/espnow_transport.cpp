@@ -272,6 +272,7 @@ void onSent(const uint8_t* mac, esp_now_send_status_t status) {
 class EspNowTransport::PeerDriver : public PeerTable::Driver {
 public:
     explicit PeerDriver(wifi_interface_t interface) : interface_(interface) {}
+    void setInterface(wifi_interface_t interface) { interface_ = interface; }
     Result add(const Mac& mac) override {
         esp_err_t err = addPlainPeer(mac, interface_);
         if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST) return Result::Ok;
@@ -668,7 +669,7 @@ uint32_t EspNowTransport::pollDelayMs() const {
     lock();
     // Frames or a "sent" report waiting (more than one poll() takes, or new).
     if (s_received.load(std::memory_order_acquire) != taken_ ||
-        s_sent.count.load(std::memory_order_acquire) != sentSeen_) {
+        s_sent.count.load(std::memory_order_acquire) != sentSeen_ || modeChanged_.load()) {
         unlock(false);
         return 0;
     }
@@ -715,6 +716,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
         }
     }
     lock();
+    if (modeChanged_.exchange(false)) followInterface();
     checkSent();
     // Bounded batch so timers still run under a flood of frames.
     int n = 0;
@@ -1084,6 +1086,62 @@ void EspNowTransport::wifiEventHandler(void* arg, esp_event_base_t base, int32_t
     } else if (id == WIFI_EVENT_STA_DISCONNECTED || id == WIFI_EVENT_STA_STOP) {
         self->staConnected_ = false;
     }
+    if (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_STOP || id == WIFI_EVENT_AP_START ||
+        id == WIFI_EVENT_AP_STOP) {
+        self->modeChanged_ = true;  // the NowTP task looks at the mode
+        wakeTask();
+    }
+}
+
+// ESP-NOW sends through one interface: the station's while it runs, else the
+// soft-AP's. Peers stay bound to the one they were added on, and frames to them
+// fail once it stops, so they all move when the application changes the mode
+// (drops a fallback soft-AP, starts the station, or the reverse). Our address
+// is that interface's MAC, so it changes too. NowTP task, lock held.
+void EspNowTransport::followInterface() {
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) return;
+    radio_.softApActive = mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA;
+    wifi_interface_t want = mode == WIFI_MODE_AP ? WIFI_IF_AP : WIFI_IF_STA;
+    if (want == interface_) return;
+    wifi_interface_t old = interface_;
+    uint8_t bitmap = 0;
+    bool lr = esp_wifi_get_protocol(old, &bitmap) == ESP_OK && (bitmap & WIFI_PROTOCOL_LR) != 0;
+    interface_ = radio_.interface = want;
+    peerDriver_->setInterface(want);
+
+    // Collected first: modifying peers while fetching them is not documented as safe.
+    Mac macs[ESP_NOW_MAX_TOTAL_PEER_NUM + 1];
+    size_t n = 0;
+    macs[n++] = Mac::broadcast();  // which esp_now_fetch_peer() skips
+    esp_now_peer_info_t peer;
+    for (bool first = true; n < ESP_NOW_MAX_TOTAL_PEER_NUM + 1 && esp_now_fetch_peer(first, &peer) == ESP_OK;
+         first = false) {
+        macs[n++] = Mac::from(peer.peer_addr);
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (esp_now_get_peer(macs[i].bytes, &peer) != ESP_OK) continue;
+        peer.ifidx = want;
+        esp_err_t err = esp_now_mod_peer(&peer);
+        if (err != ESP_OK) ESP_LOGW(kTag, "moving a peer to the new interface: %s", esp_err_to_name(err));
+        applyPeerRate(macs[i]);
+    }
+    // Long Range and (before ESP-IDF 5.1) the rate are set per interface. The
+    // new interface's protocols aren't restored by end(): only the first one's.
+    if (lr && esp_wifi_get_protocol(want, &bitmap) == ESP_OK && !(bitmap & WIFI_PROTOCOL_LR)) {
+        esp_wifi_set_protocol(want, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+    }
+#if !defined(NOWTP_PER_PEER_RATE)
+    PhyRate global = config_.radio.unicastRate != PhyRate::Default ? config_.radio.unicastRate
+                                                                   : config_.radio.broadcastRate;
+    if (global != PhyRate::Default) esp_wifi_config_espnow_rate(want, rateInfo(global).rate);
+#endif
+    Mac self = localMac();
+    if (security_) security_->setLocalMac(self);
+    if (timeSync_) timeSync_->setLocalMac(self);
+    ESP_LOGI(kTag, "Wi-Fi mode changed: ESP-NOW now uses the %s interface, as %02x:%02x:%02x:%02x:%02x:%02x",
+             want == WIFI_IF_AP ? "AP" : "STA", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
+             self.bytes[4], self.bytes[5]);
 }
 
 bool EspNowTransport::stationConnected() const {
@@ -1100,7 +1158,7 @@ void EspNowTransport::releaseRadio() {
     // Hand the application's Wi-Fi back as it was.
     if (!ownsWifiInit_) {
         if (saved_.txPower) esp_wifi_set_max_tx_power(saved_.txPowerQuarterDbm);
-        if (saved_.protocol) esp_wifi_set_protocol(interface_, saved_.protocolBitmap);
+        if (saved_.protocol) esp_wifi_set_protocol(saved_.protocolInterface, saved_.protocolBitmap);
         if (saved_.powerSave) esp_wifi_set_ps(static_cast<wifi_ps_type_t>(saved_.powerSaveMode));
         if (saved_.country) esp_wifi_set_country_code(saved_.countryCode, false);
     }
@@ -1136,6 +1194,7 @@ Status EspNowTransport::applyRadioSettings() {
             if (!ownsWifiInit_) {
                 saved_.protocol = true;
                 saved_.protocolBitmap = bitmap;
+                saved_.protocolInterface = interface_;
             }
             // Keep 802.11b/g/n so ordinary nodes are still heard.
             err = esp_wifi_set_protocol(interface_,
@@ -1536,6 +1595,7 @@ Status EspNowTransport::setLongRange(bool enabled) {
     if (!ownsWifiInit_ && !saved_.protocol) {
         saved_.protocol = true;
         saved_.protocolBitmap = bitmap;
+        saved_.protocolInterface = interface_;
     }
     uint8_t want = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | (enabled ? WIFI_PROTOCOL_LR : 0);
     if (bitmap == want) return Status::Ok;
@@ -1675,6 +1735,7 @@ constexpr uint32_t kChannelSettleMs = 600;
 void EspNowTransport::pollChannel(uint32_t now) {
     if (static_cast<int32_t>(now - lastChannelPoll_) < static_cast<int32_t>(kChannelPollMs)) return;
     lastChannelPoll_ = now;
+    followInterface();  // also without Wi-Fi events
     bool fixed = channelFixed();
     if (discovery_) discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || fixed, now);
     if (diagnostics_ && diagnostics_->busy()) {

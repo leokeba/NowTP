@@ -105,6 +105,8 @@ public:
 
     /// Where this node's role is announced (or none). Called before start().
     void setDiscovery(Discovery* discovery);
+    /// The address peers see this node send from changed.
+    void setLocalMac(const Mac& mac) { self_ = mac; }
     void start(uint32_t nowMs);
     void stop();
     void tick(uint32_t nowMs);

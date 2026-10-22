@@ -69,6 +69,10 @@ public:
     void start();
     void stop();
     void tick(uint32_t nowMs);
+    /// The address peers see this node send from changed (the transport moved
+    /// to another Wi-Fi interface): tags name the new one. Peers verify our
+    /// epoch again under it, and resealing then repairs messages queued before.
+    void setLocalMac(const Mac& mac) { local_ = mac; }
 
     /// Installs (16-32 bytes) or removes (`len` 0) the installation key.
     /// Takes the host lock.

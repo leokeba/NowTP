@@ -129,6 +129,7 @@ These settings live in `EspNowConfig::radio`, together with the power and rate s
 Things to keep in mind:
 - **Shared channel.** All nodes must be on the same channel. A node connected to an AP is on the AP's channel.
 - **Addresses depend on the interface.** A node is addressed by the MAC of the interface ESP-NOW uses. A soft-AP node sends from its AP MAC, which is usually its station MAC + 1.
+- **Mode changes.** The application may change the Wi-Fi mode while NowTP runs, for instance to drop a fallback soft-AP once the station joins a network. ESP-NOW then moves to the interface that runs, the station's if it does, else the soft-AP's, with every peer registered on the old one. This happens a few milliseconds after Wi-Fi's event, or within 250 ms if there is no default event loop. The node's address (`localMac()`) changes with the interface, so peers discover it as a new node, and lose the old one after `peerTimeoutMs`.
 
 ### Power, rate and Long Range
 
