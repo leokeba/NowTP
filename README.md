@@ -267,7 +267,16 @@ transport.pair(30000);            // finds the window, obtains the key
 - **Pairing code.** Set `security.pairingCode` on both sides to keep nodes from joining the wrong installation. A short code doesn't stop an active attacker present during the window: keep windows short, or use a long random code.
 - **Other ways to install a key.** `setSecurityKey()` installs a key you provision yourself, and `forgetSecurityKey()` removes it.
 - **Storage.** The key is stored in NVS (namespace `nowtp`) and loaded by `begin()`, unless `persistSecurityKey` is false.
-- **Limits.** Content is not encrypted. Every key holder can impersonate every other: the key proves membership of the installation, not which node sent a message. Diagnostics' remote tuning (when enabled) and probe burst requests are accepted only from key holders.
+- **Integrity only, no encryption.** A paired installation's messages are authenticated, not encrypted: anyone in range can read them. Don't send passwords or tokens in clear; encrypt them in the application, or use ESP-NOW's encryption for unicast (see [Peers and frame size](#peers-and-frame-size)).
+- **Impersonation.** Every key holder can impersonate every other: the key proves membership of the installation, not which node sent a message.
+- **Spoofed discovery frames.** Without a key, anyone in range can forge discovery frames from any address, or replay recorded ones:
+  - a goodbye reports that peer lost at once;
+  - a moving notice, or an anchor stating another channel, moves channel-following nodes;
+  - an announcement can add a fake peer or change a real one;
+  - a forged time reference draws time sync.
+
+  With a key and the default `security.requireAuthentication`, only key holders can do this. With `requireAuthentication = false`, unauthenticated frames still act, even on peers whose announcements are authenticated. Details, and what a capability downgrade can do against a keyed installation, are in docs/PROTOCOL.md ("What security does not cover").
+- **Diagnostics.** Remote tuning (when enabled) and probe burst requests are accepted only from key holders.
 
 Costs:
 - **Size.** 17 bytes per message, plus 8 per ack.

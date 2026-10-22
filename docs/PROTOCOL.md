@@ -163,7 +163,7 @@ A node with a key authenticates every message it sends, except those on port 253
 | 8 | 1 | Destination kind: `0` unicast, `1` broadcast |
 | 9 | 8 | Tag: the first 8 bytes of `HMAC-SHA256(Km, network id ‖ src MAC ‖ dst MAC ‖ port ‖ flags ‖ trailer[0..9] ‖ payload)` |
 
-- **What the tag covers.** `flags` are the message's reliable and latest-only bits. `dst MAC` is the receiver's own MAC for unicast, and `FF:FF:FF:FF:FF:FF` for broadcast, so a unicast message cannot be redirected to another node.
+- **What the tag covers.** `flags` are the message's reliable and latest-only bits. `dst MAC` is the receiver's own MAC for unicast, and `FF:FF:FF:FF:FF:FF` for broadcast, so a unicast message cannot be redirected to another node. The message ID is not covered: a recording sent again under another ID still carries its epoch and sequence number, and the checks below drop it.
 - **Receiver checks.** The receiver checks the tag, then the sequence number against a 64-entry sliding window per sender and epoch. Repeats and numbers older than the window are dropped silently. A refusal could reach the real sender, which may have a message with that ID in flight.
   - **Refused by the application.** When the application refuses a verified reliable message (answered busy, see above), its sequence number is released, so the sender's retry verifies. The window doesn't move, and the numbers of delivered messages stay taken. Until the window passes that number, a recording of the refused message could still be delivered once, even after its sender gave up. That is no worse than a late retransmission. An unreliable message keeps its number, since no retry follows.
 - **Unknown epochs.** A message from an epoch the receiver hasn't verified is held back. The receiver drops it without an ack, and challenges the sender:
@@ -191,7 +191,25 @@ A node with a key authenticates every message it sends, except those on port 253
 - **Compatibility.** Nodes running 0.5 and later versions interoperate with a shared key. Each side uses the stricter rules only with peers whose authenticated response announced them.
 - **Before reassembly.** A multi-frame message can only be verified once complete. A node with a key therefore refuses, at the first fragment, a multi-frame message without flag `0x8` when authentication is required. Senders whose epoch it hasn't verified share a single reassembly slot.
 
-Content is not encrypted. Any key holder can impersonate any other: the key proves membership of the installation, not the identity of a node.
+### What security does not cover
+
+- **No encryption.** A key provides integrity and freshness only. Payloads travel in clear, keyed or not, so anyone in range can read every message, including secrets an application sends (passwords, tokens). Encrypt those in the application, or use ESP-NOW's own per-peer encryption (unicast only). Any key holder can impersonate any other: the key proves membership of the installation, not the identity of a node.
+- **Discovery frames.** Announcements, goodbyes and moving notices are ordinary messages on port 255, and are only as trustworthy as the rules applied to them:
+  - **Without a key**, anyone in range can send them from any MAC address, or replay recorded ones:
+    - A goodbye makes receivers report that peer lost at once, and forget its message limit. Applications that react to the loss (failing pending calls, dropping subscriptions) do so too.
+    - An announcement can:
+      - add a fake peer, which takes one of the peer table's slots. When the table is full, a peer gives way only after 1.5 announcement intervals without being heard, so peers that keep announcing keep their place.
+      - change what is known about a real peer: name, metadata, frame size, message limit, channel and flags.
+      - keep a peer that has gone silent from being reported lost.
+    - A moving notice, or an announcement from an anchor stating another channel, moves every node free to follow to that channel.
+    - An announcement with the time reference flag draws time sync to the sender, which can then set its followers' network time.
+  - **With a key and authentication required** (the default), nodes drop unauthenticated discovery frames before discovery sees them, and the sequence window drops recordings. Only a key holder can do any of the above.
+  - **With a key and authentication not required**, unauthenticated frames reach discovery, which acts on them as it would without a key, even for peers whose announcements are authenticated. An unauthenticated goodbye removes such a peer. An unauthenticated announcement from its address replaces what is known about it, and marks it unauthenticated. Discovery makes one exception: in a full table, an authenticated peer gives way only to another authenticated one.
+- **Capability downgrade.** The capabilities tag uses `Kc`, so without the key nobody can set capability bits, but an attacker can remove the extension. To do so, it must keep the genuine response from reaching the challenger (selective jamming) and inject a copy cut back to 33 bytes, whose first tag still verifies. For that epoch, the challenger then treats the responder like a 0.5 node:
+  - **Replays.** It accepts, once each, sequence numbers up to 64 below the one reported. Recordings of the responder's last 64 messages of that epoch are then delivered again, if the challenger no longer remembered them (it rebooted, or it had forgotten the sender: see `maxPeers`).
+  - **Acks.** It accepts unbound complete acks from the responder. A recorded unbound complete can then confirm a later message that reuses the same 16-bit message ID, although that message was not delivered. Receivers send unbound completes, for example, for duplicates they know only from the sender's window.
+
+  The downgrade cannot forge, alter or reveal messages. It affects only the challenger whose response was stripped, in that epoch. It cannot lower the capabilities of an epoch already verified, since proving the same epoch again only adds capabilities. It is possible only when a challenger verifies a new epoch: after either side reboots, or after the challenger has forgotten the sender.
 
 ### Pairing
 
