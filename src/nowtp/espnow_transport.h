@@ -157,8 +157,8 @@ struct EspNowConfig {
     /// With runTask false: called whenever poll() has new work, so that the
     /// application can wake the task that polls (e.g. with xTaskNotifyGive()).
     /// That is when a frame arrived or the radio reported one sent (called in
-    /// the Wi-Fi driver's task), when Wi-Fi changed mode (in the event loop's
-    /// task), and when a call into NowTP from any task may
+    /// the Wi-Fi driver's task), when Wi-Fi changed mode or the station its
+    /// connection (in the event loop's task), and when a call into NowTP from any task may
     /// have given it work (called in that task, once NowTP's lock is released).
     /// Always task context, never an ISR. Keep it short, don't block in it and
     /// don't call NowTP from it.
@@ -272,7 +272,9 @@ public:
     /// an access point fixes our channel. Blocks for up to ~300 ms.
     Status moveToChannel(uint8_t channel);
     /// Tells peers we are about to move to `channel` without switching: call it
-    /// before connecting the station to an access point on another channel.
+    /// before connecting the station to an access point on another channel, or
+    /// starting a soft-AP there. Peers that follow move at once. Without it,
+    /// they learn of a roam only once the station has left (see ChannelConfig).
     Status announceChannelChange(uint8_t channel);
     /// Searches the other channels for peers now (normally automatic).
     Status searchChannels();
@@ -414,6 +416,8 @@ private:
     void onFallbackPing(Status status);
     void tickLinkChecks(uint32_t now);
     void pollChannel(uint32_t now);
+    void adoptChannel(uint8_t channel, bool fixed, uint32_t now);
+    void stationChanged(uint32_t now);
     Status sendMoveNotice(uint8_t channel);
     Status appTaskReady() const;
     void storeKey(const std::vector<uint8_t>& key);
@@ -514,6 +518,8 @@ private:
     esp_event_handler_instance_t wifiEvents_ = nullptr;
     std::atomic<bool> staConnected_{false};
     std::atomic<bool> modeChanged_{false};  // a Wi-Fi event may have changed the interface to use
+    std::atomic<bool> stationChanged_{false};  // the station connected, disconnected or changed channel
+    std::atomic<uint8_t> homeChannel_{0};      // the channel it settled on, from the event (0: none)
     bool ratesChanged_ = false;
 };
 

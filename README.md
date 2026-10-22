@@ -241,6 +241,7 @@ ESP-NOW only reaches nodes on the same channel. A node connected to an access po
   - A node may miss frames on its own channel while it searches.
   - With `channel.findAnchor`, a node also searches when it has never seen an anchor, for example right after boot.
 - **Noticing changes.** NowTP notices its own channel changing, for example when the access point decides, and tells the application through `onChannelChange()`.
+- **Roaming.** A station that roams, or follows its access point to another channel, can't warn the nodes it leaves: by the time NowTP learns of it, the station has left. So NowTP tells peers what it can at once. When the station disconnects, NowTP announces on the old channel that the node is no longer an anchor, and followers start searching after `channel.searchAfterMs`, without first waiting `discovery.peerTimeoutMs` to lose it. When the station connects on the new channel, NowTP announces the node there right away, where searching followers find it. An application that knows where its station is going should call `announceChannelChange(ch)` first, so that followers move at once.
 - **What doesn't trigger a search.** Networks without anchors never search on their own: losing a peer that is just switched off doesn't make the others wander. `searchChannels()` starts a search by hand. `channel.follow = false` turns following off.
 
 ### Security and pairing

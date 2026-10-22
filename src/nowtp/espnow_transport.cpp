@@ -669,7 +669,7 @@ uint32_t EspNowTransport::pollDelayMs() const {
     lock();
     // Frames or a "sent" report waiting (more than one poll() takes, or new).
     if (s_received.load(std::memory_order_acquire) != taken_ ||
-        s_sent.count.load(std::memory_order_acquire) != sentSeen_ || modeChanged_.load()) {
+        s_sent.count.load(std::memory_order_acquire) != sentSeen_ || modeChanged_.load() || stationChanged_.load()) {
         unlock(false);
         return 0;
     }
@@ -717,6 +717,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     }
     lock();
     if (modeChanged_.exchange(false)) followInterface();
+    if (stationChanged_.exchange(false)) stationChanged(nowMs());
     checkSent();
     // Bounded batch so timers still run under a flood of frames.
     int n = 0;
@@ -1081,10 +1082,24 @@ void EspNowTransport::wifiEventHandler(void* arg, esp_event_base_t base, int32_t
     (void)base;
     (void)data;
     EspNowTransport* self = static_cast<EspNowTransport*>(arg);
+    // The channel the station settled on: the access point's. Scans never
+    // raise these, unlike a channel merely read from the driver.
+    uint8_t home = 0;
     if (id == WIFI_EVENT_STA_CONNECTED) {
         self->staConnected_ = true;
+        if (data) home = static_cast<const wifi_event_sta_connected_t*>(data)->channel;
     } else if (id == WIFI_EVENT_STA_DISCONNECTED || id == WIFI_EVENT_STA_STOP) {
         self->staConnected_ = false;
+    }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    if (id == WIFI_EVENT_HOME_CHANNEL_CHANGE && data) {
+        home = static_cast<const wifi_event_home_channel_change_t*>(data)->new_chan;
+    }
+#endif
+    if (id == WIFI_EVENT_STA_CONNECTED || id == WIFI_EVENT_STA_DISCONNECTED || home != 0) {
+        if (home != 0) self->homeChannel_ = home;
+        self->stationChanged_ = true;  // the NowTP task tells peers at once
+        wakeTask();
     }
     if (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_STOP || id == WIFI_EVENT_AP_START ||
         id == WIFI_EVENT_AP_STOP) {
@@ -1753,6 +1768,10 @@ void EspNowTransport::pollChannel(uint32_t now) {
         return;
     }
     if (static_cast<int32_t>(now - pendingChannelSince_) < static_cast<int32_t>(kChannelSettleMs)) return;
+    adoptChannel(ch, fixed, now);
+}
+
+void EspNowTransport::adoptChannel(uint8_t ch, bool fixed, uint32_t now) {
     pendingChannel_ = 0;
     ESP_LOGI(kTag, "channel changed from %u to %u%s", radio_.channel, ch,
              fixed ? " (set by the access point)" : "");
@@ -1764,6 +1783,27 @@ void EspNowTransport::pollChannel(uint32_t now) {
     if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor || fixed, now);
     if (follower_) follower_->onChannelChanged(ch, now);
     if (channelHandler_) channelHandler_(ch);
+}
+
+// The station connected, disconnected or followed its access point to another
+// channel. A roam can't be announced where it would help, on the channel left
+// behind: by the time it is known, the station is gone (announceChannelChange()
+// is for moves the application plans). So peers learn what they can at once,
+// instead of at the next channel check, by when a roaming station may have
+// left. On a disconnect, still on the old channel, we are no longer an anchor:
+// followers start searching after ChannelConfig::searchAfterMs, rather than
+// once they lose us. On the new channel, we announce ourselves without
+// waiting for the channel to settle, so that searching followers find us.
+void EspNowTransport::stationChanged(uint32_t now) {
+    uint8_t home = homeChannel_.exchange(0);
+    bool fixed = channelFixed();
+    radio_.stationConnected = stationConnected();
+    if (diagnostics_ && diagnostics_->busy()) return;  // deep discovery is visiting other channels
+    if (home != 0 && home != radio_.channel && channel() == home) {
+        adoptChannel(home, fixed, now);
+        return;
+    }
+    if (discovery_) discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || fixed, now);
 }
 
 Status EspNowTransport::appTaskReady() const {
