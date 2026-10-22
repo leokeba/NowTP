@@ -343,7 +343,24 @@ For unicast, ESP-NOW already acknowledges and retries each frame in hardware. De
 ESP-NOW calls its callbacks from the Wi-Fi driver task. NowTP only copies each event into a ring buffer there. Everything else runs elsewhere:
 
 - With `runTask = true` (the default), protocol work and your receive and completion callbacks run in a dedicated NowTP task.
-- With `runTask = false`, they run inside `transport.poll()`, which you call from your loop.
+- With `runTask = false`, they run inside `transport.poll()`, which you call from your loop, or from a task of yours that sleeps in between.
+
+A task that polls needn't wake every few milliseconds. `poll()` returns how long it may sleep, at most 250 ms (also available as `pollDelayMs()`). Set `wake` to be told about new work before then: it is called when a frame arrives or the radio reports one sent, from the Wi-Fi driver's task, and when a call into NowTP from any task may have given it work, from that task once NowTP's lock is released. It always runs in task context, never in an interrupt. Keep it short and don't call NowTP from it:
+
+```cpp
+static void wakePoller(void* task) { xTaskNotifyGive(static_cast<TaskHandle_t>(task)); }
+
+cfg.runTask = false;
+cfg.wake = wakePoller;
+cfg.wakeContext = xTaskGetCurrentTaskHandle();  // the task that polls
+transport.begin(cfg);
+for (;;) {
+    uint32_t ms = transport.poll();
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms) + 1);  // a notification sent meanwhile isn't lost
+}
+```
+
+Call `end()` from the task that polls, or stop polling first.
 
 Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work to your own task. `Message::data` is only valid during the receive callback. To keep a message reassembled from several frames without copying it, take its buffer: save `m.buffer`, set `m.buffer = nullptr`, and `free()` it when done. Single-frame messages have no buffer to take (`m.buffer` is null) and must be copied.
 
@@ -409,6 +426,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `enableStreams` | true | Streams (see above) |
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |
+| `wake`, `wakeContext` | none | With `runTask = false`: called when `poll()` has new work (see Threading) |
 | `eventBufferSize` | 8 KB | Buffer for received frames between the Wi-Fi driver and NowTP (about 5 frames of 1470 bytes). Overflows are counted in `stats().droppedEvents` |
 
 ### Status codes

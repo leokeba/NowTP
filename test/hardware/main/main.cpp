@@ -333,10 +333,19 @@ void endCancelsAndRestart() {
     transport.end();
 }
 
+// EspNowConfig::wake: from the Wi-Fi task, or a task that called NowTP.
+volatile int g_wakes = 0;
+void wakePoller(void* task) {
+    g_wakes = g_wakes + 1;
+    xTaskNotifyGive(static_cast<TaskHandle_t>(task));
+}
+
 void pollModeAndManualPeers() {
     nowtp::EspNowConfig cfg;
     cfg.runTask = false;
     cfg.autoAddPeers = false;
+    cfg.wake = wakePoller;
+    cfg.wakeContext = xTaskGetCurrentTaskHandle();
     Status st = transport.begin(cfg);
     report("begin_poll_mode", st == Status::Ok, nowtp::toString(st));
 
@@ -351,6 +360,28 @@ void pollModeAndManualPeers() {
         vTaskDelay(1);
     }
     report("poll_mode_progresses_only_in_poll", !doneWithoutPoll && out.done && out.status == Status::Ok);
+
+    // As an application task would: sleep until woken or pollDelayMs().
+    Outcome hooked;
+    int wakesBefore = g_wakes;
+    uint32_t longest = 0;
+    transport.send(Mac::broadcast(), 1, msg.data(), msg.size(), nowtp::SendOptions(), hooked.handler());
+    end = millis() + 2000;
+    while (!hooked.done && millis() < end) {
+        uint32_t wait = transport.poll();
+        if (wait > longest) longest = wait;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait) + 1);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    transport.poll();
+    uint32_t idle = transport.pollDelayMs();
+    char detail[64];
+    snprintf(detail, sizeof(detail), "(%d wakes, idle %u ms, longest %u ms)", g_wakes - wakesBefore,
+             static_cast<unsigned>(idle), static_cast<unsigned>(longest));
+    report("poll_mode_wake_hook_and_delay",
+           hooked.done && hooked.status == Status::Ok && g_wakes > wakesBefore && idle <= 250 && longest <= 250,
+           detail);
+    ulTaskNotifyTake(pdTRUE, 0);  // leave no notification behind
     report("poll_mode_send_and_wait_refused", transport.sendAndWait(Mac::broadcast(), 1, msg.data(), 10) ==
                                                   Status::InvalidState);
 

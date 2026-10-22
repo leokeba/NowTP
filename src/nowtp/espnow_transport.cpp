@@ -106,7 +106,10 @@ inline size_t ringItemSize(size_t frame) {
 // ESP-NOW callbacks carry no user pointer, so they reach the active
 // instance through these.
 std::atomic<RingbufHandle_t> s_events{nullptr};  // received frames
+std::atomic<uint32_t> s_received{0};             // frames put in it
 std::atomic<TaskHandle_t> s_task{nullptr};       // woken by both callbacks
+std::atomic<void (*)(void*)> s_wake{nullptr};    // or the poller's hook (EspNowConfig::wake)
+void* s_wakeContext = nullptr;
 std::atomic<int> s_inCallback{0};                // end() waits for these to return
 // The last "sent" callback. Kept out of the event buffer: a burst of
 // received frames could fill it, and a lost "sent" event stalls sending.
@@ -131,18 +134,23 @@ struct CallbackGuard {
 void wakeTask() {
     TaskHandle_t t = s_task.load();
     if (t) xTaskNotifyGive(t);
+    void (*wake)(void*) = s_wake.load();
+    if (wake) wake(s_wakeContext);
 }
 
 // After the callbacks are unregistered: one may still be running.
 void waitForCallbacks() {
     s_events = nullptr;
     s_task = nullptr;
+    s_wake = nullptr;
     while (s_inCallback.load() != 0) vTaskDelay(1);
 }
 
 inline uint32_t nowMs() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
 }
+
+constexpr uint32_t kChannelPollMs = 250;
 
 const char* const kNvsNamespace = "nowtp";
 const char* const kNvsKey = "key";
@@ -189,6 +197,7 @@ void pushReceived(const uint8_t* mac, int8_t rssi, const uint8_t* data, size_t l
     memcpy(h->mac, mac, sizeof(h->mac));
     memcpy(static_cast<uint8_t*>(slot) + sizeof(EventHeader), data, len);
     xRingbufferSendComplete(rb, slot);
+    s_received.fetch_add(1, std::memory_order_release);
     wakeTask();
 }
 
@@ -442,6 +451,11 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     explicitFrameSizes_.clear();
     s_sent.count = 0;  // no callbacks registered yet
     sentSeen_ = 0;
+    s_received = 0;
+    taken_ = 0;
+    lockDepth_ = 0;
+    s_wakeContext = config_.wakeContext;
+    if (!config_.runTask) s_wake = config_.wake;
     s_events = events_;
     s_active = true;
     esp_now_register_recv_cb(onRecv);
@@ -462,6 +476,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     }
 
     stopping_ = false;
+    ending_ = false;
     started_ = true;
     lastChannelPoll_ = nowMs();
     pendingChannel_ = 0;
@@ -486,6 +501,9 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
 void EspNowTransport::end() {
     if (!started_) return;
+    // A poller woken now would run while end() takes things down.
+    ending_ = true;
+    s_wake = nullptr;
     lock();
     if (diagnostics_) diagnostics_->stop();
     if (streams_) streams_->stop();  // pending streams complete with Cancelled
@@ -560,10 +578,15 @@ void EspNowTransport::cleanup() {
 
 void EspNowTransport::lock() const {
     xSemaphoreTakeRecursive(mutex_, portMAX_DELAY);
+    lockDepth_++;
 }
 
-void EspNowTransport::unlock() const {
+// A call that may have changed what pollDelayMs() says wakes the poller
+// once it lets go. poll() itself doesn't: its callbacks' calls are nested.
+void EspNowTransport::unlock(bool changed) const {
+    bool wake = --lockDepth_ == 0 && changed && !config_.runTask && config_.wake && !ending_;
     xSemaphoreGiveRecursive(mutex_);
+    if (wake) config_.wake(config_.wakeContext);
 }
 
 void EspNowTransport::taskEntry(void* arg) {
@@ -576,9 +599,34 @@ void EspNowTransport::taskEntry(void* arg) {
     vTaskDelete(nullptr);
 }
 
-void EspNowTransport::poll() {
-    if (!started_ || config_.runTask) return;
-    processEvents(0);
+uint32_t EspNowTransport::poll() {
+    if (started_ && !config_.runTask) processEvents(0);
+    return pollDelayMs();
+}
+
+uint32_t EspNowTransport::pollDelayMs() const {
+    if (!started_) return kChannelPollMs;
+    lock();
+    // Frames or a "sent" report waiting (more than one poll() takes, or new).
+    if (s_received.load(std::memory_order_acquire) != taken_ ||
+        s_sent.count.load(std::memory_order_acquire) != sentSeen_) {
+        unlock(false);
+        return 0;
+    }
+    Deadline d(nowMs());
+    engine_->nextTick(d);
+    if (discovery_) discovery_->nextTick(d);
+    if (diagnostics_) diagnostics_->nextTick(d);
+    if (follower_) follower_->nextTick(d);
+    if (timeSync_) timeSync_->nextTick(d);
+    if (streams_) streams_->nextTick(d);
+    d.at(lastChannelPoll_ + kChannelPollMs);
+    if (fallback_.active && !fallback_.pingInFlight) d.at(fallback_.nextPingAt);
+    for (const LinkCheck& c : linkChecks_) {
+        if (!c.inFlight) d.at(c.nextAt);
+    }
+    unlock(false);
+    return d.delay(kChannelPollMs);
 }
 
 // The latest "sent" callback, if it reports the frame the engine waits for.
@@ -613,6 +661,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     int n = 0;
     while (n < 32 && (item || (item = xRingbufferReceive(events_, &size, 0)) != nullptr)) {
         ++n;
+        ++taken_;
         if (size >= sizeof(EventHeader)) {
             const EventHeader* h = static_cast<const EventHeader*>(item);
             const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
@@ -638,7 +687,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     if (timeSync_) timeSync_->tick(now);
     if (streams_) streams_->tick(now);
     tickLinkChecks(now);
-    unlock();
+    unlock(false);
     return n >= 32;
 }
 
@@ -800,7 +849,7 @@ EspNowTransport::TransportStats EspNowTransport::stats() const {
     static_cast<Stats&>(s) = engine_->stats();
     s.droppedEvents = s_droppedEvents;
     s.oneWayLinks = stats_.oneWayLinks;
-    unlock();
+    unlock(false);
     return s;
 }
 
@@ -1281,7 +1330,7 @@ std::vector<PeerInfo> EspNowTransport::peers() const {
     if (!started_ || !discovery_) return std::vector<PeerInfo>();
     lock();
     std::vector<PeerInfo> copy = discovery_->peers();
-    unlock();
+    unlock(false);
     return copy;
 }
 
@@ -1289,7 +1338,7 @@ Engine::MemoryUse EspNowTransport::memory() const {
     if (!started_) return Engine::MemoryUse();
     lock();
     Engine::MemoryUse m = engine_->memory();
-    unlock();
+    unlock(false);
     return m;
 }
 
@@ -1297,7 +1346,7 @@ size_t EspNowTransport::peerMaxMessageSize(const Mac& peer) const {
     if (!started_) return 0;
     lock();
     size_t limit = engine_->peerMessageLimit(peer);
-    unlock();
+    unlock(false);
     return limit;
 }
 
@@ -1524,7 +1573,6 @@ void EspNowTransport::tickLinkChecks(uint32_t now) {
 // Channels (NowTP task, lock held, unless noted)
 
 namespace {
-constexpr uint32_t kChannelPollMs = 250;
 // A station's own scan visits other channels briefly; only a channel that
 // stays is a move.
 constexpr uint32_t kChannelSettleMs = 600;
@@ -1663,7 +1711,7 @@ bool EspNowTransport::secured() const {
     if (!started_) return false;
     lock();
     bool on = security_->enabled();
-    unlock();
+    unlock(false);
     return on;
 }
 
@@ -1685,7 +1733,7 @@ uint64_t EspNowTransport::networkTimeUs() const {
     if (!started_ || !timeSync_) return local;
     lock();
     uint64_t t = timeSync_->toNetwork(local);
-    unlock();
+    unlock(false);
     return t;
 }
 
@@ -1693,7 +1741,7 @@ int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
     if (!started_ || !timeSync_) return static_cast<int64_t>(networkUs);
     lock();
     uint64_t t = timeSync_->toLocal(networkUs);
-    unlock();
+    unlock(false);
     return static_cast<int64_t>(t);
 }
 
@@ -1707,7 +1755,7 @@ TimeSyncStatus EspNowTransport::timeSyncStatus() const {
     }
     lock();
     TimeSyncStatus s = timeSync_->status();
-    unlock();
+    unlock(false);
     return s;
 }
 

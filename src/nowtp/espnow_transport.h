@@ -127,11 +127,21 @@ struct EspNowConfig {
     /// discovery reports lost is removed.
     bool autoAddPeers = true;
     /// Process radio events and run callbacks in a dedicated task. When false,
-    /// call EspNowTransport::poll() regularly (e.g. from Arduino's loop()).
+    /// call EspNowTransport::poll() regularly (e.g. from Arduino's loop()), or
+    /// from a task that `wake` wakes, at the latest after pollDelayMs().
     bool runTask = true;
     uint32_t taskStackSize = 4096;
     UBaseType_t taskPriority = 5;
     BaseType_t taskCore = tskNO_AFFINITY;
+    /// With runTask false: called whenever poll() has new work, so that the
+    /// application can wake the task that polls (e.g. with xTaskNotifyGive()).
+    /// That is when a frame arrived or the radio reported one sent (called in
+    /// the Wi-Fi driver's task), and when a call into NowTP from any task may
+    /// have given it work (called in that task, once NowTP's lock is released).
+    /// Always task context, never an ISR. Keep it short, don't block in it and
+    /// don't call NowTP from it.
+    void (*wake)(void* context) = nullptr;
+    void* wakeContext = nullptr;
     /// Bytes buffered between the Wi-Fi driver's receive callback and the NowTP
     /// task: about 5 frames of 1470 bytes (ESP-NOW v2), 28 of 250. Frames that
     /// don't fit are dropped and counted (stats().droppedEvents); reliable
@@ -322,7 +332,13 @@ public:
     Status deepDiscover(DeepDiscoveryReport& out, const DeepDiscoveryOptions& options = DeepDiscoveryOptions());
 
     /// Processes pending radio events and timers when runTask is false.
-    void poll();
+    /// Returns pollDelayMs(). end() must not run while another task is in poll().
+    uint32_t poll();
+    /// Milliseconds until poll() must run again (0: at once) for timers:
+    /// retransmissions, timeouts, announcements, time rounds. At most 250.
+    /// New frames don't wait for it: EspNowConfig::wake reports them. Without
+    /// that hook, poll every few milliseconds instead.
+    uint32_t pollDelayMs() const;
 
     Mac localMac() const;
     TransportStats stats() const;
@@ -374,7 +390,9 @@ private:
     bool processEvents(TickType_t wait);  // true if events are left
     void checkSent();
     void lock() const;
-    void unlock() const;
+    /// `changed`: the caller may have given NowTP work, which a poller asleep
+    /// until pollDelayMs() must look at (see EspNowConfig::wake).
+    void unlock(bool changed = true) const;
     void cleanup();
 
     EspNowConfig config_;
@@ -434,11 +452,14 @@ private:
     } saved_;
     RadioInfo radio_;
     RingbufHandle_t events_ = nullptr;
+    uint32_t taken_ = 0;           // frames taken from the event buffer
+    mutable int lockDepth_ = 0;
     SemaphoreHandle_t mutex_ = nullptr;
     SemaphoreHandle_t taskExited_ = nullptr;
     TaskHandle_t task_ = nullptr;
     wifi_interface_t interface_ = WIFI_IF_STA;
     volatile bool stopping_ = false;
+    bool ending_ = false;  // in end(): no more wake-ups for the poller
     bool started_ = false;
     bool espNowInitialized_ = false;
     bool ownsWifiInit_ = false;
