@@ -152,6 +152,38 @@ inline uint32_t nowMs() {
 
 constexpr uint32_t kChannelPollMs = 250;
 
+// Large blocks in PSRAM (EspNowConfig::usePsram). Small ones stay internal:
+// message bookkeeping, acks, short messages, all short-lived and often used.
+constexpr size_t kPsramMinBytes = 256;
+const uint32_t kPsramCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+
+void* psramAllocate(size_t n) {
+    if (n >= kPsramMinBytes) {
+        void* p = heap_caps_malloc(n, kPsramCaps);
+        if (p) return p;
+    }
+    return malloc(n);
+}
+
+void* psramReallocate(void* p, size_t n) {
+    if (n >= kPsramMinBytes) {
+        void* q = heap_caps_realloc(p, n, kPsramCaps);  // leaves `p` alone on failure
+        if (q) return q;
+    }
+    return realloc(p, n);
+}
+
+void psramRelease(void* p) {
+    free(p);
+}
+
+const heap::Hooks kPsramHooks = {psramAllocate, psramReallocate, psramRelease};
+
+// Images built with CONFIG_SPIRAM_IGNORE_NOTFOUND also run on boards without it.
+bool psramPresent() {
+    return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+}
+
 const char* const kNvsNamespace = "nowtp";
 const char* const kNvsKey = "key";
 
@@ -368,9 +400,11 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
     config_ = config;
     // Where NowTP can only allocate with operator new, it first checks this.
-    heap::probe() = [] { return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT); };
+    heap::probe() = [] { return heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT); };
     Status radio = prepareRadio();
     if (radio != Status::Ok) return radio;
+    psram_ = config_.usePsram && psramPresent();
+    if (psram_) heap::hooks() = &kPsramHooks;
 
     uint16_t maxSize = maxSupportedFrameSize();
     if (config_.defaultMaxFrameSize > maxSize) config_.defaultMaxFrameSize = maxSize;
@@ -379,7 +413,26 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
     // At least one frame of the largest size must fit.
     size_t ring = std::max(config_.eventBufferSize, ringItemSize(maxSupportedFrameSize()));
-    events_ = xRingbufferCreate(ring, RINGBUF_TYPE_NOSPLIT);
+    ring = (ring + 3) & ~static_cast<size_t>(3);
+    events_ = nullptr;
+#if configSUPPORT_STATIC_ALLOCATION
+    // Only the Wi-Fi task and NowTP's poller touch it, never with the flash
+    // cache off; its control block stays internal.
+    if (psram_) {
+        ringStorage_ = heap_caps_malloc(ring, kPsramCaps);
+        ringControl_ = heap_caps_malloc(sizeof(StaticRingbuffer_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (ringStorage_ && ringControl_) {
+            events_ = xRingbufferCreateStatic(ring, RINGBUF_TYPE_NOSPLIT, static_cast<uint8_t*>(ringStorage_),
+                                              static_cast<StaticRingbuffer_t*>(ringControl_));
+        }
+        if (!events_) {
+            free(ringStorage_);
+            free(ringControl_);
+            ringStorage_ = ringControl_ = nullptr;
+        }
+    }
+#endif
+    if (!events_) events_ = xRingbufferCreate(ring, RINGBUF_TYPE_NOSPLIT);
     sendTracker_ = SendTracker();
     mutex_ = xSemaphoreCreateRecursiveMutex();
     taskExited_ = xSemaphoreCreateBinary();
@@ -564,6 +617,12 @@ void EspNowTransport::cleanup() {
         vRingbufferDelete(events_);
         events_ = nullptr;
     }
+    free(ringStorage_);  // a static ring buffer's memory is ours to free
+    free(ringControl_);
+    ringStorage_ = ringControl_ = nullptr;
+    // NowTP's blocks are all freed; any a handler took are freed with free().
+    if (heap::hooks() == &kPsramHooks) heap::hooks() = nullptr;
+    psram_ = false;
     if (mutex_) {
         vSemaphoreDelete(mutex_);
         mutex_ = nullptr;

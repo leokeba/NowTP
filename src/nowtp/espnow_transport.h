@@ -142,6 +142,11 @@ struct EspNowConfig {
     /// don't call NowTP from it.
     void (*wake)(void* context) = nullptr;
     void* wakeContext = nullptr;
+    /// On chips with PSRAM, take NowTP's large buffers from it: message copies,
+    /// reassembly and stream buffers (blocks of 256 bytes and more) and the
+    /// event buffer, leaving internal RAM to Wi-Fi, lwIP and DMA. Internal RAM
+    /// is used when there is no PSRAM, or no room in it.
+    bool usePsram = true;
     /// Bytes buffered between the Wi-Fi driver's receive callback and the NowTP
     /// task: about 5 frames of 1470 bytes (ESP-NOW v2), 28 of 250. Frames that
     /// don't fit are dropped and counted (stats().droppedEvents); reliable
@@ -452,7 +457,10 @@ private:
     } saved_;
     RadioInfo radio_;
     RingbufHandle_t events_ = nullptr;
+    void* ringStorage_ = nullptr;  // the event buffer's storage when in PSRAM
+    void* ringControl_ = nullptr;  // and its StaticRingbuffer_t, in internal RAM
     uint32_t taken_ = 0;           // frames taken from the event buffer
+    bool psram_ = false;           // large buffers come from PSRAM
     mutable int lockDepth_ = 0;
     SemaphoreHandle_t mutex_ = nullptr;
     SemaphoreHandle_t taskExited_ = nullptr;

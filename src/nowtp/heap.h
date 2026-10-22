@@ -12,9 +12,10 @@
 namespace nowtp {
 
 /// NowTP's heap allocations. They all come from malloc(), which returns null
-/// on a short heap (a handler may free() a buffer it took). Host tests build
-/// with NOWTP_HEAP_HOOKS to count them and to make them fail, as on a short
-/// heap; otherwise these are malloc, realloc and free.
+/// on a short heap (a handler may free() a buffer it took), unless hooks are
+/// set: EspNowTransport places large blocks in PSRAM with them, and host tests
+/// count allocations and make them fail, as on a short heap. Blocks are always
+/// freed with free() or the hooks' release, whichever allocated them.
 namespace heap {
 
 /// Largest block the heap could give now. Code that can only allocate with
@@ -35,7 +36,6 @@ inline bool fits(size_t n) {
     return !p || (n < SIZE_MAX - kReserve && p() >= n + kReserve);
 }
 
-#if defined(NOWTP_HEAP_HOOKS)
 struct Hooks {
     void* (*allocate)(size_t n);
     void* (*reallocate)(void* p, size_t n);
@@ -46,20 +46,22 @@ inline const Hooks*& hooks() {
     static const Hooks* h = nullptr;
     return h;
 }
-inline void* allocate(size_t n) { return hooks() ? hooks()->allocate(n) : std::malloc(n); }
-inline void* reallocate(void* p, size_t n) { return hooks() ? hooks()->reallocate(p, n) : std::realloc(p, n); }
+inline void* allocate(size_t n) {
+    const Hooks* h = hooks();
+    return h ? h->allocate(n) : std::malloc(n);
+}
+inline void* reallocate(void* p, size_t n) {
+    const Hooks* h = hooks();
+    return h ? h->reallocate(p, n) : std::realloc(p, n);
+}
 inline void release(void* p) {
-    if (hooks()) {
-        hooks()->release(p);
+    const Hooks* h = hooks();
+    if (h) {
+        h->release(p);
     } else {
         std::free(p);
     }
 }
-#else
-inline void* allocate(size_t n) { return std::malloc(n); }
-inline void* reallocate(void* p, size_t n) { return std::realloc(p, n); }
-inline void release(void* p) { std::free(p); }
-#endif
 
 /// An object in malloc()ed memory, for state a peer makes us create: `new`
 /// (even `new (std::nothrow)`, in libstdc++) aborts on a short heap with

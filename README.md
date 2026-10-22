@@ -384,6 +384,8 @@ cfg.protocol.maxRxBytes = 12 * 1024;
 cfg.protocol.maxRxMessages = 3;
 ```
 
+On chips with PSRAM (most ESP32-S3 modules, WROVER), NowTP takes its large buffers from it: message copies, reassembly and stream buffers (blocks of 256 bytes and more), and the event buffer. Internal RAM, which Wi-Fi, lwIP and DMA need, then only holds NowTP's tables and small messages. Without PSRAM, or when it is full, everything comes from internal RAM as before. `usePsram = false` turns this off.
+
 ### Peers and frame size
 
 - **Peers.** Unknown unicast destinations are registered automatically as unencrypted peers on the current channel. The same happens for senders that need an ack. Set `EspNowConfig::autoAddPeers = false` to manage peers yourself with `addPeer()`. ESP-NOW allows at most 20 peers. When its table is full, the automatically added peer used least recently is removed to make room. Peers you registered with `addPeer()` are never removed that way, and a peer that discovery reports lost gives its automatic slot back.
@@ -427,6 +429,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `autoAddPeers`, `defaultMaxFrameSize` | true, 250 | Peer registration and default frame size |
 | `runTask`, `taskStackSize`, `taskPriority`, `taskCore` | true, 4096, 5, any | NowTP task settings |
 | `wake`, `wakeContext` | none | With `runTask = false`: called when `poll()` has new work (see Threading) |
+| `usePsram` | true | Large buffers in PSRAM when the chip has it (see Memory) |
 | `eventBufferSize` | 8 KB | Buffer for received frames between the Wi-Fi driver and NowTP (about 5 frames of 1470 bytes). Overflows are counted in `stats().droppedEvents` |
 
 ### Status codes
