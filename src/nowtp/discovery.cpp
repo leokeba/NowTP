@@ -87,6 +87,7 @@ void Discovery::setChannelInfo(uint8_t channel, bool anchor, uint32_t now) {
     if (channel == channel_ && flags == extFlags_) return;
     channel_ = channel;
     extFlags_ = flags;
+    for (PeerInfo& p : peers_) p.otherChannel = otherChannel(p.channel);
     if (!running_) return;
     announceDue_ = true;
     tick(now);
@@ -267,6 +268,10 @@ void Discovery::handle(const Message& m) {
             if (peers_[i].mac != m.src) continue;
             PeerInfo lost = std::move(peers_[i]);
             peers_.erase(i);
+            if ((a.flags & kMoving) && a.moveTo != 0) {
+                lost.channel = a.moveTo;  // where it went
+                lost.otherChannel = otherChannel(a.moveTo);
+            }
             emit(PeerEvent::Lost, lost);
             if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) moveHandler_(lost, a.moveTo);
             break;
@@ -325,6 +330,7 @@ void Discovery::handle(const Message& m) {
         fresh.rssi = m.rssi;
         fresh.firstSeenMs = fresh.lastSeenMs = now_;
         fresh.channel = a.channel;
+        fresh.otherChannel = otherChannel(a.channel);
         fresh.anchor = anchor;
         fresh.timeReference = timeReference;
         fresh.timeCandidate = timeCandidate;
@@ -350,6 +356,7 @@ void Discovery::handle(const Message& m) {
         peer->maxFrameSize = a.maxFrameSize;
         peer->maxMessageSize = a.maxMessageSize;
         peer->channel = a.channel;
+        peer->otherChannel = otherChannel(a.channel);
         peer->anchor = anchor;
         peer->timeReference = timeReference;
         peer->timeCandidate = timeCandidate;

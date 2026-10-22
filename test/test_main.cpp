@@ -2748,6 +2748,48 @@ TEST(channel_moves_to_the_channel_an_anchor_states) {
     CHECK_EQ(rig.chan(node), 6);
 }
 
+TEST(discovery_reports_peers_on_other_channels) {
+    FollowRig rig;
+    size_t master = rig.add(6, true), fixed = rig.add(5, true), b = rig.add(5, false);
+    std::vector<PeerInfo> lost;
+    rig.disc[fixed]->onPeerEvent([&](PeerEvent e, const PeerInfo& p) {
+        if (e == PeerEvent::Lost) lost.push_back(p);
+    });
+    rig.start();
+    rig.net.run(600);
+    // The master leaks in from channel 6 (see above); `fixed` can't follow it.
+    std::vector<uint8_t> hello;
+    for (size_t i = rig.net.log.size(); i-- > 0;) {
+        if (rig.net.log[i].from == master) {
+            hello = rig.net.log[i].data;
+            break;
+        }
+    }
+    CHECK(!hello.empty());
+    rig.net.inject(fixed, rig.net.mac(master), hello);
+    rig.net.run(10);
+    const PeerInfo* m = rig.disc[fixed]->find(rig.net.mac(master));
+    CHECK(m != nullptr);
+    CHECK_EQ(m->channel, 6);
+    CHECK(m->otherChannel);
+    const PeerInfo* nb = rig.disc[fixed]->find(rig.net.mac(b));
+    CHECK(nb != nullptr && !nb->otherChannel);
+
+    // Moving to our channel makes it a neighbour; the flag follows our channel.
+    rig.disc[fixed]->setChannelInfo(6, true, rig.net.now());
+    CHECK(!rig.disc[fixed]->find(rig.net.mac(master))->otherChannel);
+    CHECK(rig.disc[fixed]->find(rig.net.mac(b))->otherChannel);
+    rig.disc[fixed]->setChannelInfo(5, true, rig.net.now());
+
+    // b moves away: its Lost event says where to.
+    CHECK(rig.disc[b]->announceMove(9, rig.net.now()));
+    rig.net.run(20);
+    CHECK_EQ(lost.size(), 1u);
+    CHECK(lost[0].mac == rig.net.mac(b));
+    CHECK_EQ(lost[0].channel, 9);
+    CHECK(lost[0].otherChannel);
+}
+
 TEST(channel_no_search_without_anchors) {
     FollowRig rig;
     size_t a = rig.add(3, false), b = rig.add(3, false);

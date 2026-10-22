@@ -25,7 +25,14 @@ struct PeerInfo {
     /// (authenticated ones only, for an authenticated peer).
     uint32_t lastSeenMs = 0;
     /// Wi-Fi channel the peer says it is on; 0 if it does not say (NowTP < 0.5).
+    /// In the Lost event of a peer that announced a move: the channel it moved to.
     uint8_t channel = 0;
+    /// `channel` differs from ours. A peer we hear stating another channel
+    /// leaks in from an adjacent one, and our frames reach it unreliably, if
+    /// at all; one lost to a move went where we can't hear it, e.g. because
+    /// our access point keeps us here (ESP-NOW only reaches one channel).
+    /// Follows our own channel, without an event when that changes.
+    bool otherChannel = false;
     /// Its channel is fixed (by an access point, or by configuration): other
     /// nodes follow it when it moves (see ChannelFollower).
     bool anchor = false;
@@ -146,6 +153,7 @@ private:
 
     void handle(const Message& m);
     void heard(const Mac& src, bool authenticated, uint32_t now);
+    bool otherChannel(uint8_t channel) const { return channel != 0 && channel_ != 0 && channel != channel_; }
     bool announce(uint8_t flags, uint8_t moveTo = 0);
     void emit(PeerEvent event, const PeerInfo& peer);
 
