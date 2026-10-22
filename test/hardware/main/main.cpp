@@ -517,6 +517,14 @@ void radioSettingsRestored() {
            st == Status::Ok && r.txPowerDbm >= 8.4f && r.txPowerDbm <= 10 && r.longRange && strncmp(country, "JP", 2) == 0 && ps == WIFI_PS_NONE,
            fmt("(%s, power %.2f dBm, LR %d, country %s, ps %d)", nowtp::toString(st), r.txPowerDbm, r.longRange,
                country, ps));
+    Status sleepy = transport.setPowerSave(nowtp::PowerSave::MinModem);
+    wifi_ps_type_t sleepyPs = WIFI_PS_NONE;
+    esp_wifi_get_ps(&sleepyPs);
+    Status awake = transport.setPowerSave(nowtp::PowerSave::None);
+    esp_wifi_get_ps(&ps);
+    report("power_save_changes_at_run_time",
+           sleepy == Status::Ok && sleepyPs == WIFI_PS_MIN_MODEM && awake == Status::Ok && ps == WIFI_PS_NONE,
+           fmt("(%s %d, %s %d)", nowtp::toString(sleepy), sleepyPs, nowtp::toString(awake), ps));
 
     nowtp::PeerOptions po;
     po.rate = nowtp::PhyRate::G54M;

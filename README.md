@@ -122,7 +122,7 @@ See [examples/idf/reliable_echo](examples/idf/reliable_echo).
 | Soft-AP, or AP + station | Keeps the AP's channel. In AP-only mode, ESP-NOW uses the AP interface | – |
 
 These settings live in `EspNowConfig::radio`, together with the power and rate settings described next:
-- `disablePowerSave` (default on) turns off Wi-Fi modem sleep. A sleeping station misses most ESP-NOW frames.
+- `powerSave` sets Wi-Fi modem sleep while NowTP runs: `None` (the default) turns it off, `MinModem` and `MaxModem` turn it on, and `Leave` keeps the application's setting. `setPowerSave()` changes it at run time, and `end()` restores the application's setting. Modem sleep only acts while the station is connected to an access point. The radio then sleeps between the AP's DTIM beacons (typically 100–300 ms), and ESP-NOW frames that arrive meanwhile are lost: unicast frames fail after the sender's hardware retries (unreliable messages are lost, reliable ones get through by resending, with latency up to a DTIM period and a fraction of the throughput), and broadcasts such as discovery announcements go missing, so peers may be reported lost.
 - Set `initWifi = false` to make `begin()` fail instead of starting Wi-Fi.
 - `radioInfo()` reports the channel, interface and connection state that `begin()` found, plus the current transmit power and Long Range state.
 
@@ -418,7 +418,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `protocol.rxTimeoutMs` | 1000 | A partial incoming message is dropped after this long without progress |
 | `protocol.recentSenders` / `recentEntries` / `recentTtlMs` | 20 / 32 / 5000 | Duplicate suppression: senders tracked (each over its last ~128 message IDs, 44 bytes), completed messages remembered across all senders, and for how long |
 | `protocol.networkId` | 0 | Separates NowTP deployments on one channel (not a security feature) |
-| `radio.initWifi`, `radio.channel`, `radio.disablePowerSave` | true, 1, true | Radio setup (see above) |
+| `radio.initWifi`, `radio.channel`, `radio.powerSave` | true, 1, `None` | Radio setup (see above) |
 | `radio.txPowerDbm`, `radio.broadcastRate`, `radio.unicastRate`, `radio.longRange`, `radio.countryCode` | driver, 1 Mbps, 1 Mbps, false, driver | Power, rate and Long Range (see above) |
 | `enableDiscovery`, `discovery`, `negotiateFrameSize` | false, –, true | Discovery (see above) |
 | `channel.follow`, `channel.findAnchor`, `channel.anchor` | true, false, false | Channel following (see above) |

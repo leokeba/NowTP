@@ -28,6 +28,23 @@
 
 namespace nowtp {
 
+/// Wi-Fi modem sleep (esp_wifi_set_ps()) while NowTP runs.
+///
+/// Modem sleep only acts while the station is connected to an access point:
+/// the radio then sleeps between the AP's DTIM beacons (typically 100-300 ms)
+/// and wakes for traffic the AP buffered. Nothing buffers ESP-NOW frames, so
+/// those arriving while it sleeps are lost. A unicast frame fails once the
+/// sender's hardware retries run out (~100 ms): unreliable messages are lost,
+/// reliable ones get through by resending, with latency up to a DTIM period
+/// and a fraction of the throughput. Broadcasts, discovery announcements
+/// among them, go missing, so peers may be reported lost. Sending is unaffected.
+enum class PowerSave : uint8_t {
+    Leave,     ///< Keep whatever the application set.
+    None,      ///< WIFI_PS_NONE: ESP-NOW hears every frame (the default).
+    MinModem,  ///< WIFI_PS_MIN_MODEM: wakes at every DTIM beacon.
+    MaxModem,  ///< WIFI_PS_MAX_MODEM: wakes every listen interval; misses even more.
+};
+
 /// Radio settings applied by begin(). The defaults are what every ESP-NOW
 /// device understands: 1 Mbps, no Long Range, driver power and country.
 struct RadioConfig {
@@ -39,7 +56,11 @@ struct RadioConfig {
     /// no soft-AP. Otherwise the access point dictates the channel. 0 keeps the
     /// current channel. All nodes must share a channel.
     uint8_t channel = 1;
-    /// Disable Wi-Fi modem sleep. A sleeping station misses most ESP-NOW frames.
+    /// Wi-Fi modem sleep while NowTP runs (see PowerSave for what sleep costs).
+    /// end() restores the application's setting. Change it at run time with
+    /// EspNowTransport::setPowerSave().
+    PowerSave powerSave = PowerSave::None;
+    /// Deprecated: false is powerSave = PowerSave::Leave.
     bool disablePowerSave = true;
     /// Maximum transmit power in dBm (2 to 20, 0.25 dB steps); 0 keeps the
     /// driver's setting (usually 20 dBm). Boards with a weak supply often fail to
@@ -307,6 +328,10 @@ public:
     PhyRate broadcastRate() const override;
     /// Changes the rate for peers without their own PeerOptions::rate.
     Status setUnicastRate(PhyRate rate);
+    /// Changes Wi-Fi modem sleep while running (RadioConfig::powerSave); Leave
+    /// hands the setting back as the application had it before NowTP changed it.
+    Status setPowerSave(PowerSave mode);
+    PowerSave powerSave() const;
     /// Rate used toward one peer; Default reverts it to the unicast rate.
     Status setPeerRate(const Mac& peer, PhyRate rate) override;
     PhyRate peerRate(const Mac& mac) const override;
@@ -367,6 +392,7 @@ private:
     Status prepareRadio();
     Status applyRadioSettings();
     Status applyTxPower(float dbm);
+    Status applyPowerSave(PowerSave mode);
     Status applyPeerRate(const Mac& mac);
     void releaseRadio();
     static void wifiEventHandler(void* arg, esp_event_base_t base, int32_t id, void* data);

@@ -921,9 +921,10 @@ Status EspNowTransport::prepareRadio() {
     saved_ = SavedRadio();
     ratesChanged_ = false;
 
+    if (!config_.radio.disablePowerSave) config_.radio.powerSave = PowerSave::Leave;
     const RadioConfig& rc = config_.radio;
     if ((rc.txPowerDbm != 0 && quarterDbm(rc.txPowerDbm) == 0) || !validRate(rc.broadcastRate) ||
-        !validRate(rc.unicastRate)) {
+        !validRate(rc.unicastRate) || static_cast<uint8_t>(rc.powerSave) > static_cast<uint8_t>(PowerSave::MaxModem)) {
         ESP_LOGE(kTag, "invalid radio settings (power 2-21 dBm)");
         return Status::InvalidArgument;
     }
@@ -1126,16 +1127,7 @@ Status EspNowTransport::applyRadioSettings() {
     const RadioConfig& rc = config_.radio;
     esp_err_t err;
 
-    if (rc.disablePowerSave) {
-        wifi_ps_type_t ps = WIFI_PS_NONE;
-        if (esp_wifi_get_ps(&ps) == ESP_OK && ps != WIFI_PS_NONE) {
-            if (!ownsWifiInit_) {
-                saved_.powerSave = true;
-                saved_.powerSaveMode = ps;
-            }
-            esp_wifi_set_ps(WIFI_PS_NONE);
-        }
-    }
+    applyPowerSave(rc.powerSave);
 
     if (rc.longRange) {
         uint8_t bitmap = 0;
@@ -1171,6 +1163,49 @@ Status EspNowTransport::applyRadioSettings() {
     }
 #endif
     return Status::Ok;
+}
+
+// The application's own setting is saved the first time NowTP changes it;
+// Leave and releaseRadio() put it back.
+Status EspNowTransport::applyPowerSave(PowerSave mode) {
+    wifi_ps_type_t current = WIFI_PS_NONE;
+    if (esp_wifi_get_ps(&current) != ESP_OK) return Status::LinkError;
+    wifi_ps_type_t want = current;
+    switch (mode) {
+        case PowerSave::Leave:
+            if (saved_.powerSave) want = static_cast<wifi_ps_type_t>(saved_.powerSaveMode);
+            saved_.powerSave = false;
+            break;
+        case PowerSave::None: want = WIFI_PS_NONE; break;
+        case PowerSave::MinModem: want = WIFI_PS_MIN_MODEM; break;
+        case PowerSave::MaxModem: want = WIFI_PS_MAX_MODEM; break;
+        default: return Status::InvalidArgument;
+    }
+    if (want == current) return Status::Ok;
+    if (mode != PowerSave::Leave && !ownsWifiInit_ && !saved_.powerSave) {
+        saved_.powerSave = true;
+        saved_.powerSaveMode = current;
+    }
+    esp_err_t err = esp_wifi_set_ps(want);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "esp_wifi_set_ps: %s", esp_err_to_name(err));
+        return Status::LinkError;
+    }
+    return Status::Ok;
+}
+
+Status EspNowTransport::setPowerSave(PowerSave mode) {
+    if (!started_) return Status::InvalidState;
+    if (static_cast<uint8_t>(mode) > static_cast<uint8_t>(PowerSave::MaxModem)) return Status::InvalidArgument;
+    lock();
+    Status st = applyPowerSave(mode);
+    if (st == Status::Ok) config_.radio.powerSave = mode;
+    unlock(false);
+    return st;
+}
+
+PowerSave EspNowTransport::powerSave() const {
+    return config_.radio.powerSave;
 }
 
 PhyRate EspNowTransport::peerRate(const Mac& mac) const {
