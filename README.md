@@ -416,6 +416,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `protocol.maxTxMessagesPerPeer` / `maxTxBytesPerPeer` | 4 / 24 KB | Of those, for one destination, so an absent peer can't fill the queue for the others |
 | `protocol.maxRxMessages` / `maxRxBytes` | 4 / 32 KB | Messages being reassembled at once, and their memory. Beyond them a new message is refused (the sender backs off and retries), never one in progress. |
 | `protocol.maxRxMessagesPerSender` | 2 | Of those, from one sender |
+| `protocol.receiverCredit` | true | Acks tell senders how much reassembly room is left for their next message. A sender holds a new multi-frame message that wouldn't fit, rather than send it only to be refused |
 | `protocol.sendTimeoutMs` | 2000 | Default deadline for a whole message (`SendOptions::timeoutMs` overrides it) |
 | `protocol.ackTimeoutMs` | 100 | Reliable mode: wait before probing the receiver again |
 | `protocol.rxTimeoutMs` | 1000 | A partial incoming message is dropped after this long without progress |

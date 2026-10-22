@@ -1139,6 +1139,102 @@ TEST(reassembly_survives_more_senders_than_slots) {
     }
 }
 
+// A receiver that has no room says so in its acks: the sender's next messages
+// wait instead of each sending a fragment only to be refused.
+TEST(receiver_credit_holds_messages_a_full_receiver_refuses) {
+    struct Run {
+        uint32_t framesSent, creditWaits, receiverBusy, ms;
+    };
+    auto run = [](bool senderCredit, bool receiverCredit, Run& r) {
+        sim::Network net;
+        Config tx, rx;
+        tx.receiverCredit = senderCredit;
+        rx.receiverCredit = receiverCredit;
+        rx.maxRxMessages = 1;  // room for one message at a time
+        size_t recv = net.addNode(rx);
+        std::vector<size_t> senders = {net.addNode(tx), net.addNode(tx), net.addNode(tx)};
+        Inbox inbox;
+        net.engine(recv).listen(1, inbox.handler());
+        std::vector<Outcome> outs(4 * senders.size());
+        for (size_t i = 0; i < outs.size(); ++i) {
+            auto msg = pattern(2000, static_cast<uint32_t>(i));
+            CHECK(net.engine(senders[i % senders.size()])
+                      .send(net.mac(recv), 1, msg.data(), msg.size(), reliable(), outs[i].handler(), net.now()) ==
+                  Status::Ok);
+        }
+        CHECK(net.runUntil([&] {
+            for (auto& o : outs) {
+                if (!o.done) return false;
+            }
+            return true;
+        }));
+        for (auto& o : outs) CHECK(o.status == Status::Ok);
+        CHECK_EQ(inbox.messages.size(), outs.size());
+        r = Run{0, 0, 0, net.now()};
+        for (size_t s : senders) {
+            const Stats& st = net.engine(s).stats();
+            r.framesSent += st.framesSent;
+            r.creditWaits += st.creditWaits;
+            r.receiverBusy += st.receiverBusy;
+        }
+    };
+    Run with = {}, without = {}, oldReceiver = {}, oldSender = {};
+    run(true, true, with);
+    run(false, false, without);
+    run(true, false, oldReceiver);  // acks without credit: nothing waits
+    run(false, true, oldSender);    // ignores the credit
+    std::printf("    with credit: %u frames, %u busy, %u waits, %u ms; without: %u frames, %u busy, %u ms\n",
+                with.framesSent, with.receiverBusy, with.creditWaits, with.ms, without.framesSent,
+                without.receiverBusy, without.ms);
+    CHECK(with.creditWaits > 0u);
+    CHECK(with.receiverBusy * 2 < without.receiverBusy);
+    CHECK(with.framesSent < without.framesSent);
+    CHECK_EQ(without.creditWaits, 0u);
+    CHECK_EQ(oldReceiver.creditWaits, 0u);
+    CHECK_EQ(oldReceiver.framesSent, without.framesSent);
+    CHECK_EQ(oldSender.framesSent, without.framesSent);
+}
+
+// The credit byte ends the ack, after missing fragments listed two bytes each:
+// a sender reading only those pairs, as older ones do, never sees it.
+TEST(receiver_credit_is_invisible_to_older_senders) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    net.dropIf = [&](const sim::Frame& f) {
+        wire::Header h;
+        size_t off;
+        return f.from == a && wire::decodeHeader(f.data.data(), f.data.size(), h, off) &&
+               h.type == wire::Type::Fragment && (h.index == 2 || h.index == 5) && net.now() < 50;
+    };
+    Outcome out;
+    auto msg = pattern(2000);
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    bool sawMissing = false;
+    for (const sim::Frame& frame : net.log) {
+        wire::Header h;
+        size_t off;
+        if (frame.from != b || !wire::decodeHeader(frame.data.data(), frame.data.size(), h, off) ||
+            h.type != wire::Type::Ack) {
+            continue;
+        }
+        const std::vector<uint8_t>& f = frame.data;
+        CHECK(h.flags & wire::kFlagCredit);
+        const uint8_t* p = f.data() + wire::kCommonHeaderSize;
+        size_t len = f.size() - wire::kCommonHeaderSize;
+        if (p[0] != static_cast<uint8_t>(wire::AckStatus::Missing)) continue;
+        sawMissing = true;
+        std::vector<uint16_t> old;  // the loop older senders run
+        for (size_t i = 1; i + 1 < len; i += 2) old.push_back(wire::getU16(p + i));
+        CHECK(old == (std::vector<uint16_t>{2, 5}));
+        CHECK(p[len - 1] > 0);  // room for more
+    }
+    CHECK(sawMissing);
+}
+
 TEST(random_frames_do_not_crash) {
     sim::Network net;
     Config cfg;

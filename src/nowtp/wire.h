@@ -20,6 +20,9 @@ enum class Type : uint8_t {
 
 enum Flags : uint8_t {
     kFlagReliable = 0x01,
+    /// On an ack (where "reliable" means nothing): the ack ends with a credit
+    /// byte, before any tag. See kCreditUnit.
+    kFlagCredit = 0x01,
     kFlagLatest = 0x02,
     kFlagAckRequest = 0x04,
     kFlagAuth = 0x08,  ///< Payload ends with an authentication trailer (Security).
@@ -43,6 +46,10 @@ constexpr size_t kMaxFrameSize = 1470;  // ESP-NOW v2
 constexpr size_t kAckTagSize = 8;
 /// Leading trailer bytes (epoch, sequence) a bound ack tag covers.
 constexpr size_t kAckBindSize = 8;
+/// An ack's credit byte counts the reassembly room its sender has left for
+/// a new message from us in these units; kCreditMax means that much or more.
+constexpr size_t kCreditUnit = 256;
+constexpr uint8_t kCreditMax = 255;
 
 struct Header {
     Type type = Type::Single;

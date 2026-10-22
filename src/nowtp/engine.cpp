@@ -85,6 +85,7 @@ struct Engine::TxMessage {
     uint32_t ackDeadline = 0;
     uint32_t deadline = 0;
     uint8_t frameFailures = 0;
+    bool waitedForCredit = false;
     CompletionHandler done;
     Status result = Status::Ok;  // once finished
     TxMessage* nextDone = nullptr;
@@ -156,6 +157,7 @@ Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
     tx_.reserve(config_.maxTxMessages);
     rx_.reserve(config_.maxRxMessages);
     backoffs_.reserve(config_.maxTxMessages);
+    credits_.reserve(config_.maxTxMessages);
 }
 
 Engine::~Engine() {
@@ -404,6 +406,7 @@ void Engine::pump(uint32_t now) {
         }
         stats_.framesSent++;
         if (!inflight_.firstPass) stats_.retransmissions++;
+        if (inflight_.firstPass && index == 0 && tx->count > 1) spendCredit(*tx);
     }
 
     pumping_ = false;
@@ -434,6 +437,11 @@ Engine::TxMessage* Engine::nextMessage(uint32_t now) {
             }
         }
         if (!head) continue;
+        if (waitsForCredit(*t, now)) {
+            if (!t->waitedForCredit) stats_.creditWaits++;
+            t->waitedForCredit = true;
+            continue;  // and the destination's later messages wait behind it
+        }
         Backoff* b = backoff(t->dst);
         if (b && !reached(now, b->retryAt)) {
             if (!waiting) waiting = t;
@@ -449,6 +457,85 @@ Engine::Backoff* Engine::backoff(const Mac& dst) {
         if (b.dst == dst) return &b;
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Receiver credit: a receiver's acks say how much room it has left for our
+// next message. A new multi-frame message it has no room for waits, instead
+// of costing a frame and a Busy ack; one refused already probes as before,
+// and its acks bring fresh credit. Single-frame messages need no room.
+
+Engine::Credit* Engine::credit(const Mac& dst) {
+    for (Credit& c : credits_) {
+        if (c.dst == dst) return &c;
+    }
+    return nullptr;
+}
+
+const Engine::Credit* Engine::credit(const Mac& dst) const {
+    for (const Credit& c : credits_) {
+        if (c.dst == dst) return &c;
+    }
+    return nullptr;
+}
+
+namespace {
+// What reassembling `count` fragments of `fragSize` takes at the receiver (see admitRx()).
+inline size_t rxNeed(uint16_t count, uint16_t fragSize) {
+    return static_cast<size_t>(count) * fragSize + (count + 7u) / 8;
+}
+}  // namespace
+
+bool Engine::waitsForCredit(const TxMessage& tx, uint32_t now, uint32_t* until) const {
+    if (tx.count < 2 || tx.nextIndex > 0 || tx.resendCount > 0 || tx.awaitingAck) return false;  // started
+    const Credit* c = credit(tx.dst);
+    if (!c || reached(now, c->at + creditTtl()) || c->room >= rxNeed(tx.count, tx.fragSize)) return false;
+    if (until) *until = c->at + creditTtl();
+    return true;
+}
+
+void Engine::noteCredit(const Mac& dst, uint8_t units, uint32_t now) {
+    Credit* c = credit(dst);
+    if (!c && credits_.size() < credits_.capacity()) {  // never grows (see tx_)
+        Credit fresh = {dst, 0, 0};
+        credits_.push_back(fresh);
+        c = &credits_.back();
+    }
+    if (!c) {  // full: the oldest word goes, likely expired (they are forgotten only in tick())
+        if (credits_.empty()) return;
+        c = &credits_[0];
+        for (Credit& x : credits_) {
+            if (static_cast<int32_t>(x.at - c->at) < 0) c = &x;
+        }
+        c->dst = dst;
+    }
+    c->room = units >= kCreditMax ? UINT32_MAX : static_cast<uint32_t>(units * kCreditUnit);
+    c->at = now;
+}
+
+// Messages started after the receiver's word take room it didn't count.
+void Engine::spendCredit(const TxMessage& tx) {
+    Credit* c = credit(tx.dst);
+    if (!c || c->room == UINT32_MAX) return;
+    size_t need = rxNeed(tx.count, tx.fragSize);
+    c->room = c->room > need ? static_cast<uint32_t>(c->room - need) : 0;
+}
+
+// As admitRx() sees it: partial messages idle long enough to be evicted are room.
+uint8_t Engine::creditFor(const Mac& src, uint32_t now) const {
+    uint32_t idleMs = 3 * config_.ackTimeoutMs;
+    size_t live = 0, fromSrc = 0, held = 0;
+    for (const auto& r : rx_) {
+        if (reached(now, r->lastActivity + idleMs)) continue;
+        live++;
+        held += r->reserved;
+        if (r->src == src) fromSrc++;
+    }
+    if (live >= config_.maxRxMessages || fromSrc >= config_.maxRxMessagesPerSender || held >= config_.maxRxBytes) {
+        return 0;
+    }
+    size_t units = (config_.maxRxBytes - held) / kCreditUnit;
+    return units >= kCreditMax ? kCreditMax : static_cast<uint8_t>(units);
 }
 
 void Engine::onFrameSent(bool delivered, uint32_t now, uint64_t sentUs) {
@@ -600,6 +687,14 @@ void Engine::tick(uint32_t now) {
         ++i;
     }
 
+    for (size_t i = 0; i < credits_.size();) {
+        if (reached(now, credits_[i].at + creditTtl())) {
+            credits_.erase(credits_.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        ++i;
+    }
+
     for (size_t i = 0; i < rx_.size();) {
         RxMessage* rx = rx_[i].get();
         if (reached(now, rx->lastActivity + config_.rxTimeoutMs)) {
@@ -614,14 +709,25 @@ void Engine::tick(uint32_t now) {
 }
 
 // What tick() checks, as times. Sending needs no tick while a frame is in
-// flight (its report pumps the next one) or nothing is pending.
+// flight (its report pumps the next one) or nothing is pending, nor for a
+// destination whose next message waits for credit, until that expires.
 void Engine::nextTick(Deadline& d) const {
     if (inflight_.active) d.at(inflight_.deadline);
     bool pending = controlCount_ > 0;
-    for (const auto& t : tx_) {
+    for (size_t i = 0; i < tx_.size(); ++i) {
+        const TxMessage* t = tx_[i].get();
         d.at(t->deadline);
         if (t->awaitingAck) d.at(t->ackDeadline);
-        pending = pending || t->hasPendingFrame();
+        if (!t->hasPendingFrame()) continue;
+        bool head = true;  // see nextMessage()
+        for (size_t j = 0; j < i && head; ++j) head = !(tx_[j]->hasPendingFrame() && tx_[j]->dst == t->dst);
+        uint32_t until = 0;
+        if (!head) continue;
+        if (waitsForCredit(*t, d.now(), &until)) {
+            d.at(until);
+            continue;
+        }
+        pending = true;
     }
     if (pending && !inflight_.active) d.at(linkBusy_ ? linkBusyUntil_ : d.now());
     for (const Backoff& b : backoffs_) d.at(b.retryAt);  // forgotten then, if idle
@@ -710,7 +816,7 @@ void Engine::delivered(Delivery d, const Mac& src, uint8_t port, uint8_t flags, 
         case Delivery::Refused:
             if (!reliable) break;
             if (bind && auth_) auth_->refused(src, bind);  // its sequence number comes back with the retry
-            queueAck(src, port, id, flags, AckStatus::Busy, nullptr, bind);
+            queueAck(src, port, id, flags, AckStatus::Busy, nullptr, bind, true);
             break;
         case Delivery::NoListener:
             if (reliable) queueAck(src, port, id, flags, AckStatus::Rejected, nullptr);
@@ -1144,6 +1250,10 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         }
         len -= kAckTagSize;
     }
+    if ((h.flags & kFlagCredit) && len >= 2) {
+        len--;  // the credit byte, after any missing fragments
+        if (config_.receiverCredit) noteCredit(src, payload[len], now);
+    }
     if (heard_) heard_(src, (tx->flags & kFlagAuth) != 0, now);
 
     switch (static_cast<AckStatus>(payload[0])) {
@@ -1168,11 +1278,14 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
 }
 
 void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, AckStatus status,
-                      const RxMessage* missing, const uint8_t* bind) {
+                      const RxMessage* missing, const uint8_t* bind, bool full) {
     bool tagged = (flags & kFlagAuth) && auth_ && auth_->sealing(port);
+    // A single trailing byte, so that older senders, reading missing
+    // fragments two bytes at a time, never see it.
+    bool withCredit = config_.receiverCredit && status != AckStatus::Rejected;
     size_t mtu = link_.maxFrameSize(dst);
-    if (mtu < kAckHeaderSize + kAckTagSize) return;
-    size_t room = tagged ? mtu - kAckTagSize : mtu;
+    if (mtu < kAckHeaderSize + 1 + kAckTagSize) return;
+    size_t room = (tagged ? mtu - kAckTagSize : mtu) - (withCredit ? 1 : 0);
 
     // The frame's exact size first: a full frame per acknowledgement would
     // take an MTU of heap each time.
@@ -1182,6 +1295,7 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
             if (!missing->has(i)) len += 2;
         }
     }
+    if (withCredit) len += 1;
     if (tagged) len += kAckTagSize;
     Control c;
     c.dst = dst;
@@ -1191,7 +1305,7 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
     c.len = len;
     Header h;
     h.type = Type::Ack;
-    h.flags = tagged ? kFlagAuth : 0;
+    h.flags = static_cast<uint8_t>((tagged ? kFlagAuth : 0) | (withCredit ? kFlagCredit : 0));
     h.networkId = config_.networkId;
     h.port = port;
     h.messageId = id;
@@ -1204,6 +1318,7 @@ void Engine::queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, 
             off += 2;
         }
     }
+    if (withCredit) c.frame[off++] = full ? 0 : creditFor(dst, now_);
     if (tagged) {
         auth_->sealAck(dst, c.frame.get(), off, bind, c.frame.get() + off);
         off += kAckTagSize;

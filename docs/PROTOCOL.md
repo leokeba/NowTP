@@ -20,6 +20,7 @@ NowTP runs on top of ESP-NOW frames. Every frame NowTP sends starts with a NowTP
   - `0x2` latest-only: only the newest message per (sender, port) matters.
   - `0x4` ack-request: the receiver must answer with an ack now.
   - `0x8` authenticated: the payload ends with an authentication trailer (see [Security](#security-port-253)). On an ack, the ack ends with a tag.
+  - On an ack, `0x1` means credit instead: the ack carries a credit byte (see below).
 - **network ID**: frames whose ID differs from the receiver's configured ID are ignored. This keeps separate deployments on the same channel apart. It is not a security feature.
 - **port**: selects the receive handler, like a UDP port. Ports 240–255 are reserved for NowTP's own services: 251 streams, 252 time synchronization, 253 security, 254 diagnostics, 255 discovery.
 - **message ID**: per sender. Each new message increments it, and the first value is random at boot.
@@ -45,7 +46,7 @@ The whole message fits in one frame. There is no CRC, because the radio frame al
 
 ### Ack (type 2)
 
-`common header | status (1) | [missing indices…]`
+`common header | status (1) | [missing indices…] | [credit (1)] | [tag (8)]`
 
 Port and message ID repeat the values of the message being acknowledged. Status values:
 
@@ -53,6 +54,11 @@ Port and message ID repeat the values of the message being acknowledged. Status 
 - `1` missing: the payload lists missing fragment indices, 2 bytes each, in increasing order. The list may be cut short to fit one frame.
 - `2` rejected: the receiver will never accept this message, because it has no handler on the port or the message is too large.
 - `3` busy: the receiver has no room to reassemble this message right now. The sender stops sending it, waits one to two and a half ack timeouts (spread by message ID), then probes (step 5 below). Receivers send it for the first fragment and for ack-requests of a message they refuse, and for a complete message (single-frame or reassembled) that the receiving application refused. Senders that predate this status ignore it and simply probe after their ack timeout.
+
+**Credit.** A complete, missing or busy ack with flag `0x1` ends with a credit byte, after any missing indices and before any tag: the reassembly room the receiver has left for the next message from the ack's recipient, in units of 256 bytes, with 255 meaning that much or more.
+- **Receiver.** It counts the room it would grant now. A slot must be free, both overall and among those this sender may hold, and the bytes are what its reassembly budget has left. Partial messages idle long enough to be evicted count as free. An ack for a message the application refused carries 0.
+- **Sender.** It notes the room, less the needs of the multi-frame messages it starts afterwards (`count × S` plus the bitmap, `⌈count / 8⌉` bytes). A new multi-frame message that needs more than the room waits, and so do the destination's messages behind it, until an ack brings fresh credit, or for three ack timeouts after the last word. A message already started, or refused (busy), continues and probes as before, and its acks bring fresh credit. Single-frame messages need no reassembly, and never wait on their own.
+- **Compatibility.** Senders that predate credit ignore the flag on acks. They read missing indices two bytes at a time while two bytes remain, so the single trailing byte never reads as an index. The tag covers the byte like the rest of the frame. Receivers that predate credit send no credit, and their senders never wait.
 
 ## Sending
 
@@ -256,4 +262,4 @@ All messages are reliable unicast.
 ## Limits
 
 - **Message size.** Each side sets its own maximum message size. Receivers check the claimed size before allocating memory.
-- **Reassembly.** The number of messages being reassembled at once is bounded, and so is their total memory. When either limit is reached, the least recently active message is evicted.
+- **Reassembly.** The number of messages being reassembled at once is bounded, and so is their total memory. When either limit is reached, a new message is refused (busy), unless a partial message idle for three ack timeouts can make room (see [Reassembly admission](#reliable-delivery-unicast-only)).

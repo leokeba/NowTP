@@ -130,6 +130,12 @@ struct Config {
     uint8_t maxRxMessagesPerSender = 2;
     /// Total bytes held by reassembly buffers.
     size_t maxRxBytes = 32 * 1024;
+    /// Tell senders, in acks, how much reassembly room is left for their next
+    /// message, and hold a new multi-frame message to a receiver that said it
+    /// has no room for it, until it says so again or 3 x ackTimeoutMs pass,
+    /// instead of sending a frame only to be refused. Older nodes neither send
+    /// nor read it.
+    bool receiverCredit = true;
     /// A partial message is dropped after this long without a new fragment.
     uint32_t rxTimeoutMs = 1000;
     /// Default deadline for a whole outgoing message.
@@ -173,6 +179,9 @@ struct Stats {
     uint32_t reassemblyRefused = 0;
     /// Our messages the receiver had no room for yet; each backs off and retries.
     uint32_t receiverBusy = 0;
+    /// Our messages that waited to start until the receiver had room for them
+    /// (Config::receiverCredit).
+    uint32_t creditWaits = 0;
     /// Messages a receive handler refused (Message::refused). Also counted in
     /// messagesDropped, not in messagesReceived.
     uint32_t messagesRefused = 0;

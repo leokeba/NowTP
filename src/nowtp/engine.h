@@ -277,6 +277,14 @@ private:
         uint32_t retryAt;
     };
 
+    // Room a receiver said it has for our next message, less what we started
+    // since (Config::receiverCredit). Good for creditTtl().
+    struct Credit {
+        Mac dst;
+        uint32_t room;  // bytes; UINT32_MAX: plenty
+        uint32_t at;
+    };
+
     struct InFlight {
         bool active = false;
         bool control = false;
@@ -290,6 +298,16 @@ private:
     void pump(uint32_t now);
     TxMessage* nextMessage(uint32_t now);
     Backoff* backoff(const Mac& dst);
+    Credit* credit(const Mac& dst);
+    const Credit* credit(const Mac& dst) const;
+    uint32_t creditTtl() const { return 3 * config_.ackTimeoutMs + 1; }
+    /// True while `tx` may not start: its receiver said it has no room for it.
+    /// `until` receives when that word expires.
+    bool waitsForCredit(const TxMessage& tx, uint32_t now, uint32_t* until = nullptr) const;
+    void noteCredit(const Mac& dst, uint8_t units, uint32_t now);
+    void spendCredit(const TxMessage& tx);
+    /// What we tell `src` in an ack: room for its next message, in kCreditUnit.
+    uint8_t creditFor(const Mac& src, uint32_t now) const;
     size_t buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest);
     void frameSent(bool delivered, uint32_t now, uint64_t sentUs);
     Status queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
@@ -334,8 +352,9 @@ private:
     bool isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const;
     void dropOlderLatest(const Mac& src, uint8_t port, uint16_t id);
 
+    /// `full`: say there's no room, whatever reassembly has (a handler refused).
     void queueAck(const Mac& dst, uint8_t port, uint16_t id, uint8_t flags, wire::AckStatus status,
-                  const RxMessage* missing, const uint8_t* bind = nullptr);
+                  const RxMessage* missing, const uint8_t* bind = nullptr, bool full = false);
     Control& control(size_t i) { return control_[(controlHead_ + i) % kMaxControlFrames]; }
     void popControl();
 
@@ -362,6 +381,7 @@ private:
     size_t frameCapacity_ = 0;
 
     std::vector<Backoff> backoffs_;
+    std::vector<Credit> credits_;
     Mac lastDst_{};  // destination of the last data frame, for round-robin
     InFlight inflight_;
     size_t txBytes_ = 0;
