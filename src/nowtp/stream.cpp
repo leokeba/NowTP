@@ -26,6 +26,8 @@ inline bool reached(uint32_t now, uint32_t deadline) {
 }
 
 constexpr uint32_t kRetryMs = 5;  // a chunk the send queue (or the heap) refused
+// Heap a stored callback takes (see Callback): a std::function and its control block.
+constexpr size_t kCallbackBytes = 64;
 
 SendOptions reliableWithin(uint32_t timeoutMs) {
     SendOptions o;
@@ -55,10 +57,13 @@ struct Streams::Out {
     uint16_t tag = 0;
     Mac dst;
     uint32_t size = 0;
-    StreamReader read;
-    StreamDone done;
+    // Callbacks run with the lock let go (CallbackGate), when another task may
+    // finish the stream: each call holds its own reference.
+    Callback<bool(uint32_t, uint8_t*, size_t)> read;
+    Callback<void(Status)> done;
     StreamOptions options;
     Callback<void(uint32_t, uint32_t)> progress;
+    bool reading = false;  // in `read`: chunks are read in order, once each
     enum Phase : uint8_t { Offering, Sending } phase = Offering;
     std::vector<uint8_t> offer;
     uint8_t offerAttempts = 0;
@@ -91,7 +96,9 @@ struct Streams::In {
     uint8_t window = 1;
     uint32_t expected = 0;
     uint32_t crc = 0;
-    StreamSink sink;
+    Callback<bool(uint32_t, const uint8_t*, size_t)> write;  // the StreamSink, as for Out's callbacks
+    Callback<void(Status)> done;
+    bool writing = false;  // in `write`: bytes are written in order, once each
     Held* held = nullptr;  // window - 1 entries, malloc()ed
     size_t heldCount = 0;
     uint32_t lastActivity = 0;
@@ -170,8 +177,8 @@ Status Streams::send(const Mac& dst, uint32_t size, StreamReader read, StreamDon
     }());
     o->dst = dst;
     o->size = size;
-    o->read = std::move(read);
-    o->done = std::move(done);
+    o->read.set(std::move(read));
+    o->done.set(std::move(done));
     o->options = options;
     o->progress.set(options.progress);
     o->chunks.reserve(options.window);
@@ -244,7 +251,12 @@ void Streams::chunkDone(uint32_t key, Status s) {
     if (s == Status::Ok) {
         o->confirmed += static_cast<uint32_t>(o->chunks[i].len);
         o->chunks.erase(o->chunks.begin() + static_cast<std::ptrdiff_t>(i));
-        if (o->progress) o->progress(o->confirmed, o->size);
+        if (o->progress) {
+            Callback<void(uint32_t, uint32_t)> progress = o->progress;
+            uint32_t confirmed = o->confirmed, size = o->size;
+            GateScope open(engine_.callbackGate());
+            progress(confirmed, size);
+        }
     } else if (s == Status::Rejected || s == Status::Cancelled || s == Status::AuthFailed ||
                o->chunks[i].attempts >= kAttempts) {
         control(o->dst, kAbort, id);
@@ -259,7 +271,8 @@ void Streams::chunkDone(uint32_t key, Status s) {
 void Streams::pump(uint32_t id) {
     for (;;) {
         Out* o = findOut(id);
-        if (!o || o->phase != Out::Sending) return;
+        // A task in the reader carries on from there once it returns.
+        if (!o || o->phase != Out::Sending || o->reading) return;
 
         if (o->confirmed == o->size && o->chunks.empty()) {
             if (o->endQueued) return;
@@ -319,13 +332,22 @@ void Streams::pump(uint32_t id) {
             fresh.frame[0] = kData;
             putU32(fresh.frame.get() + 1, id);
             putU32(fresh.frame.get() + 5, o->next);
-            if (!o->read(o->next, fresh.frame.get() + kDataHeader, len)) {
+            Callback<bool(uint32_t, uint8_t*, size_t)> read = o->read;
+            uint32_t offset = o->next;
+            o->reading = true;
+            bool ok;
+            {
+                GateScope open(engine_.callbackGate());
+                ok = read(offset, fresh.frame.get() + kDataHeader, len);
+            }
+            o = findOut(id);  // the reader, or another task, may have finished the stream
+            if (!o) return;
+            o->reading = false;
+            if (!ok) {
                 control(o->dst, kAbort, id);
                 finishOut(id, Status::Cancelled);
                 return;
             }
-            o = findOut(id);  // the reader may have cancelled the stream
-            if (!o) return;
             o->crc = wire::crc32(fresh.frame.get() + kDataHeader, len, o->crc);
             o->next += len;
             o->chunks.push_back(std::move(fresh));  // within the reserved window
@@ -357,7 +379,10 @@ void Streams::finishOut(uint32_t id, Status status) {
         if (out_[i]->id != id) continue;
         std::unique_ptr<Out> o = std::move(out_[i]);  // detach, then call
         out_.erase(out_.begin() + static_cast<std::ptrdiff_t>(i));
-        if (o->done) o->done(status);
+        if (o->done) {
+            GateScope open(engine_.callbackGate());
+            o->done(status);
+        }
         return;
     }
 }
@@ -365,12 +390,27 @@ void Streams::finishOut(uint32_t id, Status status) {
 // ---------------------------------------------------------------------------
 // Receiving
 
-bool Streams::deliverChunk(In& in, const uint8_t* data, size_t len) {
-    if (in.expected + len > in.size) return false;
-    if (in.sink.write && !in.sink.write(in.expected, data, len)) return false;
-    in.crc = wire::crc32(data, len, in.crc);
-    in.expected += static_cast<uint32_t>(len);
-    return true;
+Streams::Write Streams::deliverChunk(const Mac& src, uint32_t id, const uint8_t* data, size_t len) {
+    In* in = findIn(src, id);
+    if (!in) return Write::Gone;
+    if (in->expected + len > in->size) return Write::Failed;
+    if (in->write) {
+        Callback<bool(uint32_t, const uint8_t*, size_t)> write = in->write;
+        uint32_t offset = in->expected;
+        in->writing = true;
+        bool ok;
+        {
+            GateScope open(engine_.callbackGate());
+            ok = write(offset, data, len);
+        }
+        in = findIn(src, id);  // another task may have finished the stream
+        if (!in) return Write::Gone;
+        in->writing = false;
+        if (!ok) return Write::Failed;
+    }
+    in->crc = wire::crc32(data, len, in->crc);
+    in->expected += static_cast<uint32_t>(len);
+    return Write::Ok;
 }
 
 void Streams::finishIn(const Mac& src, uint32_t id, Status status) {
@@ -378,7 +418,10 @@ void Streams::finishIn(const Mac& src, uint32_t id, Status status) {
         if (in_[i]->id != id || in_[i]->src != src) continue;
         heap::Owned<In> s = std::move(in_[i]);
         in_.erase(in_.begin() + static_cast<std::ptrdiff_t>(i));
-        if (s->sink.done) s->sink.done(status);
+        if (s->done) {
+            GateScope open(engine_.callbackGate());
+            s->done(status);
+        }
         return;
     }
 }
@@ -414,7 +457,7 @@ void Streams::handle(const Message& m) {
                 in->held = static_cast<In::Held*>(heap::allocate((window - 1u) * sizeof(In::Held)));
                 if (!in->held) in.reset();
             }
-            if (in_.size() >= kMaxIncoming || !in || !heap::fits(headerLen)) {
+            if (in_.size() >= kMaxIncoming || !in || !heap::fits(headerLen + 2 * kCallbackBytes)) {
                 control(m.src, kReject, id, kBusy, true);
                 return;
             }
@@ -425,13 +468,23 @@ void Streams::handle(const Message& m) {
             info.topic = d[13];
             info.header.assign(d + kOfferFixed, d + m.len);
             StreamSink sink;
-            if (!acceptor_(info, sink)) {
+            bool accepted;
+            {
+                Callback<bool(const StreamInfo&, StreamSink&)> acceptor = acceptor_;
+                GateScope open(engine_.callbackGate());
+                accepted = acceptor(info, sink);
+            }
+            if (!accepted) {
                 control(m.src, kReject, id, kRefused, true);
                 return;
             }
-            if (in_.size() >= kMaxIncoming || findIn(m.src, id)) {  // the acceptor re-entered
+            // The acceptor re-entered, or another task called in meanwhile.
+            if (!running_ || in_.size() >= kMaxIncoming || findIn(m.src, id)) {
                 control(m.src, kReject, id, kBusy, true);
-                if (sink.done) sink.done(Status::Cancelled);
+                if (sink.done) {
+                    GateScope open(engine_.callbackGate());
+                    sink.done(Status::Cancelled);
+                }
                 return;
             }
             in->src = m.src;
@@ -439,7 +492,8 @@ void Streams::handle(const Message& m) {
             in->size = info.size;
             in->chunk = chunk;
             in->window = window;
-            in->sink = std::move(sink);
+            in->write.set(std::move(sink.write));
+            in->done.set(std::move(sink.done));
             in->lastActivity = now_;
             in_.push_back(std::move(in));  // within the reserved capacity
             control(m.src, kAccept, id);
@@ -467,6 +521,10 @@ void Streams::handle(const Message& m) {
             In* in = findIn(m.src, id);
             if (!in) {
                 control(m.src, kAbort, id);  // e.g. we restarted: tell the sender at once
+                return;
+            }
+            if (in->writing) {
+                m.refused = true;  // another task is in its sink: the sender sends this again
                 return;
             }
             in->lastActivity = now_;
@@ -502,20 +560,22 @@ void Streams::handle(const Message& m) {
                 in->held[in->heldCount++] = h;
                 return;
             }
-            bool ok = deliverChunk(*in, data, len);
-            for (bool progress = ok; progress && ok;) {
+            Write w = deliverChunk(m.src, id, data, len);
+            for (bool progress = w == Write::Ok; progress && w == Write::Ok;) {
                 progress = false;
+                in = findIn(m.src, id);
+                if (!in) return;
                 for (size_t i = 0; i < in->heldCount; ++i) {
                     if (in->held[i].offset != in->expected) continue;
                     In::Held h = in->held[i];
                     in->held[i] = in->held[--in->heldCount];
-                    ok = deliverChunk(*in, h.data, h.len);
+                    w = deliverChunk(m.src, id, h.data, h.len);
                     heap::release(h.block);
                     progress = true;
                     break;
                 }
             }
-            if (!ok) {
+            if (w == Write::Failed) {
                 control(m.src, kAbort, id);
                 finishIn(m.src, id, Status::Rejected);
             }
@@ -525,6 +585,10 @@ void Streams::handle(const Message& m) {
             if (m.len < 9) return;
             In* in = findIn(m.src, id);
             if (!in) return;
+            if (in->writing) {
+                m.refused = true;  // its last bytes are still being written: the sender sends this again
+                return;
+            }
             uint8_t code = kResultOk;
             if (in->expected != in->size) {
                 code = kResultIncomplete;

@@ -174,6 +174,12 @@ public:
     /// exchanges with it. One at a time.
     void setSentObserver(SentObserver observer) { sent_.set(std::move(observer)); }
 
+    /// Opened around application callbacks: receive handlers on ports below
+    /// kFirstReservedPort, and completions of messages sent on them (null:
+    /// none). NowTP's own services, on the reserved ports, run inside.
+    void setCallbackGate(CallbackGate* gate) { gate_ = gate; }
+    CallbackGate* callbackGate() const { return gate_; }
+
     /// Authenticates outgoing messages and checks incoming ones (null: none).
     void setAuthenticator(Authenticator* auth) { auth_ = auth; }
     /// True when outgoing messages on `port` are authenticated (a key is installed).
@@ -397,6 +403,7 @@ private:
     Callback<void(const Mac&, bool, uint32_t)> heard_;
     Callback<void(const Mac&, uint8_t, uint32_t, uint64_t)> sent_;
     Authenticator* auth_ = nullptr;
+    CallbackGate* gate_ = nullptr;
 };
 
 }  // namespace nowtp

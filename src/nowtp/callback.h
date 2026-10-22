@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <stdint.h>
+
 #include <functional>
 #include <memory>
 #include <utility>
@@ -38,6 +40,33 @@ public:
 
 private:
     std::shared_ptr<Function> target_;
+};
+
+/// Brackets each call of an application callback, so that its owner can let
+/// go of its lock meanwhile: EspNowTransport does, so a callback may wait for
+/// a task that is itself calling NowTP. Code around a gate must not rely on
+/// state it read before: other tasks may call in while the callback runs, as
+/// the callback itself may. enter() returns what the matching leave() needs.
+class CallbackGate {
+public:
+    virtual ~CallbackGate() {}
+    virtual uint32_t enter() = 0;
+    virtual void leave(uint32_t token) = 0;
+};
+
+/// Holds a gate open for a scope; a null gate does nothing.
+class GateScope {
+public:
+    explicit GateScope(CallbackGate* gate) : gate_(gate), token_(gate ? gate->enter() : 0) {}
+    ~GateScope() {
+        if (gate_) gate_->leave(token_);
+    }
+    GateScope(const GateScope&) = delete;
+    GateScope& operator=(const GateScope&) = delete;
+
+private:
+    CallbackGate* gate_;
+    uint32_t token_;
 };
 
 }  // namespace nowtp

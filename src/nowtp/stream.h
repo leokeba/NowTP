@@ -60,7 +60,8 @@ struct StreamOptions {
 /// A stream is offered to the receiver, which accepts or rejects it based on
 /// its topic, size and header; the data then follows as reliable messages,
 /// and a CRC-32 over the whole stream confirms the result. Platform-independent;
-/// driven by tick(). Reader and sink callbacks run in the engine's context.
+/// driven by tick(). Its application callbacks (acceptor, reader, sink,
+/// progress, done) run inside the engine's CallbackGate.
 class Streams {
 public:
     static constexpr size_t kMaxHeader = 200;
@@ -117,7 +118,8 @@ private:
     void finishOut(uint32_t id, Status status);
     void finishIn(const Mac& src, uint32_t id, Status status);
     void control(const Mac& dst, uint8_t type, uint32_t id, uint8_t value = 0, bool withValue = false);
-    bool deliverChunk(In& in, const uint8_t* data, size_t len);
+    enum class Write : uint8_t { Ok, Failed, Gone };
+    Write deliverChunk(const Mac& src, uint32_t id, const uint8_t* data, size_t len);
 
     Engine& engine_;
     std::function<uint32_t()> random_;

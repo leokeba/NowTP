@@ -365,7 +365,9 @@ for (;;) {
 
 Call `end()` from the task that polls, or stop polling first.
 
-Callbacks may call `send()` and `listen()`. Keep them short, and hand heavy work to your own task. `Message::data` is only valid during the receive callback. To keep a message reassembled from several frames without copying it, take its buffer: save `m.buffer`, set `m.buffer = nullptr`, and `free()` it when done. Single-frame messages have no buffer to take (`m.buffer` is null) and must be copied.
+Callbacks run without NowTP's lock: receive handlers, completions, peer and channel events, and stream callbacks. A callback may therefore wait for a lock of your own even while another task that holds it calls NowTP. In turn, other tasks may call NowTP while a callback runs, so what a callback read earlier, from `peers()` for instance, may have changed by the time it acts. A completion may also run in a task whose own call into NowTP finished the message, before that call returns. NowTP's own services keep the lock.
+
+Callbacks may call `send()`, `listen()` and the rest of the API, but not `end()` or the blocking calls (`sendAndWait()`, diagnostics, pairing). `end()` waits for callbacks still running in other tasks. Keep callbacks short, since the NowTP task handles nothing else meanwhile, and hand heavy work to your own task. `Message::data` is only valid during the receive callback. To keep a message reassembled from several frames without copying it, take its buffer: save `m.buffer`, set `m.buffer = nullptr`, and `free()` it when done. Single-frame messages have no buffer to take (`m.buffer` is null) and must be copied.
 
 A handler that can't take a message now, for instance on a short heap, sets `m.refused = true`. A reliable sender is then told the receiver is busy, backs off and sends the message again, and the handler sees it as a new delivery. NowTP acknowledges a reliable message as complete only after its handler has returned without refusing it, so a sender that sees `Ok` knows the application took it. A refused unreliable message is dropped. Refusals are counted in `stats().messagesRefused`.
 

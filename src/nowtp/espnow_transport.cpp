@@ -374,6 +374,29 @@ private:
     EspNowTransport& t_;
 };
 
+// Lets go of the lock, however deep the calling task holds it, while an
+// application callback runs (see CallbackGate), and takes it back after.
+class EspNowTransport::Gate : public CallbackGate {
+public:
+    explicit Gate(EspNowTransport& t) : t_(t) {}
+    uint32_t enter() override {
+        t_.callbacks_++;
+        if (xSemaphoreGetMutexHolder(t_.mutex_) != xTaskGetCurrentTaskHandle()) return 0;
+        int depth = t_.lockDepth_;
+        t_.lockDepth_ = 0;
+        for (int i = 0; i < depth; ++i) xSemaphoreGiveRecursive(t_.mutex_);
+        return static_cast<uint32_t>(depth);
+    }
+    void leave(uint32_t depth) override {
+        for (uint32_t i = 0; i < depth; ++i) xSemaphoreTakeRecursive(t_.mutex_, portMAX_DELAY);
+        if (depth) t_.lockDepth_ = static_cast<int>(depth);
+        t_.callbacks_--;
+    }
+
+private:
+    EspNowTransport& t_;
+};
+
 EspNowTransport::EspNowTransport() {}
 
 EspNowTransport::~EspNowTransport() {
@@ -442,6 +465,8 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, *peerTable_, sendTracker_,
                               [this](const Mac& mac) { applyPeerRate(mac); }));
     engine_.reset(new Engine(*link_, config_.protocol, static_cast<uint16_t>(esp_random())));
+    gate_.reset(new Gate(*this));
+    engine_->setCallbackGate(gate_.get());
     if (!events_ || !mutex_ || !taskExited_) {
         cleanup();
         return Status::NoMemory;
@@ -465,7 +490,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
         follower_.reset(new ChannelFollower(*discovery_, *this, config_.channel));
         follower_->onChannelChange([this](uint8_t ch) {
             ESP_LOGI(kTag, "followed peers to channel %u", ch);
-            if (channelHandler_) channelHandler_(ch);
+            channelChanged(ch);
         });
         discovery_->onPeerMoved([this](const PeerInfo& p, uint8_t ch) { follower_->onPeerMoved(p, ch, nowMs()); });
         // A new peer's first announcement waits for its epoch to be verified: ask again at once.
@@ -590,6 +615,8 @@ void EspNowTransport::end() {
     lock();
     engine_->cancelAll(Status::Cancelled);
     unlock();
+    // Callbacks run without the lock: one may still be running in another task.
+    while (callbacks_.load() != 0) vTaskDelay(1);
     cleanup();
 }
 
@@ -611,6 +638,7 @@ void EspNowTransport::cleanup() {
     security_.reset();
     host_.reset();
     engine_.reset();
+    gate_.reset();
     link_.reset();
     peerTable_.reset();
     peerDriver_.reset();
@@ -1473,7 +1501,19 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
         }
         link_->setFrameSize(peer.mac, size);
     }
-    if (peerHandler_) peerHandler_(event, peer);
+    if (peerHandler_) {
+        // A copy: another task may replace the handler while it runs unlocked.
+        Callback<void(PeerEvent, const PeerInfo&)> handler = peerHandler_;
+        GateScope open(gate_.get());
+        handler(event, peer);
+    }
+}
+
+void EspNowTransport::channelChanged(uint8_t ch) {
+    if (!channelHandler_) return;
+    Callback<void(uint8_t)> handler = channelHandler_;
+    GateScope open(gate_.get());
+    handler(ch);
 }
 
 bool EspNowTransport::hasExplicitFrameSize(const Mac& mac) const {
@@ -1782,7 +1822,7 @@ void EspNowTransport::adoptChannel(uint8_t ch, bool fixed, uint32_t now) {
     radio_.stationConnected = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) && stationConnected();
     if (discovery_) discovery_->setChannelInfo(ch, config_.channel.anchor || fixed, now);
     if (follower_) follower_->onChannelChanged(ch, now);
-    if (channelHandler_) channelHandler_(ch);
+    channelChanged(ch);
 }
 
 // The station connected, disconnected or followed its access point to another

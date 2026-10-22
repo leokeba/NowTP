@@ -202,9 +202,21 @@ struct RadioInfo {
 /// 250 ms without the default event loop. Peers address a node by the MAC
 /// of that interface, so this node's address (localMac()) changes with it:
 /// a soft-AP's MAC is the station's + 1. Only one instance can be
-/// active, since ESP-NOW has a single pair of driver callbacks. Receive and
-/// completion callbacks run in the NowTP task (or inside poll()), never in the
-/// Wi-Fi driver task; keep them short.
+/// active, since ESP-NOW has a single pair of driver callbacks.
+///
+/// Callbacks: receive handlers, send completions, peer and channel events,
+/// and stream callbacks (acceptor, reader, sink, progress, done) run in the
+/// NowTP task (or inside poll()), never in the Wi-Fi driver task. A completion
+/// may also run in a task whose call into NowTP finished the message, before
+/// that call returns. They run without NowTP's lock, so a callback may take
+/// a lock of the application's even while another task holding it calls
+/// NowTP. In turn, other tasks may call NowTP while a callback runs: what a
+/// callback learned (peers(), a stream's progress) may have changed by the
+/// time it acts. Callbacks may call NowTP, but not end() or the blocking calls
+/// (sendAndWait(), diagnostics, pairing); end() waits for callbacks running in
+/// other tasks to return. Keep them short: the NowTP task handles nothing else
+/// meanwhile. The wake hook (EspNowConfig::wake) is different: it must never
+/// call NowTP.
 class EspNowTransport : public RadioControl {
 public:
     /// Engine counters plus radio-level ones.
@@ -222,6 +234,7 @@ public:
 
     Status begin(const EspNowConfig& config = EspNowConfig());
     /// Stops the transport; pending messages complete with Status::Cancelled.
+    /// Never from a callback. Waits for callbacks running in other tasks.
     void end();
     bool started() const { return started_; }
 
@@ -410,6 +423,8 @@ private:
     bool stationConnected() const;
     void handlePeerEvent(PeerEvent event, const PeerInfo& peer);
     class Host;
+    class Gate;
+    void channelChanged(uint8_t channel);
     Status diagnosticsReady() const;
     void startPowerFallback(const Mac& peer);
     void sendFallbackPing();
@@ -453,6 +468,8 @@ private:
     std::vector<std::pair<Mac, PhyRate>> peerRates_;
     std::vector<LinkHealth> linkHealth_;
     std::unique_ptr<Host> host_;
+    std::unique_ptr<Gate> gate_;
+    std::atomic<int> callbacks_{0};  // application callbacks running, with the lock let go
     std::unique_ptr<Diagnostics> diagnostics_;
     std::unique_ptr<Security> security_;
     std::unique_ptr<ChannelFollower> follower_;

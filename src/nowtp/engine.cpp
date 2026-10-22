@@ -637,6 +637,7 @@ void Engine::flushCompletions() {
         Owned<TxMessage> t(doneHead_);
         doneHead_ = t->nextDone;
         if (!doneHead_) doneTail_ = nullptr;
+        GateScope open(t->port < kFirstReservedPort ? gate_ : nullptr);
         t->done(t->result);
     }
     flushing_ = false;
@@ -791,7 +792,10 @@ Engine::Delivery Engine::deliver(const Mac& src, uint8_t port, uint8_t flags, co
     m.authenticated = authenticated;
     m.timestampUs = timestampUs;
     m.buffer = owned.release();
-    handler(m);
+    {
+        GateScope open(port < kFirstReservedPort ? gate_ : nullptr);
+        handler(m);
+    }
     heap::release(m.buffer);
     if (m.refused) {
         stats_.messagesRefused++;

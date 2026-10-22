@@ -3757,6 +3757,177 @@ TEST(stream_over_secured_link) {
     rig.net.tickers.pop_back();
 }
 
+// ---------------------------------------------------------------------------
+// Application callbacks without the lock (CallbackGate)
+
+namespace {
+
+// Stands in for EspNowTransport's gate, which lets go of its lock. What
+// another task does meanwhile runs in leave(): after the callback, before
+// NowTP's code goes on, the worst moment.
+struct TestGate : CallbackGate {
+    int depth = 0;
+    int opened = 0;
+    std::function<void()> meanwhile;  // runs once, at the next leave()
+
+    uint32_t enter() override {
+        depth++;
+        opened++;
+        return 0;
+    }
+    void leave(uint32_t) override {
+        depth--;
+        if (!meanwhile) return;
+        std::function<void()> f;
+        f.swap(meanwhile);
+        f();
+    }
+};
+
+}  // namespace
+
+TEST(gate_brackets_application_callbacks_only) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    TestGate ga, gb;
+    net.engine(a).setCallbackGate(&ga);
+    net.engine(b).setCallbackGate(&gb);
+    int appRx = -1, serviceRx = -1, appDone = -1, serviceDone = -1;
+    net.engine(b).listen(1, [&](const Message&) { appRx = gb.depth; });
+    net.engine(b).listen(kStreamPort, [&](const Message&) { serviceRx = gb.depth; });
+    auto msg = pattern(600);
+    net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), [&](Status) { appDone = ga.depth; },
+                       net.now());
+    net.engine(a).send(net.mac(b), kStreamPort, msg.data(), msg.size(), reliable(),
+                       [&](Status) { serviceDone = ga.depth; }, net.now());
+    CHECK(net.runUntil([&] { return appDone >= 0 && serviceDone >= 0; }));
+    CHECK_EQ(appRx, 1);
+    CHECK_EQ(appDone, 1);
+    CHECK_EQ(serviceRx, 0);  // NowTP's own services keep the lock
+    CHECK_EQ(serviceDone, 0);
+}
+
+// Other tasks call in while a callback runs: the engine carries on with
+// whatever they changed.
+TEST(engine_carries_on_after_calls_made_while_callbacks_run) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    TestGate ga, gb;
+    net.engine(a).setCallbackGate(&ga);
+    net.engine(b).setCallbackGate(&gb);
+    Inbox later;
+    int first = 0;
+    net.engine(b).listen(1, [&](const Message&) {
+        first++;
+        // Meanwhile: the handler is replaced, and a reply goes out.
+        gb.meanwhile = [&] {
+            net.engine(b).listen(1, later.handler());
+            uint8_t reply[300] = {};
+            net.engine(b).send(net.mac(a), 2, reply, sizeof(reply), reliable(), nullptr, net.now());
+        };
+    });
+    Inbox replies;
+    net.engine(a).listen(2, replies.handler());
+    std::vector<Outcome> outs(3);
+    auto msg = pattern(700);
+    for (auto& o : outs) {
+        net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), o.handler(), net.now());
+    }
+    // A completion meanwhile: everything else is cancelled (another task ending).
+    ga.meanwhile = [&] { net.engine(a).cancelAll(Status::Cancelled); };
+    CHECK(net.runUntil([&] { return outs[2].done; }));
+    CHECK(outs[0].status == Status::Ok);
+    CHECK(outs[1].status == Status::Cancelled);
+    CHECK(outs[2].status == Status::Cancelled);
+    CHECK_EQ(first, 1);
+    net.run(500);
+    CHECK_EQ(replies.messages.size(), 1u);
+    auto again = pattern(800, 2);
+    Outcome out;
+    net.engine(a).send(net.mac(b), 1, again.data(), again.size(), reliable(), out.handler(), net.now());
+    CHECK(net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    CHECK_EQ(later.messages.size(), 1u);
+}
+
+TEST(stream_survives_being_finished_while_callbacks_run) {
+    std::vector<uint8_t> data = pattern(40000, 5);
+    // Sender: another task cancels the stream while the reader runs, or pumps it.
+    for (int variant = 0; variant < 2; ++variant) {
+        StreamRig rig;
+        size_t a = rig.add(), b = rig.add();
+        TestGate gate;
+        rig.net.engine(a).setCallbackGate(&gate);
+        Received& r = rig.receiver();
+        rig.st[b]->onIncoming(collectInto(r));
+        Outcome& out = rig.outcome();
+        uint32_t id = 0, reads = 0, next = 0;
+        bool inOrder = true;
+        auto reader = [&](uint32_t offset, uint8_t* buf, size_t n) {
+            inOrder = inOrder && offset == next;
+            next = offset + static_cast<uint32_t>(n);
+            memcpy(buf, data.data() + offset, n);
+            if (++reads == 3) {
+                gate.meanwhile = [&, variant] {
+                    if (variant == 0) {
+                        rig.st[a]->cancel(id, rig.net.now());
+                    } else {
+                        rig.st[a]->tick(rig.net.now());  // must not read again meanwhile
+                    }
+                };
+            }
+            return true;
+        };
+        CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()), reader, out.handler(),
+                              StreamOptions(), rig.net.now(), &id) == Status::Ok);
+        CHECK(rig.net.runUntil([&] { return out.done; }, 30000));
+        CHECK(inOrder);
+        if (variant == 0) {
+            CHECK(out.status == Status::Cancelled);
+        } else {
+            CHECK(out.status == Status::Ok);
+            CHECK(r.data == data);
+        }
+        CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    }
+
+    // Receiver: another task stops streams (ends the transport) while the sink
+    // writes, and while the acceptor decides.
+    for (int variant = 0; variant < 2; ++variant) {
+        StreamRig rig;
+        size_t a = rig.add(), b = rig.add();
+        TestGate gate;
+        rig.net.engine(b).setCallbackGate(&gate);
+        Received& r = rig.receiver();
+        StreamAcceptor accept = collectInto(r);
+        rig.st[b]->onIncoming([&, variant](const StreamInfo& info, StreamSink& sink) {
+            bool ok = accept(info, sink);
+            std::function<bool(uint32_t, const uint8_t*, size_t)> write = sink.write;
+            if (variant == 0) {
+                gate.meanwhile = [&] { rig.st[b]->stop(); };
+            } else {
+                sink.write = [&, write](uint32_t offset, const uint8_t* d, size_t n) {
+                    testing::HeapExempt app;
+                    if (offset > 0 && !gate.meanwhile) gate.meanwhile = [&] { rig.st[b]->stop(); };
+                    return write(offset, d, n);
+                };
+            }
+            return ok;
+        });
+        Outcome& out = rig.outcome();
+        rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                        [&](uint32_t offset, uint8_t* buf, size_t n) {
+                            memcpy(buf, data.data() + offset, n);
+                            return true;
+                        },
+                        out.handler(), StreamOptions(), rig.net.now());
+        CHECK(rig.net.runUntil([&] { return out.done && r.done; }, 30000));
+        CHECK(out.status != Status::Ok);
+        CHECK(r.status == Status::Cancelled);
+        CHECK_EQ(rig.st[b]->incoming(), 0u);
+    }
+}
+
 TEST(engine_reports_receive_timestamps) {
     sim::Network net;
     size_t a = net.addNode(), b = net.addNode();
