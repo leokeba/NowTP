@@ -25,9 +25,13 @@ struct FreeBytes {
 };
 typedef std::unique_ptr<uint8_t[], FreeBytes> Bytes;
 
-/// Bytes after the payload that NowTP may need in an outgoing message's
-/// buffer: the authentication trailer and the CRC of a multi-frame message.
-constexpr size_t kSendOverhead = wire::kAuthTrailerSize + wire::kCrcSize;
+/// Room before an outgoing message's payload, where each frame's header is
+/// written in turn (see Engine::buildFrame()).
+constexpr size_t kSendHeadroom = wire::kFragmentHeaderSize;
+/// Bytes beyond the payload that NowTP needs in an outgoing message's
+/// buffer: the frame header's room, the authentication trailer, and the CRC
+/// of a multi-frame message.
+constexpr size_t kSendOverhead = kSendHeadroom + wire::kAuthTrailerSize + wire::kCrcSize;
 
 /// A received frame as seen before any filtering, for diagnostics.
 struct FrameInfo {
@@ -131,8 +135,9 @@ public:
                 CompletionHandler done, uint32_t nowMs, uint32_t* messageId = nullptr);
     /// Like send(), but takes `buffer`: a malloc()ed block of `capacity` bytes
     /// whose first `len` are the payload. With capacity >= len + kSendOverhead
-    /// it is used without a copy; otherwise it is realloc()ed. It is freed in
-    /// every case, including when an error is returned.
+    /// it is used without a copy (the payload moves up by kSendHeadroom);
+    /// otherwise it is realloc()ed. It is freed in every case, including when
+    /// an error is returned.
     Status sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
                       const SendOptions& options, CompletionHandler done, uint32_t nowMs);
 
@@ -317,7 +322,9 @@ private:
     void spendCredit(const TxMessage& tx);
     /// What we tell `src` in an ack: room for its next message, in kCreditUnit.
     uint8_t creditFor(const Mac& src, uint32_t now) const;
-    size_t buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest);
+    uint8_t* buildFrame(TxMessage& tx, uint16_t index, bool ackRequest, uint8_t* saved, size_t& headerLen,
+                        size_t& len);
+    bool fitFrames(TxMessage& tx);
     void frameSent(bool delivered, uint32_t now, uint64_t sentUs);
     Status queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes owned, size_t len, size_t capacity,
                  const SendOptions& options, CompletionHandler done, uint32_t now, uint32_t* messageId = nullptr);
@@ -386,8 +393,6 @@ private:
     std::vector<std::pair<uint8_t, Callback<void(const Message&)>>> listeners_;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;
-    Bytes frame_;  // the frame being built, malloc'd at the largest size used
-    size_t frameCapacity_ = 0;
 
     std::vector<Backoff> backoffs_;
     std::vector<Credit> credits_;

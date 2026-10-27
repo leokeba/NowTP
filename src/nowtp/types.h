@@ -185,6 +185,9 @@ struct Stats {
     /// Messages a receive handler refused (Message::refused). Also counted in
     /// messagesDropped, not in messagesReceived.
     uint32_t messagesRefused = 0;
+    /// Queued messages cut again into smaller frames because their
+    /// destination's frame size shrank (e.g. it came back with ESP-NOW v1).
+    uint32_t messagesRecut = 0;
 };
 
 }  // namespace nowtp

@@ -76,6 +76,7 @@ struct Engine::TxMessage {
     uint16_t fragSize = 0;  // stream bytes per fragment when count > 1
     size_t streamLen = 0;   // payload, plus CRC-32 when count > 1
     size_t trailerAt = 0;   // offset of the authentication trailer (with kFlagAuth)
+    bool onAir = false;     // a frame of this cut was sent (see fitFrames())
     // Earlier seals' binds, newest first: an ack may still come for a copy
     // sent before reseal(). Seals that never went on air aren't kept.
     static constexpr size_t kOldBinds = 3;
@@ -85,6 +86,8 @@ struct Engine::TxMessage {
     bool resealWanted = false;  // asked again within a second: done at resealAt + 1 s
     uint32_t resealAt = 0;
     uint8_t bindsBefore[kOldBinds * kAckBindSize];
+    // kSendHeadroom bytes, then the stream, then room for a CRC-32 even when
+    // count is 1 (fitFrames() may cut it into fragments later).
     Bytes stream;
     uint16_t nextIndex = 0;  // next fragment of the first pass
     Bytes resend;            // bitmap of fragments to send again, allocated on first use
@@ -98,6 +101,8 @@ struct Engine::TxMessage {
     Status result = Status::Ok;  // once finished
     TxMessage* nextDone = nullptr;
 
+    uint8_t* data() const { return stream.get() + kSendHeadroom; }
+    size_t payloadLen() const { return count > 1 ? streamLen - kCrcSize : streamLen; }
     bool reliable() const { return (flags & kFlagReliable) != 0; }
     bool latest() const { return (flags & kFlagLatest) != 0; }
     bool firstPassPending() const { return nextIndex < count; }
@@ -271,20 +276,24 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
         return Status::QueueFull;
     }
 
+    // Frame headers are written in the buffer, just before each frame's bytes.
+    size_t room = kSendHeadroom + payloadLen + kCrcSize;
     Bytes stream;
     if (owned) {
-        if (capacity >= streamLen) {
-            stream = std::move(owned);
-        } else {
-            uint8_t* grown = static_cast<uint8_t*>(heap::reallocate(owned.get(), streamLen));
+        if (capacity < room) {
+            uint8_t* grown = static_cast<uint8_t*>(heap::reallocate(owned.get(), room));
             if (grown) {
                 owned.release();  // moved into `grown`
-                stream.reset(grown);
+                owned.reset(grown);
+            } else {
+                owned.reset();
             }
         }
+        if (owned && len > 0) memmove(owned.get() + kSendHeadroom, owned.get(), len);
+        stream = std::move(owned);
     } else {
-        stream = allocBytes(streamLen);
-        if (stream && len > 0) memcpy(stream.get(), data, len);
+        stream = allocBytes(room);
+        if (stream && len > 0) memcpy(stream.get() + kSendHeadroom, data, len);
     }
     Owned<TxMessage> tx = heap::make<TxMessage>();
     if (!stream || !tx) {
@@ -299,11 +308,11 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     tx->streamLen = streamLen;
     tx->stream = std::move(stream);
     if (trailer) {
-        auth_->seal(dst, port, tx->flags, tx->stream.get(), len, tx->stream.get() + len);
+        auth_->seal(dst, port, tx->flags, tx->data(), len, tx->data() + len);
         tx->flags = static_cast<uint8_t>(tx->flags | kFlagAuth);
         tx->trailerAt = len;
     }
-    if (count > 1) putU32(tx->stream.get() + payloadLen, crc32(tx->stream.get(), payloadLen));
+    if (count > 1) putU32(tx->data() + payloadLen, crc32(tx->data(), payloadLen));
 
     tx->id = nextId_++;
     if (messageId) *messageId = tx->id;
@@ -317,20 +326,47 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     return Status::Ok;
 }
 
-// 0 if there is no memory for the frame buffer.
-size_t Engine::buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest) {
-    // The message was cut for the destination's frame size when it was queued,
-    // which may have shrunk since (a peer lost, or announced again smaller).
-    size_t need = tx.count > 1 ? kFragmentHeaderSize + tx.fragSize : kCommonHeaderSize + tx.streamLen;
-    if (frameCapacity_ < need) {
-        // As large as the largest frame sent so far (1470 bytes with v2 peers).
-        size_t size = std::max(need, link_.maxFrameSize(tx.dst));
-        Bytes bigger = allocBytes(size);
-        if (!bigger) return 0;
-        frame_ = std::move(bigger);
-        frameCapacity_ = size;
+// A message is cut for its destination's frame size when it is queued, and
+// that may shrink meanwhile (the peer lost, or announced again smaller). The
+// message is then cut again, under a new id if a frame of the old cut went
+// out: the receiver may hold some. False if it was finished instead.
+bool Engine::fitFrames(TxMessage& tx) {
+    size_t mtu = link_.maxFrameSize(tx.dst);
+    size_t largest = tx.count > 1 ? kFragmentHeaderSize + tx.fragSize : kCommonHeaderSize + tx.streamLen;
+    if (largest <= mtu) return true;
+    size_t payloadLen = tx.payloadLen();
+    size_t streamLen = payloadLen + kCrcSize;
+    if (mtu <= kFragmentHeaderSize) {
+        finish(&tx, Status::LinkError);
+        return false;
     }
+    uint16_t fragSize = static_cast<uint16_t>(std::min<size_t>(mtu - kFragmentHeaderSize, 0xFFFF));
+    size_t count = (streamLen + fragSize - 1) / fragSize;
+    if (count > 0xFFFF) {
+        finish(&tx, Status::TooLarge);
+        return false;
+    }
+    if (tx.count == 1) putU32(tx.data() + payloadLen, crc32(tx.data(), payloadLen));
+    txBytes_ = txBytes_ - tx.streamLen + streamLen;
+    tx.streamLen = streamLen;
+    tx.fragSize = fragSize;
+    tx.count = static_cast<uint16_t>(count);
+    if (tx.onAir) tx.id = nextId_++;
+    tx.onAir = false;
+    tx.nextIndex = 0;
+    tx.clearResend();
+    tx.awaitingAck = false;
+    stats_.messagesRecut++;
+    return true;
+}
 
+// Frame `index` of `tx`, its header written in place just before its bytes:
+// over the headroom for the first, over the end of the previous fragment for
+// the others. Those bytes go to `saved` (kFragmentHeaderSize), to be put back
+// once the link has copied the frame. Returns the frame; `headerLen` and
+// `len` receive its header's size and its own.
+uint8_t* Engine::buildFrame(TxMessage& tx, uint16_t index, bool ackRequest, uint8_t* saved, size_t& headerLen,
+                            size_t& len) {
     Header h;
     h.type = tx.count > 1 ? Type::Fragment : Type::Single;
     h.flags = static_cast<uint8_t>(tx.flags | (ackRequest ? kFlagAckRequest : 0));
@@ -339,12 +375,14 @@ size_t Engine::buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest) 
     h.messageId = tx.id;
     h.index = index;
     h.count = tx.count;
-    size_t off = encodeHeader(h, frame_.get());
-
     size_t start = tx.count > 1 ? static_cast<size_t>(index) * tx.fragSize : 0;
     size_t n = tx.count > 1 ? std::min<size_t>(tx.fragSize, tx.streamLen - start) : tx.streamLen;
-    if (n > 0) memcpy(frame_.get() + off, tx.stream.get() + start, n);
-    return off + n;
+    headerLen = headerSize(h.type);
+    uint8_t* frame = tx.data() + start - headerLen;
+    memcpy(saved, frame, headerLen);
+    encodeHeader(h, frame);
+    len = headerLen + n;
+    return frame;
 }
 
 void Engine::pump(uint32_t now) {
@@ -385,14 +423,12 @@ void Engine::pump(uint32_t now) {
         if (!tx) break;
         lastDst_ = tx->dst;
 
+        if (!fitFrames(*tx)) continue;
         uint16_t index = tx->pendingFrame();
         bool ackRequest = tx->reliable() && tx->isLastPending();
-        size_t len = buildFrame(*tx, index, ackRequest);
-        if (len == 0) {  // short heap: try again shortly
-            linkBusy_ = true;
-            linkBusyUntil_ = now + config_.linkBusyBackoffMs;
-            break;
-        }
+        uint8_t saved[kFragmentHeaderSize];
+        size_t headerLen = 0, len = 0;
+        uint8_t* frame = buildFrame(*tx, index, ackRequest, saved, headerLen, len);
 
         inflight_ = InFlight();
         inflight_.active = true;
@@ -402,7 +438,8 @@ void Engine::pump(uint32_t now) {
         inflight_.ackRequest = ackRequest;
         inflight_.deadline = now + config_.frameSentTimeoutMs;
 
-        Status st = link_.sendFrame(tx->dst, frame_.get(), len);
+        Status st = link_.sendFrame(tx->dst, frame, len);  // copies the frame
+        memcpy(frame, saved, headerLen);
         if (st == Status::QueueFull) {
             inflight_.active = false;
             linkBusy_ = true;
@@ -417,6 +454,7 @@ void Engine::pump(uint32_t now) {
         }
         stats_.framesSent++;
         tx->sentSinceSeal = true;
+        tx->onAir = true;
         if (!inflight_.firstPass) stats_.retransmissions++;
     }
 
@@ -673,17 +711,17 @@ void Engine::reseal(const Mac& dst, uint32_t now) {
 }
 
 void Engine::resealOne(TxMessage& t, uint32_t now) {
-    uint8_t* trailer = t.stream.get() + t.trailerAt;
+    uint8_t* trailer = t.data() + t.trailerAt;
     if (t.sentSinceSeal) {
         memmove(t.bindsBefore + kAckBindSize, t.bindsBefore, (TxMessage::kOldBinds - 1) * kAckBindSize);
         memcpy(t.bindsBefore, trailer, kAckBindSize);
         if (t.oldBinds < TxMessage::kOldBinds) t.oldBinds++;
         t.sentSinceSeal = false;
     }
-    auth_->seal(t.dst, t.port, static_cast<uint8_t>(t.flags & (kFlagReliable | kFlagLatest)), t.stream.get(),
+    auth_->seal(t.dst, t.port, static_cast<uint8_t>(t.flags & (kFlagReliable | kFlagLatest)), t.data(),
                 t.trailerAt, trailer);
     size_t payloadLen = t.trailerAt + kAuthTrailerSize;
-    if (t.count > 1) putU32(t.stream.get() + payloadLen, crc32(t.stream.get(), payloadLen));
+    if (t.count > 1) putU32(t.data() + payloadLen, crc32(t.data(), payloadLen));
     t.resealed = true;
     t.resealWanted = false;
     t.resealAt = now;
@@ -1288,7 +1326,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         const uint8_t* frame = payload - kCommonHeaderSize;
         if (!auth_ || len < 1 + kAckTagSize ||
             !auth_->openAck(src, frame, kCommonHeaderSize + len - kAckTagSize, payload + len - kAckTagSize,
-                            tx->stream.get() + tx->trailerAt, tx->bindsBefore, tx->oldBinds)) {
+                            tx->data() + tx->trailerAt, tx->bindsBefore, tx->oldBinds)) {
             stats_.authRejected++;
             return;
         }

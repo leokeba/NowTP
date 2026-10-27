@@ -380,7 +380,7 @@ Callbacks may call `send()`, `listen()` and the rest of the API, but not `end()`
 
 A handler that can't take a message now, for instance on a short heap, sets `m.refused = true`. A reliable sender is then told the receiver is busy, backs off and sends the message again, and the handler sees it as a new delivery. NowTP acknowledges a reliable message as complete only after its handler has returned without refusing it, so a sender that sees `Ok` knows the application took it. A refused unreliable message is dropped. Refusals are counted in `stats().messagesRefused`.
 
-Sending works the other way round. `send()` copies the payload, so a large message briefly exists twice. `sendBuffer(dst, port, buf, len, capacity)` takes a `malloc()`ed buffer instead and frees it when done, including on errors. Allocate `len + nowtp::kSendOverhead` bytes so NowTP can add its trailer and checksum without reallocating.
+Sending works the other way round. `send()` copies the payload, so a large message briefly exists twice. `sendBuffer(dst, port, buf, len, capacity)` takes a `malloc()`ed buffer instead and frees it when done, including on errors. Allocate `len + nowtp::kSendOverhead` bytes so NowTP can write its frame headers, trailer and checksum without reallocating.
 
 ### Memory
 

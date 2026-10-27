@@ -1254,27 +1254,40 @@ struct SizedLink : Link {
 
 }  // namespace
 
-// A message keeps the frame size it was cut for, which may be more than its
-// destination takes by the time it goes out (a peer lost, or announced again
-// smaller). The frame buffer must hold it all the same: a 1205-byte frame once
-// went into a 250-byte buffer.
+// A message is cut for its destination's frame size when queued, which may
+// shrink before it has all gone out (a peer lost, or announced again
+// smaller). A 1205-byte frame once went into a 250-byte buffer; then such
+// messages went out too big and timed out. Now they are cut again, under a
+// new id if a frame of the old cut went out.
 TEST(frame_size_shrinking_under_a_queued_message) {
     for (size_t size : {1200, 3000}) {
-        SizedLink link;
-        Mac narrow = {{0x02, 0, 0, 0, 0, 1}};
-        Engine e(link);
-        uint32_t now = sim::clockStart();
-        auto small = pattern(10), big = pattern(size);
-        CHECK(e.send(narrow, 1, small.data(), small.size(), SendOptions(), nullptr, now) == Status::Ok);
-        Outcome out;
-        CHECK(e.send(link.wide, 1, big.data(), big.size(), SendOptions(), out.handler(), now) == Status::Ok);
-        link.wideSize = 250;
-        for (uint32_t t = 1; t < 10 && !out.done; ++t) e.onFrameSent(true, now + t);
-        CHECK(out.done && out.status == Status::Ok);
-        size_t header = size > 1470 ? wire::kFragmentHeaderSize : wire::kCommonHeaderSize;
-        CHECK(link.sent.size() >= 2u);
-        CHECK_EQ(link.sent[1].size(), size > 1470 ? 1470u : header + size);
-        CHECK(std::equal(link.sent[1].begin() + static_cast<std::ptrdiff_t>(header), link.sent[1].end(), big.begin()));
+        for (bool started : {false, true}) {
+            if (started && size < 1465) continue;  // one frame: nothing left to cut
+            SizedLink link, rxLink;
+            Mac narrow = {{0x02, 0, 0, 0, 0, 1}}, src = {{0x02, 0, 0, 0, 0, 9}};
+            Engine e(link), receiver(rxLink);
+            Inbox inbox;
+            receiver.listen(1, inbox.handler());
+            uint32_t now = sim::clockStart();
+            auto small = pattern(10), big = pattern(size);
+            CHECK(e.send(narrow, 1, small.data(), small.size(), SendOptions(), nullptr, now) == Status::Ok);
+            Outcome out;
+            CHECK(e.send(link.wide, 1, big.data(), big.size(), SendOptions(), out.handler(), now) == Status::Ok);
+            if (started) {
+                e.onFrameSent(true, now + 1);
+                CHECK_EQ(link.sent.back().size(), 1470u);  // the first of the old cut
+            }
+            link.wideSize = 250;
+            for (uint32_t t = 2; t < 40 && !out.done; ++t) e.onFrameSent(true, now + t);
+            CHECK(out.done && out.status == Status::Ok);
+            CHECK_EQ(e.stats().messagesRecut, 1u);
+            for (size_t i = 1; i < link.sent.size(); ++i) {
+                if (!(started && i == 1)) CHECK(link.sent[i].size() <= 250u);
+                receiver.onFrameReceived(src, link.sent[i].data(), link.sent[i].size(), now + 40);
+            }
+            CHECK_EQ(inbox.messages.size(), 1u);
+            CHECK(!inbox.messages.empty() && inbox.messages.back() == big);
+        }
     }
 }
 
