@@ -987,6 +987,7 @@ EspNowTransport::TransportStats EspNowTransport::stats() const {
     static_cast<Stats&>(s) = engine_->stats();
     s.droppedEvents = s_droppedEvents;
     s.oneWayLinks = stats_.oneWayLinks;
+    s.powerFallbacks = stats_.powerFallbacks;
     return s;
 }
 
