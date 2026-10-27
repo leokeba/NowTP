@@ -6,7 +6,7 @@ if(ESP_PLATFORM)
              "src/nowtp/peer_table.cpp"
              "src/nowtp/espnow_transport.cpp"
         INCLUDE_DIRS "src"
-        REQUIRES esp_wifi esp_ringbuf esp_timer esp_event nvs_flash)
+        REQUIRES esp_wifi esp_ringbuf esp_timer esp_event nvs_flash mbedtls)
     return()
 endif()
 

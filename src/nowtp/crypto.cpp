@@ -10,6 +10,80 @@ namespace crypto {
 // ---------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4)
 
+#if NOWTP_MBEDTLS_SHA256
+
+// Failures (none expected for SHA-256 in memory) leave the output zeroed:
+// a tag that verifies nothing.
+#if MBEDTLS_VERSION_MAJOR >= 4
+
+void Sha256::reset() {
+    if (started_) psa_hash_abort(&op_);
+    started_ = false;
+}
+
+Sha256::~Sha256() {
+    reset();
+}
+
+void Sha256::start() {
+    op_ = psa_hash_operation_init();
+    psa_crypto_init();  // done at boot by ESP-IDF; harmless again
+    started_ = psa_hash_setup(&op_, PSA_ALG_SHA_256) == PSA_SUCCESS;
+}
+
+void Sha256::update(const uint8_t* data, size_t len) {
+    if (!started_) start();
+    if (started_ && len > 0) psa_hash_update(&op_, data, len);
+}
+
+void Sha256::finish(uint8_t out[kSha256Size]) {
+    if (!started_) start();
+    size_t n = 0;
+    if (!started_ || psa_hash_finish(&op_, out, kSha256Size, &n) != PSA_SUCCESS || n != kSha256Size) {
+        memset(out, 0, kSha256Size);
+    }
+    reset();
+}
+
+#else  // mbedTLS 2 and 3
+
+#if MBEDTLS_VERSION_MAJOR < 3
+#define NOWTP_SHA256(f) mbedtls_sha256_##f##_ret
+#else
+#define NOWTP_SHA256(f) mbedtls_sha256_##f
+#endif
+
+void Sha256::reset() {
+    if (started_) mbedtls_sha256_free(&ctx_);
+    started_ = false;
+}
+
+Sha256::~Sha256() {
+    reset();
+}
+
+void Sha256::start() {
+    mbedtls_sha256_init(&ctx_);
+    started_ = true;
+    if (NOWTP_SHA256(starts)(&ctx_, 0) != 0) reset();
+}
+
+void Sha256::update(const uint8_t* data, size_t len) {
+    if (!started_) start();
+    if (started_ && len > 0) NOWTP_SHA256(update)(&ctx_, data, len);
+}
+
+void Sha256::finish(uint8_t out[kSha256Size]) {
+    if (!started_) start();
+    if (!started_ || NOWTP_SHA256(finish)(&ctx_, out) != 0) memset(out, 0, kSha256Size);
+    reset();
+}
+
+#undef NOWTP_SHA256
+#endif
+
+#else  // portable
+
 namespace {
 
 const uint32_t kK[64] = {
@@ -40,6 +114,8 @@ inline void storeBe32(uint8_t* p, uint32_t v) {
 }
 
 }  // namespace
+
+Sha256::~Sha256() {}
 
 void Sha256::reset() {
     static const uint32_t kInit[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -113,6 +189,8 @@ void Sha256::finish(uint8_t out[kSha256Size]) {
     for (int i = 0; i < 8; ++i) storeBe32(out + 4 * i, h_[i]);
     reset();
 }
+
+#endif  // NOWTP_MBEDTLS_SHA256
 
 void sha256(const uint8_t* data, size_t len, uint8_t out[kSha256Size]) {
     Sha256 s;

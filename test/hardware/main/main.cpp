@@ -102,13 +102,65 @@ void startWifi() {
 // ---------------------------------------------------------------------------
 // Engine on target, simulated radio
 
-// Crypto on the chip: test vectors (real compiler and CPU), and timings.
+// Crypto on the chip: test vectors (real compiler and CPU, and mbedTLS's
+// SHA-256 where NOWTP_MBEDTLS_SHA256 picks it), and timings.
+bool hexIs(const uint8_t* got, const char* hex) {
+    for (size_t i = 0; hex[2 * i]; ++i) {
+        unsigned v = 0;
+        sscanf(hex + 2 * i, "%2x", &v);
+        if (got[i] != v) return false;
+    }
+    return true;
+}
+
 void cryptoOnTarget() {
     using namespace nowtp::crypto;
     uint8_t out[32];
-    sha256(reinterpret_cast<const uint8_t*>("abc"), 3, out);
-    const uint8_t abc[4] = {0xba, 0x78, 0x16, 0xbf};
-    report("sha256_vector", memcmp(out, abc, 4) == 0);
+    const uint8_t* abc = reinterpret_cast<const uint8_t*>("abc");
+    sha256(abc, 3, out);
+    bool ok = hexIs(out, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    sha256(nullptr, 0, out);
+    ok = ok && hexIs(out, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    const char* two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";  // two blocks with padding
+    sha256(reinterpret_cast<const uint8_t*>(two), strlen(two), out);
+    ok = ok && hexIs(out, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    report("sha256_vectors", ok);
+
+    // In uneven pieces, and two hashes interleaved (on ESP32, the second has
+    // no SHA engine to itself), each object reused after finish().
+    std::vector<uint8_t> big(5000);
+    for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i * 13 + 1);
+    uint8_t whole[32], pieces[32], other[32], again[32];
+    sha256(big.data(), big.size(), whole);
+    Sha256 x, y;
+    size_t cuts[] = {1, 63, 64, 1000, 3872};
+    size_t at = 0;
+    for (size_t n : cuts) {
+        x.update(big.data() + at, n);
+        y.update(abc, 3);
+        at += n;
+    }
+    x.finish(pieces);
+    y.finish(other);
+    x.update(abc, 3);
+    x.finish(again);
+    uint8_t abc5[15];
+    for (int i = 0; i < 5; ++i) memcpy(abc5 + 3 * i, abc, 3);
+    sha256(abc5, sizeof(abc5), out);
+    report("sha256_pieces_interleaved", memcmp(whole, pieces, 32) == 0 && memcmp(other, out, 32) == 0 &&
+                                            hexIs(again, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+    // RFC 4231, test cases 2 and 6 (a key longer than a block).
+    const char* jefe = "Jefe";
+    const char* want = "what do ya want for nothing?";
+    hmacSha256(reinterpret_cast<const uint8_t*>(jefe), 4, reinterpret_cast<const uint8_t*>(want), strlen(want), out);
+    ok = hexIs(out, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    uint8_t longKey[131];
+    memset(longKey, 0xaa, sizeof(longKey));
+    const char* first = "Test Using Larger Than Block-Size Key - Hash Key First";
+    hmacSha256(longKey, sizeof(longKey), reinterpret_cast<const uint8_t*>(first), strlen(first), out);
+    ok = ok && hexIs(out, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    report("hmac_vectors", ok);
 
     uint8_t a[32] = {0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66, 0x45,
                      0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a};
@@ -155,6 +207,47 @@ void engineOnTarget() {
     snprintf(detail, sizeof(detail), "(16 KB, 20%% loss: %s, %lu retransmissions, %lld us CPU)",
              nowtp::toString(result), (unsigned long)net.engine(a).stats().retransmissions, (long long)us);
     report("engine_reliable_16k_lossy", done && result == Status::Ok && received == msg, detail);
+}
+
+// Authenticated messages between two simulated nodes: every frame sealed
+// and checked with the chip's SHA-256, and a node with another key refused.
+void secureOnTarget() {
+    sim::Network net(43);
+    sim::SimHost host(net);
+    size_t a = net.addNode(), b = net.addNode(), c = net.addNode();
+    std::vector<std::unique_ptr<nowtp::Security>> sec;
+    for (size_t i = 0; i < 3; ++i) {
+        nowtp::SecurityConfig cfg;
+        cfg.key.assign(32, i == c ? 0x22 : 0x11);
+        cfg.requireAuthentication = true;
+        sec.emplace_back(new nowtp::Security(net.engine(i), host, net.mac(i), cfg));
+        sec.back()->start();
+        nowtp::Security* p = sec.back().get();
+        net.tickers.push_back(sim::Ticker([p](uint32_t now) { p->tick(now); }, [](nowtp::Deadline&) {}, i));
+    }
+    std::vector<uint8_t> received;
+    net.engine(b).listen(1, [&](const nowtp::Message& m) {
+        if (m.authenticated) received.assign(m.data, m.data + m.len);
+    });
+    std::vector<uint8_t> msg(4000);
+    for (size_t i = 0; i < msg.size(); ++i) msg[i] = static_cast<uint8_t>(i * 5 + 7);
+    nowtp::SendOptions opts;
+    opts.reliable = true;
+    Status results[2] = {Status::Cancelled, Status::Cancelled};
+    bool done[2] = {false, false};
+    size_t from[2] = {a, c};
+    for (int k = 0; k < 2; ++k) {
+        net.engine(from[k]).send(net.mac(b), 1, msg.data(), msg.size(), opts,
+                                 [&, k](Status st) {
+                                     results[k] = st;
+                                     done[k] = true;
+                                 },
+                                 net.now());
+        net.runUntil([&] { return done[k]; }, 10000);
+    }
+    report("secure_messages_on_target", results[0] == Status::Ok && received == msg && results[1] == Status::AuthFailed,
+           fmt("(right key: %s, other key: %s)", nowtp::toString(results[0]), nowtp::toString(results[1])));
+    for (auto& p : sec) p->stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +724,7 @@ extern "C" void app_main() {
 
     cryptoOnTarget();
     engineOnTarget();
+    secureOnTarget();
 
     radioSetupModes();
     radioSettingsRestored();
