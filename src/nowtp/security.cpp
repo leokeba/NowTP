@@ -29,7 +29,7 @@ constexpr uint8_t kChallengeTries = 5;
 constexpr uint32_t kChallengeBackoffMs = 2000;
 // An epoch other than the one verified this recently is a replay, not a reboot.
 constexpr uint32_t kFreshVerificationMs = 1000;
-constexpr uint8_t kMaxResponsesPerSecond = 20;
+constexpr uint8_t kMaxResponsesPerChallenger = 4;  // per second; a peer retries every 300 ms
 constexpr uint32_t kPairRequestIntervalMs = 500;
 constexpr uint32_t kPairStepMs = 2500;
 
@@ -138,6 +138,7 @@ Security::~Security() {
 
 void Security::start() {
     running_ = true;
+    for (Challenger& c : challengers_) c = Challenger();
     engine_.listen(kSecurityPort, [this](const Message& m) { handle(m); });
     engine_.setAuthenticator(this);
 }
@@ -327,11 +328,11 @@ void Security::sealAck(const Mac& dst, const uint8_t* frame, size_t len, const u
 }
 
 bool Security::openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
-                       const uint8_t* bindBefore) {
+                       const uint8_t* before, size_t beforeCount) {
     if (key_.empty()) return false;
     uint8_t expected[wire::kAckTagSize];
-    const uint8_t* binds[2] = {bind, bindBefore};
-    for (const uint8_t* b : binds) {
+    for (size_t i = 0; i <= beforeCount; ++i) {
+        const uint8_t* b = i == 0 ? bind : before + (i - 1) * wire::kAckBindSize;
         if (!b) continue;
         ackTag(src, local_, frame, len, b, expected);
         if (crypto::equal(expected, tag, wire::kAckTagSize)) return true;
@@ -396,12 +397,22 @@ void Security::challenge(Peer& p, uint32_t now) {
 
 void Security::respond(const Mac& to, const uint8_t* nonce, uint32_t now) {
     if (key_.empty()) return;
-    if (static_cast<int32_t>(now - responseWindowStart_) >= 1000) {
-        responseWindowStart_ = now;
-        responsesInWindow_ = 0;
+    Challenger* ch = nullptr;
+    Challenger* spare = nullptr;  // unused, or its second is over
+    for (Challenger& x : challengers_) {
+        if (x.used && x.mac == to) ch = &x;
+        if (!spare && (!x.used || reached(now, x.since + 1000))) spare = &x;
     }
-    if (responsesInWindow_ >= kMaxResponsesPerSecond) return;
-    responsesInWindow_++;
+    if (!ch || reached(now, ch->since + 1000)) {
+        if (!ch) ch = spare;
+        if (!ch) return;  // eight others challenged us this second
+        ch->mac = to;
+        ch->used = true;
+        ch->responses = 0;
+        ch->since = now;
+    }
+    if (ch->responses >= kMaxResponsesPerChallenger) return;
+    ch->responses++;
 
     // type | nonce (8) | epoch (4) | sequence (4) | tag (16) | caps (1) | caps tag (16)
     uint8_t msg[kResponseSize + kCapsSize];
@@ -427,7 +438,7 @@ void Security::respond(const Mac& to, const uint8_t* nonce, uint32_t now) {
     counters_.challengesAnswered++;
     engine_.send(to, kSecurityPort, msg, sizeof(msg), SendOptions(), CompletionHandler(), now);
     // `to` now accepts only sequence numbers above the one we reported.
-    engine_.reseal(to);
+    engine_.reseal(to, now);
 }
 
 void Security::verifyResponse(const Mac& from, const uint8_t* d, size_t len, uint32_t now) {

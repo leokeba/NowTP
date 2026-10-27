@@ -1091,10 +1091,11 @@ TEST(reassembly_rejects_what_can_never_fit) {
     net.engine(b).listen(1, inbox.handler());
     auto msg = pattern(6000);
     Outcome out;
+    uint32_t t0 = net.now();
     net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), reliable(), out.handler(), net.now());
     CHECK(net.runUntil([&] { return out.done; }));
     CHECK(out.status == Status::Rejected);  // not Busy until the deadline
-    CHECK(net.now() < 100u);
+    CHECK(net.now() - t0 < 100u);
 }
 
 // More senders than reassembly slots or bytes: evicting the least recently
@@ -1202,11 +1203,12 @@ TEST(receiver_credit_is_invisible_to_older_senders) {
     size_t a = net.addNode(), b = net.addNode();
     Inbox inbox;
     net.engine(b).listen(1, inbox.handler());
+    uint32_t t0 = net.now();
     net.dropIf = [&](const sim::Frame& f) {
         wire::Header h;
         size_t off;
         return f.from == a && wire::decodeHeader(f.data.data(), f.data.size(), h, off) &&
-               h.type == wire::Type::Fragment && (h.index == 2 || h.index == 5) && net.now() < 50;
+               h.type == wire::Type::Fragment && (h.index == 2 || h.index == 5) && net.now() - t0 < 50;
     };
     Outcome out;
     auto msg = pattern(2000);
@@ -1233,6 +1235,78 @@ TEST(receiver_credit_is_invisible_to_older_senders) {
         CHECK(p[len - 1] > 0);  // room for more
     }
     CHECK(sawMissing);
+}
+
+namespace {
+
+// Frame sizes per destination, as the transport negotiates them.
+struct SizedLink : Link {
+    Mac wide = {{0x02, 0, 0, 0, 0, 2}};
+    size_t wideSize = 1470;
+    std::vector<std::vector<uint8_t>> sent;
+    Status sendFrame(const Mac&, const uint8_t* data, size_t len) override {
+        testing::HeapExempt radio;
+        sent.emplace_back(data, data + len);
+        return Status::Ok;
+    }
+    size_t maxFrameSize(const Mac& dst) const override { return dst == wide ? wideSize : 250; }
+};
+
+}  // namespace
+
+// A message keeps the frame size it was cut for, which may be more than its
+// destination takes by the time it goes out (a peer lost, or announced again
+// smaller). The frame buffer must hold it all the same: a 1205-byte frame once
+// went into a 250-byte buffer.
+TEST(frame_size_shrinking_under_a_queued_message) {
+    for (size_t size : {1200, 3000}) {
+        SizedLink link;
+        Mac narrow = {{0x02, 0, 0, 0, 0, 1}};
+        Engine e(link);
+        uint32_t now = sim::clockStart();
+        auto small = pattern(10), big = pattern(size);
+        CHECK(e.send(narrow, 1, small.data(), small.size(), SendOptions(), nullptr, now) == Status::Ok);
+        Outcome out;
+        CHECK(e.send(link.wide, 1, big.data(), big.size(), SendOptions(), out.handler(), now) == Status::Ok);
+        link.wideSize = 250;
+        for (uint32_t t = 1; t < 10 && !out.done; ++t) e.onFrameSent(true, now + t);
+        CHECK(out.done && out.status == Status::Ok);
+        size_t header = size > 1470 ? wire::kFragmentHeaderSize : wire::kCommonHeaderSize;
+        CHECK(link.sent.size() >= 2u);
+        CHECK_EQ(link.sent[1].size(), size > 1470 ? 1470u : header + size);
+        CHECK(std::equal(link.sent[1].begin() + static_cast<std::ptrdiff_t>(header), link.sent[1].end(), big.begin()));
+    }
+}
+
+// Credit is spent when a message's first frame is delivered: one lost at the
+// MAC level goes again at once, instead of waiting for the credit to expire.
+TEST(receiver_credit_is_spent_by_delivered_frames) {
+    SizedLink link;
+    Mac b = {{0x02, 0, 0, 0, 0, 3}};
+    uint32_t t = sim::clockStart();
+    Engine e(link, Config(), 0);
+    auto small = pattern(10), big = pattern(1000);
+    CHECK(e.send(b, 1, small.data(), small.size(), reliable(), nullptr, t) == Status::Ok);
+    e.onFrameSent(true, t + 1);
+    uint8_t ack[8];
+    wire::Header h;
+    h.type = wire::Type::Ack;
+    h.flags = wire::kFlagCredit;
+    h.port = 1;
+    h.messageId = 0;
+    size_t n = wire::encodeHeader(h, ack);
+    ack[n++] = static_cast<uint8_t>(wire::AckStatus::Complete);
+    ack[n++] = 5;  // room for 1280 bytes
+    e.onFrameReceived(b, ack, n, t + 2);
+    CHECK(e.send(b, 1, big.data(), big.size(), reliable(), nullptr, t + 3) == Status::Ok);  // 5 frames: it fits
+    CHECK_EQ(link.sent.size(), 2u);
+    e.onFrameSent(false, t + 4);  // its first frame fails
+    for (uint32_t dt = 5; dt < 20 && link.sent.size() < 3; ++dt) e.tick(t + dt);
+    CHECK_EQ(link.sent.size(), 3u);
+    wire::Header first;
+    size_t off;
+    CHECK(wire::decodeHeader(link.sent[2].data(), link.sent[2].size(), first, off) && first.index == 0);
+    CHECK_EQ(e.stats().creditWaits, 0u);
 }
 
 TEST(random_frames_do_not_crash) {
@@ -2187,6 +2261,8 @@ std::vector<uint8_t> testKey(uint8_t seed = 0x42) {
 }
 
 struct SecureRig {
+    SecureRig() {}
+    explicit SecureRig(uint32_t clockStart) : net(21, clockStart) {}
     sim::Network net{21};
     sim::Scheduler sched{net};
     sim::Scheduler::Host host{sched};
@@ -2545,14 +2621,102 @@ TEST(secure_acks_are_bound_to_the_message) {
     for (uint8_t status : {uint8_t(wire::AckStatus::Complete), uint8_t(wire::AckStatus::Missing)}) {
         frame[5] = status;
         rig.sec[b]->sealAck(ma, frame, sizeof(frame), first, tag);
-        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, first, nullptr));
-        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, first));  // sealed again since
-        CHECK(!rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr));
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, first, nullptr, 0));
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, first, 1));  // sealed again since
+        uint8_t before[3 * 8] = {};  // newest first: sealed three times since
+        std::memcpy(before + 16, first, 8);
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, before, 3));
+        CHECK(!rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, before, 2));
+        CHECK(!rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr, 0));
         // Unbound: accepted only for other statuses, from a receiver that binds.
         rig.sec[b]->sealAck(ma, frame, sizeof(frame), nullptr, tag);
         bool complete = status == uint8_t(wire::AckStatus::Complete);
-        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr) == !complete);
+        CHECK(rig.sec[a]->openAck(mb, frame, sizeof(frame), tag, later, nullptr, 0) == !complete);
     }
+}
+
+namespace {
+
+std::vector<uint8_t> challengeFrame(uint16_t id, uint8_t fill) {
+    wire::Header h;
+    h.port = kSecurityPort;
+    h.messageId = id;
+    std::vector<uint8_t> f(wire::kCommonHeaderSize + 9, fill);
+    size_t n = wire::encodeHeader(h, f.data());
+    f[n] = 1;  // challenge, then the nonce
+    return f;
+}
+
+size_t responsesTo(const sim::Network& net, size_t from, const Mac& to) {
+    size_t n = 0;
+    for (const sim::Frame& f : net.log) {
+        wire::Header h;
+        size_t off;
+        if (f.from == from && f.dst == to && wire::decodeHeader(f.data.data(), f.data.size(), h, off) &&
+            h.port == kSecurityPort && f.data.size() > off && f.data[off] == 2) {
+            n++;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+// Anyone can send challenges under any MAC. Each challenger gets four answers
+// a second, whatever others do, and from any uptime: a window that started at
+// 0 once stopped all answers on a node started after 2^31 ms.
+TEST(secure_challenges_are_answered_per_challenger) {
+    for (uint32_t start : {sim::clockStart(), sim::clockStart() + 25u * 86400 * 1000}) {
+        SecureRig rig(start);
+        size_t a = rig.add(testKey()), b = rig.add(testKey()), c = rig.add(testKey());
+        for (uint16_t i = 0; i < 20; ++i) {
+            rig.net.inject(a, rig.net.mac(b), challengeFrame(i, static_cast<uint8_t>(i)));
+            if (i % 5 == 0) rig.net.inject(a, rig.net.mac(c), challengeFrame(static_cast<uint16_t>(100 + i), 0xC0));
+            rig.net.run(100);
+        }
+        CHECK_EQ(responsesTo(rig.net, a, rig.net.mac(b)), 8u);  // 4 a second
+        CHECK_EQ(responsesTo(rig.net, a, rig.net.mac(c)), 4u);  // all
+        CHECK_EQ(rig.sec[a]->counters().challengesAnswered, 12u);
+    }
+}
+
+// Challenges reseal what is queued for the challenger, once a second at most,
+// and an ack bound to any seal that went on air still confirms the message.
+// A delivered message whose acks were lost through two reseals used to end
+// Timeout, and the application might send it again.
+TEST(secure_delivered_message_survives_reseals) {
+    SecureRig rig;
+    size_t a = rig.add(testKey()), b = rig.add(testKey());
+    Inbox inbox;
+    rig.net.engine(b).listen(1, inbox.handler());
+    CHECK(rig.sendWait(a, b, 1, pattern(10), reliable()) == Status::Ok);  // b verifies a's epoch
+    bool dropAcks = true;
+    rig.net.dropIf = [&](const sim::Frame& f) {
+        wire::Header h;
+        size_t off;
+        return dropAcks && f.from == b && wire::decodeHeader(f.data.data(), f.data.size(), h, off) &&
+               h.type == wire::Type::Ack;
+    };
+    Outcome out;
+    SendOptions o = reliable();
+    o.timeoutMs = 4000;
+    auto msg = pattern(100, 3);
+    rig.net.engine(a).send(rig.net.mac(b), 1, msg.data(), msg.size(), o, out.handler(), rig.net.now());
+    std::vector<uint32_t> seqs;  // a's sequence numbers for it
+    for (uint16_t i = 0; i < 9; ++i) {
+        rig.net.run(300);
+        rig.net.inject(a, rig.net.mac(b), challengeFrame(i, static_cast<uint8_t>(i)));
+        std::vector<uint8_t> f = rig.lastFrame(a, 1);
+        uint32_t seq = wire::getU32(&f[f.size() - wire::kAuthTrailerSize + 4]);
+        if (seqs.empty() || seqs.back() != seq) seqs.push_back(seq);
+    }
+    CHECK_EQ(inbox.messages.size(), 2u);
+    CHECK(!out.done);
+    CHECK(seqs.size() >= 3u && seqs.size() <= 4u);  // resealed about once a second
+    dropAcks = false;
+    CHECK(rig.net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    CHECK_EQ(inbox.messages.size(), 2u);
 }
 
 // A response without the capabilities extension, as from NowTP 0.5: the

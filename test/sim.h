@@ -161,6 +161,16 @@ private:
     size_t index_;
 };
 
+/// NOWTP_CLOCK_START=<ms>: the network's clock starts there instead of 0, to
+/// run the suite across 2^31 ms (24.8 days of uptime) or the wrap at 2^32.
+inline uint32_t clockStart() {
+    static const uint32_t start = [] {
+        const char* v = std::getenv("NOWTP_CLOCK_START");
+        return v && *v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    return start;
+}
+
 struct Node {
     Node(Network& net, size_t index, const Mac& m, const nowtp::Config& cfg)
         : mac(m), link(net, index), engine(link, cfg, static_cast<uint16_t>(index * 1000)) {}
@@ -175,8 +185,10 @@ struct Node {
     /// Local clock: offset and rate error against the simulation's time.
     uint64_t clockOffsetUs = 1000000000;
     double clockSkew = 0;  // e.g. 40e-6 for a crystal 40 ppm fast
+    /// Like a device's 64-bit esp_timer, it carries on past the ms clock's wrap.
     uint64_t clockUs(uint32_t nowMs) const {
-        return clockOffsetUs + static_cast<uint64_t>(static_cast<double>(nowMs) * 1000.0 * (1.0 + clockSkew));
+        uint64_t ms = static_cast<uint64_t>(clockStart()) + static_cast<uint32_t>(nowMs - clockStart());
+        return clockOffsetUs + static_cast<uint64_t>(static_cast<double>(ms) * 1000.0 * (1.0 + clockSkew));
     }
 };
 
@@ -213,7 +225,7 @@ using LinkModel = std::function<double(size_t from, size_t to, nowtp::PhyRate ra
 
 class Network {
 public:
-    explicit Network(uint32_t seed = 1) : rng_(seed) {}
+    explicit Network(uint32_t seed = 1, uint32_t start = clockStart()) : rng_(seed), now_(start) {}
 
     size_t addNode(const nowtp::Config& cfg = nowtp::Config()) {
         Mac m = {{0x02, 0, 0, 0, 0, static_cast<uint8_t>(nodes_.size() + 1)}};
@@ -439,7 +451,7 @@ private:
     std::vector<bool> due_, tickerDue_;
     std::deque<Event> events_;
     std::mt19937 rng_;
-    uint32_t now_ = 0;
+    uint32_t now_ = clockStart();
 };
 
 inline Status SimLink::sendFrame(const Mac& dst, const uint8_t* data, size_t len) {

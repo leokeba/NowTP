@@ -78,9 +78,10 @@ public:
     /// bytes (epoch and sequence), so the ack can't stand for another message.
     virtual void sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) = 0;
     /// Verifies an ack frame from `src` for our message whose trailer starts
-    /// with `bind`, or with `bindBefore` (its seal before the last reseal()).
+    /// with `bind`, or with one of `beforeCount` earlier seals' binds at
+    /// `before` (kAckBindSize bytes each, newest first; see Engine::reseal()).
     virtual bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
-                         const uint8_t* bindBefore) = 0;
+                         const uint8_t* before, size_t beforeCount) = 0;
 
     /// A reliable message open() found Authentic was refused by its receive
     /// handler, and its sender will send it again. `bind` is the start of its
@@ -186,8 +187,9 @@ public:
     bool authenticates(uint8_t port) const { return auth_ && auth_->sealing(port); }
     /// Seals the authenticated messages queued for `dst` again, with fresh
     /// sequence numbers. Called by Security after answering dst's challenge:
-    /// dst then accepts only numbers above the one we reported.
-    void reseal(const Mac& dst);
+    /// dst then accepts only numbers above the one we reported. A message
+    /// resealed less than a second ago is resealed when that second is over.
+    void reseal(const Mac& dst, uint32_t now);
 
     /// Fails every outgoing message with `reason` and drops partial incoming ones.
     void cancelAll(Status reason = Status::Cancelled);
@@ -310,6 +312,7 @@ private:
     /// True while `tx` may not start: its receiver said it has no room for it.
     /// `until` receives when that word expires.
     bool waitsForCredit(const TxMessage& tx, uint32_t now, uint32_t* until = nullptr) const;
+    void resealOne(TxMessage& tx, uint32_t now);
     void noteCredit(const Mac& dst, uint8_t units, uint32_t now);
     void spendCredit(const TxMessage& tx);
     /// What we tell `src` in an ack: room for its next message, in kCreditUnit.

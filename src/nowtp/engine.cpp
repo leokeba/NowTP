@@ -32,6 +32,7 @@ constexpr size_t kAckHeaderSize = kCommonHeaderSize + 1;  // + status byte
 // served in turn would still take most of the airtime.
 constexpr uint32_t kBackoffMinMs = 50;
 constexpr uint32_t kBackoffMaxMs = 800;
+constexpr uint32_t kResealIntervalMs = 1000;  // per message (see reseal())
 
 }  // namespace
 
@@ -75,8 +76,15 @@ struct Engine::TxMessage {
     uint16_t fragSize = 0;  // stream bytes per fragment when count > 1
     size_t streamLen = 0;   // payload, plus CRC-32 when count > 1
     size_t trailerAt = 0;   // offset of the authentication trailer (with kFlagAuth)
-    bool hasBindBefore = false;
-    uint8_t bindBefore[kAckBindSize];  // the trailer's start before the last reseal()
+    // Earlier seals' binds, newest first: an ack may still come for a copy
+    // sent before reseal(). Seals that never went on air aren't kept.
+    static constexpr size_t kOldBinds = 3;
+    uint8_t oldBinds = 0;
+    bool sentSinceSeal = false;
+    bool resealed = false;      // by reseal(), at `resealAt`
+    bool resealWanted = false;  // asked again within a second: done at resealAt + 1 s
+    uint32_t resealAt = 0;
+    uint8_t bindsBefore[kOldBinds * kAckBindSize];
     Bytes stream;
     uint16_t nextIndex = 0;  // next fragment of the first pass
     Bytes resend;            // bitmap of fragments to send again, allocated on first use
@@ -311,13 +319,16 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
 
 // 0 if there is no memory for the frame buffer.
 size_t Engine::buildFrame(const TxMessage& tx, uint16_t index, bool ackRequest) {
-    size_t mtu = link_.maxFrameSize(tx.dst);
-    if (frameCapacity_ < mtu) {
+    // The message was cut for the destination's frame size when it was queued,
+    // which may have shrunk since (a peer lost, or announced again smaller).
+    size_t need = tx.count > 1 ? kFragmentHeaderSize + tx.fragSize : kCommonHeaderSize + tx.streamLen;
+    if (frameCapacity_ < need) {
         // As large as the largest frame sent so far (1470 bytes with v2 peers).
-        Bytes bigger = allocBytes(mtu);
+        size_t size = std::max(need, link_.maxFrameSize(tx.dst));
+        Bytes bigger = allocBytes(size);
         if (!bigger) return 0;
         frame_ = std::move(bigger);
-        frameCapacity_ = mtu;
+        frameCapacity_ = size;
     }
 
     Header h;
@@ -405,8 +416,8 @@ void Engine::pump(uint32_t now) {
             continue;
         }
         stats_.framesSent++;
+        tx->sentSinceSeal = true;
         if (!inflight_.firstPass) stats_.retransmissions++;
-        if (inflight_.firstPass && index == 0 && tx->count > 1) spendCredit(*tx);
     }
 
     pumping_ = false;
@@ -575,6 +586,8 @@ void Engine::frameSent(bool delivered, uint32_t now, uint64_t sentUs) {
 
     if (b) backoffs_.erase(backoffs_.begin() + (b - backoffs_.data()));
     tx->frameFailures = 0;
+    // Only once delivered: a first frame lost at the MAC level goes again at once.
+    if (f.firstPass && f.index == 0 && tx->count > 1) spendCredit(*tx);
     // Reported once the frame's bookkeeping is done: tx may be gone by then.
     bool report = sentUs != 0 && tx->count == 1 && sent_;
     Mac dst = tx->dst;
@@ -643,18 +656,37 @@ void Engine::flushCompletions() {
     flushing_ = false;
 }
 
-void Engine::reseal(const Mac& dst) {
+// Anyone can ask for this, under any MAC (Security answers every challenge):
+// each message is sealed again at most once a second, later requests within
+// that second when it is over. Until then, a receiver that really forgot us
+// drops its copies as replays, and reliable delivery tries again.
+void Engine::reseal(const Mac& dst, uint32_t now) {
     if (!auth_) return;
     for (auto& t : tx_) {
         if (!(t->dst == dst) || !(t->flags & kFlagAuth) || !auth_->sealing(t->port)) continue;
-        uint8_t* trailer = t->stream.get() + t->trailerAt;
-        memcpy(t->bindBefore, trailer, kAckBindSize);  // an ack may still come for the old seal
-        t->hasBindBefore = true;
-        auth_->seal(dst, t->port, static_cast<uint8_t>(t->flags & (kFlagReliable | kFlagLatest)), t->stream.get(),
-                    t->trailerAt, trailer);
-        size_t payloadLen = t->trailerAt + kAuthTrailerSize;
-        if (t->count > 1) putU32(t->stream.get() + payloadLen, crc32(t->stream.get(), payloadLen));
+        if (t->resealed && !reached(now, t->resealAt + kResealIntervalMs)) {
+            t->resealWanted = true;
+            continue;
+        }
+        resealOne(*t, now);
     }
+}
+
+void Engine::resealOne(TxMessage& t, uint32_t now) {
+    uint8_t* trailer = t.stream.get() + t.trailerAt;
+    if (t.sentSinceSeal) {
+        memmove(t.bindsBefore + kAckBindSize, t.bindsBefore, (TxMessage::kOldBinds - 1) * kAckBindSize);
+        memcpy(t.bindsBefore, trailer, kAckBindSize);
+        if (t.oldBinds < TxMessage::kOldBinds) t.oldBinds++;
+        t.sentSinceSeal = false;
+    }
+    auth_->seal(t.dst, t.port, static_cast<uint8_t>(t.flags & (kFlagReliable | kFlagLatest)), t.stream.get(),
+                t.trailerAt, trailer);
+    size_t payloadLen = t.trailerAt + kAuthTrailerSize;
+    if (t.count > 1) putU32(t.stream.get() + payloadLen, crc32(t.stream.get(), payloadLen));
+    t.resealed = true;
+    t.resealWanted = false;
+    t.resealAt = now;
 }
 
 void Engine::tick(uint32_t now) {
@@ -668,6 +700,13 @@ void Engine::tick(uint32_t now) {
         if (reached(now, tx->deadline)) {
             finish(tx, Status::Timeout);
             continue;
+        }
+        if (tx->resealWanted && reached(now, tx->resealAt + kResealIntervalMs)) {
+            if (auth_ && auth_->sealing(tx->port)) {
+                resealOne(*tx, now);
+            } else {
+                tx->resealWanted = false;
+            }
         }
         if (tx->awaitingAck && reached(now, tx->ackDeadline)) {
             // No feedback: probe by resending the last fragment with an ack request.
@@ -719,6 +758,7 @@ void Engine::nextTick(Deadline& d) const {
         const TxMessage* t = tx_[i].get();
         d.at(t->deadline);
         if (t->awaitingAck) d.at(t->ackDeadline);
+        if (t->resealWanted) d.at(t->resealAt + kResealIntervalMs);
         if (!t->hasPendingFrame()) continue;
         bool head = true;  // see nextMessage()
         for (size_t j = 0; j < i && head; ++j) head = !(tx_[j]->hasPendingFrame() && tx_[j]->dst == t->dst);
@@ -1248,7 +1288,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
         const uint8_t* frame = payload - kCommonHeaderSize;
         if (!auth_ || len < 1 + kAckTagSize ||
             !auth_->openAck(src, frame, kCommonHeaderSize + len - kAckTagSize, payload + len - kAckTagSize,
-                            tx->stream.get() + tx->trailerAt, tx->hasBindBefore ? tx->bindBefore : nullptr)) {
+                            tx->stream.get() + tx->trailerAt, tx->bindsBefore, tx->oldBinds)) {
             stats_.authRejected++;
             return;
         }

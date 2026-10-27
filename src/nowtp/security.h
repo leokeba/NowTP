@@ -114,7 +114,7 @@ public:
                  uint32_t nowMs) override;
     void sealAck(const Mac& dst, const uint8_t* frame, size_t len, const uint8_t* bind, uint8_t* tag) override;
     bool openAck(const Mac& src, const uint8_t* frame, size_t len, const uint8_t* tag, const uint8_t* bind,
-                 const uint8_t* bindBefore) override;
+                 const uint8_t* before, size_t beforeCount) override;
     Screen screen(const Mac& src, uint8_t port, uint8_t flags) const override;
     void refused(const Mac& src, const uint8_t* bind) override;
 
@@ -204,8 +204,16 @@ private:
     uint32_t epoch_ = 0;
     uint32_t seq_ = 0;
     Table<Peer> peers_;  // memory per verified sender, not reserved for maxPeers
-    uint32_t responseWindowStart_ = 0;
-    uint8_t responsesInWindow_ = 0;
+    // Who challenged us in the last second. A challenge can come from anyone
+    // under any MAC: each gets a few answers a second, whatever others send.
+    struct Challenger {
+        Mac mac;
+        bool used = false;
+        uint8_t responses = 0;
+        uint32_t since = 0;  // start of its one-second window
+    };
+    static constexpr size_t kChallengers = 8;
+    Challenger challengers_[kChallengers];
     Pairing pairing_;
     Counters counters_;
 };

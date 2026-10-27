@@ -43,4 +43,9 @@ if(NOWTP_BUILD_TESTS)
     # Again, ticking only what is due, as a poller sleeping on pollDelayMs() does.
     add_test(NAME nowtp_tests_sparse COMMAND nowtp_tests)
     set_tests_properties(nowtp_tests_sparse PROPERTIES ENVIRONMENT NOWTP_SPARSE_TICKS=1)
+    # Across the ms clock's sign change (24.8 days of uptime) and its wrap (49.7 days).
+    add_test(NAME nowtp_tests_late COMMAND nowtp_tests)
+    set_tests_properties(nowtp_tests_late PROPERTIES ENVIRONMENT NOWTP_CLOCK_START=0x7FFFF000)
+    add_test(NAME nowtp_tests_wrap COMMAND nowtp_tests)
+    set_tests_properties(nowtp_tests_wrap PROPERTIES ENVIRONMENT "NOWTP_CLOCK_START=0xFFFFF000;NOWTP_SPARSE_TICKS=1")
 endif()
