@@ -686,20 +686,36 @@ void EspNowTransport::lock() const {
     lockDepth_++;
 }
 
-// A call that may have changed what pollDelayMs() says wakes the poller
-// once it lets go. poll() itself doesn't: its callbacks' calls are nested.
+// A call that may have changed what pollDelayMs() says wakes whoever
+// sleeps on it once it lets go: the NowTP task, or the poller's hook.
+// Neither wakes itself: calls from its own callbacks are seen on its way back.
 void EspNowTransport::unlock(bool changed) const {
-    bool wake = --lockDepth_ == 0 && changed && !config_.runTask && config_.wake && !ending_;
+    bool last = --lockDepth_ == 0 && changed;
+    TaskHandle_t task = task_;
     xSemaphoreGiveRecursive(mutex_);
-    if (wake) config_.wake(config_.wakeContext);
+    if (!last) return;
+    if (config_.runTask) {
+        if (task && task != xTaskGetCurrentTaskHandle()) xTaskNotifyGive(task);
+    } else if (config_.wake && !ending_) {
+        config_.wake(config_.wakeContext);
+    }
+}
+
+// The NowTP task sleeps until pollDelayMs(), or until a callback or a call
+// into NowTP wakes it. tickIntervalMs is the shortest sleep for timers.
+TickType_t EspNowTransport::taskWait() const {
+    uint32_t ms = pollDelayMs();
+    if (ms == 0) return 0;
+    if (ms < config_.tickIntervalMs) ms = config_.tickIntervalMs;
+    // Rounded up: a tick early would find nothing due and sleep again.
+    TickType_t ticks = static_cast<TickType_t>((static_cast<uint64_t>(ms) * configTICK_RATE_HZ + 999) / 1000);
+    return ticks ? ticks : 1;
 }
 
 void EspNowTransport::taskEntry(void* arg) {
     EspNowTransport* self = static_cast<EspNowTransport*>(arg);
-    TickType_t wait = pdMS_TO_TICKS(self->config_.tickIntervalMs);
-    if (wait == 0) wait = 1;
     bool more = false;
-    while (!self->stopping_) more = self->processEvents(more ? 0 : wait);
+    while (!self->stopping_) more = self->processEvents(more ? 0 : self->taskWait());
     xSemaphoreGive(self->taskExited_);
     vTaskDelete(nullptr);
 }
@@ -757,7 +773,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     void* item = nullptr;
     if (wait) {
         if (task_ && xTaskGetCurrentTaskHandle() == task_) {
-            ulTaskNotifyTake(pdTRUE, wait);  // either callback wakes us, or the tick
+            ulTaskNotifyTake(pdTRUE, wait);  // a callback or an API call wakes us, or a timer is due
         } else {
             // An application task (poll mode): its notifications aren't ours.
             item = xRingbufferReceive(events_, &size, wait);

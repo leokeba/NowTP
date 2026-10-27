@@ -174,7 +174,9 @@ struct EspNowConfig {
     /// don't fit are dropped and counted (stats().droppedEvents); reliable
     /// messages recover them. Send results don't go through it.
     size_t eventBufferSize = 8 * 1024;
-    /// How often timeouts and retransmissions are checked.
+    /// With runTask: the shortest the NowTP task sleeps waiting for a timer
+    /// (retransmissions, timeouts, announcements). It sleeps until the next
+    /// one is due, at most 250 ms, and new frames or calls wake it at once.
     uint32_t tickIntervalMs = 5;
 };
 
@@ -450,6 +452,7 @@ private:
     bool hasExplicitFrameSize(const Mac& mac) const;
     uint16_t negotiatedFrameSize(const Mac& mac) const;
     bool processEvents(TickType_t wait);  // true if events are left
+    TickType_t taskWait() const;
     void checkSent();
     void lock() const;
     /// `changed`: the caller may have given NowTP work, which a poller asleep
