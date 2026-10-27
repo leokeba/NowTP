@@ -13,6 +13,8 @@
 #include "diagnostics.h"
 #include "discovery.h"
 #include "engine.h"
+#include "frame_sizes.h"
+#include "link_monitor.h"
 #include "peer_table.h"
 #include "send_tracker.h"
 #include "radio.h"
@@ -435,28 +437,23 @@ private:
     class Gate;
     void channelChanged(uint8_t channel);
     Status diagnosticsReady() const;
-    void startPowerFallback(const Mac& peer);
-    void sendFallbackPing();
-    void onFallbackPing(Status status);
-    void tickLinkChecks(uint32_t now);
     void pollChannel(uint32_t now);
     void adoptChannel(uint8_t channel, bool fixed, uint32_t now);
     void stationChanged(uint32_t now);
     Status sendMoveNotice(uint8_t channel);
     Status appTaskReady() const;
     void storeKey(const std::vector<uint8_t>& key);
-    struct LinkHealth {
-        Mac mac;
-        uint32_t lastHeardMs = 0;
-        uint16_t failures = 0;
-        bool warned = false;
+    /// The link monitor's view of the radio: power, and events to log and count.
+    class MonitorHost : public LinkMonitor::Host {
+    public:
+        explicit MonitorHost(EspNowTransport& t) : t_(t) {}
+        float txPower() const override { return t_.txPower(); }
+        void setTxPower(float dbm) override;
+        void linkEvent(LinkMonitor::Event event, const Mac& peer, float fromDbm, float toDbm) override;
+
+    private:
+        EspNowTransport& t_;
     };
-    LinkHealth* linkHealth(const Mac& mac, bool create);
-    void notePeerHeard(const Mac& mac);
-    void notePeerSendResult(const Mac& mac, bool delivered);
-    uint16_t frameSizeFor(const Mac& dst) const;
-    void forgetFrameSize(const Mac& mac);
-    uint16_t negotiatedFrameSize(const Mac& mac) const;
     bool processEvents(TickType_t wait);  // true if events are left
     TickType_t taskWait() const;
     void checkSent();
@@ -477,9 +474,8 @@ private:
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
     std::vector<std::pair<uint8_t, CompletionObserver>> observers_;
     Callback<void(PeerEvent, const PeerInfo&)> peerHandler_;
-    std::vector<std::pair<Mac, uint16_t>> explicitFrameSizes_;  // set by addPeer()
+    std::unique_ptr<FrameSizes> frameSizes_;
     std::vector<std::pair<Mac, PhyRate>> peerRates_;
-    std::vector<LinkHealth> linkHealth_;
     std::unique_ptr<Host> host_;
     std::unique_ptr<Gate> gate_;
     std::atomic<int> callbacks_{0};  // application callbacks running, with the lock let go
@@ -498,29 +494,8 @@ private:
     uint8_t pendingChannel_ = 0;
     uint32_t pendingChannelSince_ = 0;
     int8_t limitQuarterDbm_ = 80;
-    struct PowerFallback {
-        bool active = false;
-        Mac peer;
-        float original = 0;
-        float ladder[6];
-        size_t steps = 0;
-        size_t index = 0;
-        uint8_t failures = 0;
-        bool pingInFlight = false;
-        bool confirming = false;  // re-testing the original power after a success
-        uint32_t nextPingAt = 0;
-        Mac tried[8];  // the most recent peers tried
-        size_t triedCount = 0;
-    } fallback_;
-    struct LinkCheck {
-        uint32_t id;  // the completion captures it (with `this`, nothing to allocate)
-        Mac peer;
-        uint8_t remaining;
-        bool inFlight;
-        uint32_t nextAt;
-    };
-    std::vector<LinkCheck> linkChecks_;  // reserved for kMaxLinkChecks in begin()
-    uint32_t nextLinkCheck_ = 0;
+    std::unique_ptr<MonitorHost> monitorHost_;
+    std::unique_ptr<LinkMonitor> monitor_;  // after the engine: it outlives its pings
     TransportStats stats_;  // radio-level counters only
     struct SavedRadio {
         bool powerSave = false;

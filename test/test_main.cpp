@@ -19,6 +19,8 @@
 #include "nowtp/diagnostics.h"
 #include "nowtp/discovery.h"
 #include "nowtp/engine.h"
+#include "nowtp/frame_sizes.h"
+#include "nowtp/link_monitor.h"
 #include "nowtp/peer_table.h"
 #include "nowtp/security.h"
 #include "nowtp/send_tracker.h"
@@ -1332,6 +1334,147 @@ TEST(frame_size_shrinking_under_a_queued_message) {
     }
 }
 
+namespace {
+
+// The ESP-NOW transport's link monitoring, on node `a` of a simulated
+// network: frames heard and send reports as the transport feeds them, power
+// from a's simulated radio, events recorded. `b` announces itself every
+// 300 ms, so that `a` hears it.
+struct MonitorRig : LinkMonitor::Host {
+    sim::Network net{7};
+    size_t a = net.addNode(), b = net.addNode();
+    std::unique_ptr<LinkMonitor> monitor;
+    std::vector<std::pair<LinkMonitor::Event, float>> events;  // with toDbm
+    bool aTalks = false;  // a sends b a message every 100 ms
+    uint32_t nextBeacon = 0, nextTalk = 0;
+
+    MonitorRig() {
+        monitor.reset(new LinkMonitor(net.engine(a), *this));
+        monitor->reset(true);
+        net.node(a).onHeard = [this](const Mac& src) { monitor->heard(src, net.now()); };
+        net.node(a).onSent = [this](const Mac& dst, bool ok) { monitor->sent(dst, ok, net.now()); };
+        net.tickers.push_back(sim::Ticker([this](uint32_t now) { monitor->tick(now); },
+                                          [this](Deadline& d) { monitor->nextTick(d); }, a));
+        net.tickers.push_back(sim::Ticker([this](uint32_t now) { traffic(now); },
+                                          [this](Deadline& d) {
+                                              d.at(nextBeacon);
+                                              if (aTalks) d.at(nextTalk);
+                                          }));
+        nextBeacon = nextTalk = net.now();
+    }
+    void traffic(uint32_t now) {
+        static const uint8_t hello[4] = {1, 2, 3, 4};
+        if (static_cast<int32_t>(now - nextBeacon) >= 0) {
+            net.engine(b).send(Mac::broadcast(), 1, hello, sizeof(hello), SendOptions(), nullptr, now);
+            nextBeacon = now + 300;
+        }
+        if (aTalks && static_cast<int32_t>(now - nextTalk) >= 0) {
+            net.engine(a).send(net.mac(b), 1, hello, sizeof(hello), SendOptions(), nullptr, now);
+            nextTalk = now + 100;
+        }
+    }
+    // a's frames get through only at 13 dBm or less: a sagging supply.
+    void weakSupply() {
+        size_t weak = a;
+        net.linkModel = [weak](size_t from, size_t, PhyRate, float dbm) { return from == weak && dbm > 13.5f ? 1.0 : 0.0; };
+    }
+    size_t count(LinkMonitor::Event e) const {
+        size_t n = 0;
+        for (const auto& ev : events) n += ev.first == e;
+        return n;
+    }
+
+    float txPower() const override { return const_cast<sim::Network&>(net).node(a).radio.power; }
+    void setTxPower(float dbm) override { net.node(a).radio.setTxPower(dbm); }
+    void linkEvent(LinkMonitor::Event e, const Mac& peer, float, float to) override {
+        testing::HeapExempt app;
+        CHECK(peer == net.mac(b));
+        events.push_back(std::make_pair(e, to));
+    }
+};
+
+}  // namespace
+
+// A board whose supply sags at full power: b's frames arrive, a's fail. The
+// link is reported one-way, and the fallback steps the power down until b
+// acknowledges, checks the full power still fails, and keeps the lower one.
+TEST(link_monitor_lowers_power_for_a_one_way_link) {
+    MonitorRig rig;
+    rig.weakSupply();
+    rig.aTalks = true;
+    CHECK(rig.net.runUntil([&] { return rig.count(LinkMonitor::Event::PowerLowered) > 0; }, 20000));
+    CHECK_EQ(rig.count(LinkMonitor::Event::OneWay), 1u);
+    CHECK_EQ(rig.count(LinkMonitor::Event::FallbackStarted), 1u);
+    CHECK_EQ(rig.events.back().second, 13.0f);
+    CHECK_EQ(rig.net.node(rig.a).radio.power, 13.0f);
+    CHECK(!rig.monitor->fallbackActive());
+    // a's messages now get through.
+    Outcome out;
+    static const uint8_t data[2] = {9, 9};
+    rig.net.engine(rig.a).send(rig.net.mac(rig.b), 1, data, sizeof(data), SendOptions(), out.handler(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Ok);
+    // Once tried for a peer, no second search however its frames fare.
+    rig.net.run(5000);
+    CHECK_EQ(rig.count(LinkMonitor::Event::FallbackStarted), 1u);
+}
+
+// A peer briefly away (rebooting, scanning) fails our frames too. The search
+// may find that a lower power "works" once it is back, but the original
+// power works as well then: it stays.
+TEST(link_monitor_keeps_power_for_a_peer_briefly_away) {
+    MonitorRig rig;
+    rig.aTalks = true;
+    rig.net.run(1000);
+    rig.net.node(rig.b).online = false;
+    CHECK(rig.net.runUntil([&] { return rig.count(LinkMonitor::Event::FallbackStarted) > 0; }, 5000));
+    rig.net.node(rig.b).online = true;
+    CHECK(rig.net.runUntil([&] { return !rig.monitor->fallbackActive(); }, 10000));
+    CHECK_EQ(rig.count(LinkMonitor::Event::PowerKept), 1u);
+    CHECK_EQ(rig.count(LinkMonitor::Event::PowerLowered), 0u);
+    CHECK_EQ(rig.net.node(rig.a).radio.power, 20.0f);
+
+    // A peer never heard is merely absent: no one-way link, no search.
+    MonitorRig quiet;
+    quiet.net.node(quiet.b).online = false;
+    quiet.aTalks = true;
+    quiet.net.run(5000);
+    CHECK(quiet.events.empty());
+}
+
+// A peer discovery finds is pinged until it acknowledges, up to three times:
+// with nothing else to send, that is what reveals a one-way link.
+TEST(link_monitor_checks_new_peers) {
+    MonitorRig healthy;
+    healthy.net.run(500);
+    healthy.monitor->found(healthy.net.mac(healthy.b), healthy.net.now());
+    size_t sent = healthy.net.engine(healthy.a).stats().framesSent;
+    healthy.net.run(2000);
+    CHECK_EQ(healthy.net.engine(healthy.a).stats().framesSent - sent, 1u);  // one ping, acknowledged
+    CHECK(healthy.events.empty());
+    Deadline d(healthy.net.now());
+    healthy.monitor->nextTick(d);
+    CHECK(!d.set());  // done: nothing left to wake for
+
+    MonitorRig weak;
+    weak.weakSupply();
+    weak.net.run(500);
+    weak.monitor->found(weak.net.mac(weak.b), weak.net.now());
+    CHECK(weak.net.runUntil([&] { return weak.count(LinkMonitor::Event::PowerLowered) > 0; }, 20000));
+    CHECK_EQ(weak.count(LinkMonitor::Event::OneWay), 1u);
+
+    // Without the fallback, neither checks nor searches.
+    MonitorRig off;
+    off.monitor->reset(false);
+    off.weakSupply();
+    off.aTalks = true;
+    off.monitor->found(off.net.mac(off.b), off.net.now());
+    off.net.run(5000);
+    CHECK_EQ(off.count(LinkMonitor::Event::OneWay), 1u);  // still reported
+    CHECK_EQ(off.count(LinkMonitor::Event::FallbackStarted), 0u);
+    CHECK_EQ(off.net.node(off.a).radio.power, 20.0f);
+}
+
 // Credit is spent when a message's first frame is delivered: one lost at the
 // MAC level goes again at once, instead of waiting for the credit to expire.
 TEST(receiver_credit_is_spent_by_delivered_frames) {
@@ -1626,6 +1769,56 @@ struct DiscoveryRig {
 };
 
 }  // namespace
+
+// Frame sizes follow discovery's peer events: negotiated with a peer found
+// (the smaller of both maxima, above the default), back to the default when
+// it is lost, and a size given to addPeer() wins over both.
+TEST(frame_sizes_follow_peer_events) {
+    DiscoveryRig rig;
+    DiscoveryConfig dc;
+    dc.peerTimeoutMs = 3000;
+    size_t a = rig.add("a", dc, 1470), wide = rig.add("wide", dc, 1470), mid = rig.add("mid", dc, 800),
+           narrow = rig.add("narrow", dc, 250);
+    FrameSizes sizes(250, 1470, true);
+    sizes.setDiscovery(rig.nodes[a].get());
+    rig.net.node(a).link.sizeFor = [&](const Mac& dst) { return sizes.sizeFor(dst); };
+    Mac w = rig.net.mac(wide), m = rig.net.mac(mid), n = rig.net.mac(narrow);
+    CHECK_EQ(sizes.sizeFor(w), 250u);  // not discovered yet
+    for (auto& d : rig.nodes) d->start(rig.net.now());
+    rig.run(200);
+    CHECK_EQ(sizes.sizeFor(w), 1470u);
+    CHECK_EQ(sizes.sizeFor(m), 800u);
+    CHECK_EQ(sizes.sizeFor(n), 250u);
+    CHECK_EQ(sizes.sizeFor(Mac::broadcast()), 250u);
+
+    // A message to `wide` goes in 1470-byte frames.
+    auto big = pattern(3000);
+    size_t logged = rig.net.log.size();
+    CHECK(rig.net.engine(a).send(w, 1, big.data(), big.size(), SendOptions(), nullptr, rig.net.now()) == Status::Ok);
+    rig.run(50);
+    size_t largest = 0;
+    for (size_t i = logged; i < rig.net.log.size(); ++i) {
+        if (rig.net.log[i].from == a && rig.net.log[i].dst == w) largest = std::max(largest, rig.net.log[i].data.size());
+    }
+    CHECK_EQ(largest, 1470u);
+
+    sizes.set(n, 600);  // addPeer(narrow, 600)
+    sizes.set(w, 400);
+    CHECK_EQ(sizes.sizeFor(n), 600u);
+    CHECK_EQ(sizes.sizeFor(w), 400u);
+    sizes.set(w, 0);  // addPeer(wide) without a size: back to what discovery says
+    CHECK_EQ(sizes.sizeFor(w), 1470u);
+
+    rig.nodes[wide]->stop(rig.net.now());  // says goodbye: Lost
+    rig.run(50);
+    CHECK_EQ(rig.count(a, PeerEvent::Lost), 1u);
+    CHECK_EQ(sizes.sizeFor(w), 250u);
+    CHECK_EQ(sizes.sizeFor(n), 600u);
+
+    FrameSizes fixed(250, 1470, false);  // negotiateFrameSize = false
+    fixed.setDiscovery(rig.nodes[a].get());
+    CHECK_EQ(fixed.sizeFor(m), 250u);
+}
 
 TEST(discovery_nodes_find_each_other) {
     DiscoveryRig rig;

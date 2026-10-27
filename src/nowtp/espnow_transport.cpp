@@ -164,8 +164,6 @@ inline uint32_t nowMs() {
 }
 
 constexpr uint32_t kChannelPollMs = 250;
-constexpr size_t kMaxLinkEntries = 20;  // one-way link detection: peers heard
-constexpr size_t kMaxLinkChecks = 8;    // new peers being checked
 
 // Large blocks in PSRAM (EspNowConfig::usePsram). Small ones stay internal:
 // message bookkeeping, acks, short messages, all short-lived and often used.
@@ -334,7 +332,7 @@ public:
         return Status::LinkError;
     }
 
-    size_t maxFrameSize(const Mac& dst) const override { return transport_.frameSizeFor(dst); }
+    size_t maxFrameSize(const Mac& dst) const override { return transport_.frameSizes_->sizeFor(dst); }
 
 private:
     const EspNowTransport& transport_;
@@ -524,11 +522,12 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
                                     destroyService<Streams>);
         streams_->onIncoming(streamAcceptor_);
     }
-    fallback_ = PowerFallback();
-    linkChecks_.clear();
-    // The receive path never allocates: room for what it records is taken now.
-    linkChecks_.reserve(kMaxLinkChecks);
-    linkHealth_.reserve(kMaxLinkEntries);
+    // Per-peer settings belong to a session: ESP-NOW forgets its peers on deinit.
+    frameSizes_.reset(new FrameSizes(config_.defaultMaxFrameSize, maxSupportedFrameSize(), config_.negotiateFrameSize));
+    frameSizes_->setDiscovery(discovery_.get());
+    monitorHost_.reset(new MonitorHost(*this));
+    monitor_.reset(new LinkMonitor(*engine_, *monitorHost_));
+    monitor_->reset(config_.radio.autoPowerFallback);
     poller_ = nullptr;
 
     esp_err_t err = esp_now_init();
@@ -541,10 +540,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
 
     s_droppedEvents = 0;
     stats_ = TransportStats();
-    linkHealth_.clear();
-    // Per-peer settings belong to a session: ESP-NOW forgets its peers on deinit.
     peerRates_.clear();
-    explicitFrameSizes_.clear();
     s_sent.count = 0;  // no callbacks registered yet
     sentSeen_ = 0;
     s_received = 0;
@@ -651,12 +647,16 @@ void EspNowTransport::cleanup() {
     timeSync_.reset();
     follower_.reset();
     diagnostics_.reset();
+    if (frameSizes_) frameSizes_->setDiscovery(nullptr);
     discovery_.reset();
     security_.reset();
     host_.reset();
     engine_.reset();
+    monitor_.reset();  // its pings were in the engine's queue
+    monitorHost_.reset();
     gate_.reset();
     link_.reset();
+    frameSizes_.reset();
     peerTable_.reset();
     peerDriver_.reset();
     if (events_) {
@@ -745,10 +745,7 @@ uint32_t EspNowTransport::pollDelayMs() const {
     if (kTimeSync && timeSync_) timeSync_->nextTick(d);
     if (kStreams && streams_) streams_->nextTick(d);
     d.at(lastChannelPoll_ + kChannelPollMs);
-    if (fallback_.active && !fallback_.pingInFlight) d.at(fallback_.nextPingAt);
-    for (const LinkCheck& c : linkChecks_) {
-        if (!c.inFlight) d.at(c.nextAt);
-    }
+    monitor_->nextTick(d);
     unlock(false);
     return d.delay(kChannelPollMs);
 }
@@ -762,7 +759,7 @@ void EspNowTransport::checkSent() {
     uint64_t sentUs = s_sent.timeUs;
     if (s_sent.count.load(std::memory_order_acquire) != count) return;  // being written; it wakes us again
     sentSeen_ = count;
-    notePeerSendResult(mac, delivered);
+    monitor_->sent(mac, delivered, nowMs());
     if (!sendTracker_.reports(count, mac)) return;  // a late report for a frame the engine gave up on
     peerTable_->clearInFlight();
     engine_->onFrameSent(delivered, nowMs(), sentUs);
@@ -792,7 +789,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
             const EventHeader* h = static_cast<const EventHeader*>(item);
             const uint8_t* data = static_cast<const uint8_t*>(item) + sizeof(EventHeader);
             Mac src = Mac::from(h->mac);
-            notePeerHeard(src);
+            monitor_->heard(src, nowMs());
             uint64_t at = h->timeLo | (static_cast<uint64_t>(h->timeHi) << 32);
             engine_->onFrameReceived(src, data, size - sizeof(EventHeader), nowMs(), h->rssi, at);
         }
@@ -812,7 +809,7 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     }
     if (kTimeSync && timeSync_) timeSync_->tick(now);
     if (kStreams && streams_) streams_->tick(now);
-    tickLinkChecks(now);
+    monitor_->tick(now);
     unlock(false);
     return n >= 32;
 }
@@ -853,8 +850,7 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
         }
     }
     lock();
-    forgetFrameSize(mac);  // 0: what discovery learned, if anything
-    if (size) explicitFrameSizes_.push_back(std::make_pair(mac, size));
+    frameSizes_->set(mac, size);  // 0: what discovery learned, if anything
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
@@ -870,7 +866,7 @@ Status EspNowTransport::removePeer(const Mac& mac) {
     lock();
     esp_err_t err = esp_now_del_peer(mac.bytes);
     peerTable_->forget(mac);
-    forgetFrameSize(mac);
+    frameSizes_->set(mac, 0);
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
@@ -1489,52 +1485,6 @@ constexpr uint16_t kOneWayFailures = 8;    // consecutive failed frames
 constexpr uint32_t kOneWayHeardMs = 3000;  // peer heard this recently
 }  // namespace
 
-EspNowTransport::LinkHealth* EspNowTransport::linkHealth(const Mac& mac, bool create) {
-    for (auto& l : linkHealth_) {
-        if (l.mac == mac) return &l;
-    }
-    if (!create) return nullptr;
-    if (linkHealth_.size() >= kMaxLinkEntries) {
-        size_t oldest = 0;
-        for (size_t i = 1; i < linkHealth_.size(); ++i) {
-            if (static_cast<int32_t>(linkHealth_[i].lastHeardMs - linkHealth_[oldest].lastHeardMs) < 0) oldest = i;
-        }
-        linkHealth_.erase(linkHealth_.begin() + static_cast<std::ptrdiff_t>(oldest));
-    }
-    LinkHealth fresh;
-    fresh.mac = mac;
-    linkHealth_.push_back(fresh);
-    return &linkHealth_.back();
-}
-
-void EspNowTransport::notePeerHeard(const Mac& mac) {
-    linkHealth(mac, true)->lastHeardMs = nowMs();
-}
-
-void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
-    if (mac.isBroadcast()) return;
-    LinkHealth* l = linkHealth(mac, false);
-    if (!l) return;  // never heard from it: an absent peer, not a one-way link
-    if (delivered) {
-        l->failures = 0;
-        return;
-    }
-    if (++l->failures < kOneWayFailures) return;
-    if (static_cast<int32_t>(nowMs() - l->lastHeardMs) > static_cast<int32_t>(kOneWayHeardMs)) return;
-    if (!l->warned) {
-        l->warned = true;
-        stats_.oneWayLinks++;
-        int8_t power = 0;
-        esp_wifi_get_max_tx_power(&power);
-        ESP_LOGW(kTag,
-                 "frames to %02x:%02x:%02x:%02x:%02x:%02x keep failing although its frames arrive: the link is one-way. "
-                 "This board may not sustain %.1f dBm (try radio.txPowerDbm = 15) or the peer may not decode rate %s.",
-                 mac.bytes[0], mac.bytes[1], mac.bytes[2], mac.bytes[3], mac.bytes[4], mac.bytes[5], power / 4.0,
-                 toString(peerRate(mac)));
-    }
-    if (config_.radio.autoPowerFallback) startPowerFallback(mac);
-}
-
 // ---------------------------------------------------------------------------
 // Discovery
 
@@ -1543,10 +1493,7 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     if (follower_) follower_->onPeerEvent(event, peer, nowMs());
     if (kTimeSync && timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
     // Check new peers hear us; failures feed the one-way detection and fallback.
-    if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < kMaxLinkChecks) {
-        LinkCheck c = {nextLinkCheck_++, peer.mac, 3, false, nowMs()};
-        linkChecks_.push_back(c);  // within the reserved capacity
-    }
+    if (event == PeerEvent::Found) monitor_->found(peer.mac, nowMs());
     // Its slot in ESP-NOW's peer table, if we added it, goes back to the pool.
     if (event == PeerEvent::Lost) peerTable_->release(peer.mac);
     if (peerHandler_) {
@@ -1562,33 +1509,6 @@ void EspNowTransport::channelChanged(uint8_t ch) {
     Callback<void(uint8_t)> handler = channelHandler_;
     GateScope open(gate_.get());
     handler(ch);
-}
-
-// The size negotiated with a discovered peer; 0 (the default) otherwise.
-uint16_t EspNowTransport::negotiatedFrameSize(const Mac& mac) const {
-    const PeerInfo* p = config_.negotiateFrameSize && discovery_ ? discovery_->find(mac) : nullptr;
-    if (!p) return 0;
-    uint16_t common = std::min(p->maxFrameSize, maxSupportedFrameSize());
-    return common > config_.defaultMaxFrameSize ? common : 0;
-}
-
-// Frames to `dst`: the size given to addPeer(), else the one negotiated with
-// discovery, else the default. Looked up per frame, so a peer lost or
-// announced again smaller is seen at once (Engine cuts its messages again).
-uint16_t EspNowTransport::frameSizeFor(const Mac& dst) const {
-    for (const auto& e : explicitFrameSizes_) {
-        if (e.first == dst) return e.second;
-    }
-    uint16_t n = negotiatedFrameSize(dst);
-    return n ? n : config_.defaultMaxFrameSize;
-}
-
-void EspNowTransport::forgetFrameSize(const Mac& mac) {
-    for (size_t i = 0; i < explicitFrameSizes_.size(); ++i) {
-        if (explicitFrameSizes_[i].first != mac) continue;
-        explicitFrameSizes_.erase(explicitFrameSizes_.begin() + static_cast<std::ptrdiff_t>(i));
-        return;
-    }
 }
 
 void EspNowTransport::onPeerEvent(PeerHandler handler) {
@@ -1729,124 +1649,46 @@ Status EspNowTransport::setLongRange(bool enabled) {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic transmit power fallback (runs in the NowTP task, lock held)
+// Link monitoring (NowTP task, lock held): one-way links, power fallback
 
-namespace {
-const float kFallbackLadder[] = {17, 15, 13, 11, 8, 5};
-const uint8_t kPing[1] = {0};  // type 0: ignored by the receiver's diagnostics
-}  // namespace
-
-void EspNowTransport::startPowerFallback(const Mac& peer) {
-    if (fallback_.active) return;
-    size_t tried = std::min(fallback_.triedCount, sizeof(fallback_.tried) / sizeof(fallback_.tried[0]));
-    if (std::find(fallback_.tried, fallback_.tried + tried, peer) != fallback_.tried + tried) return;
-    fallback_.tried[fallback_.triedCount++ % (sizeof(fallback_.tried) / sizeof(fallback_.tried[0]))] = peer;
-    float current = txPower();
-    size_t steps = 0;
-    for (float p : kFallbackLadder) {
-        if (p < current - 0.1f) fallback_.ladder[steps++] = p;
-    }
-    if (steps == 0) return;
-    fallback_.active = true;
-    fallback_.peer = peer;
-    fallback_.original = current;
-    fallback_.steps = steps;
-    fallback_.index = 0;
-    fallback_.failures = 0;
-    fallback_.pingInFlight = false;
-    fallback_.confirming = false;
-    fallback_.nextPingAt = nowMs();
-    ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x are not acknowledged: trying lower transmit power",
-             peer.bytes[0], peer.bytes[1], peer.bytes[2], peer.bytes[3], peer.bytes[4], peer.bytes[5]);
-    applyTxPower(fallback_.ladder[0]);
+void EspNowTransport::MonitorHost::setTxPower(float dbm) {
+    t_.applyTxPower(dbm);
 }
 
-void EspNowTransport::sendFallbackPing() {
-    fallback_.pingInFlight = true;
-    Status st = engine_->send(fallback_.peer, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
-                              [this](Status s) { onFallbackPing(s); }, nowMs());
-    if (st != Status::Ok) {
-        fallback_.pingInFlight = false;
-        fallback_.nextPingAt = nowMs() + 50;
-    }
-}
-
-void EspNowTransport::onFallbackPing(Status status) {
-    if (!fallback_.active) return;
-    fallback_.pingInFlight = false;
-    const Mac& p = fallback_.peer;
-    if (fallback_.confirming) {
-        // A lower power worked; does the original power work again too? Then the
-        // peer was briefly away (rebooting, other channel), not our transmitter.
-        fallback_.confirming = false;
-        if (status == Status::Ok) {
-            fallback_.active = false;
-            if (LinkHealth* l = linkHealth(p, false)) l->failures = 0;
-            ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x get through at %.1f dBm again: keeping it",
-                     p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5], fallback_.original);
-            return;
-        }
-        applyTxPower(fallback_.ladder[fallback_.index]);
-        float now = txPower();
-        s_learnedCeilingDbm = now;
-        stats_.powerFallbacks++;
-        fallback_.active = false;
-        if (LinkHealth* l = linkHealth(p, false)) l->failures = 0;
-        ESP_LOGW(kTag,
-                 "transmit power lowered from %.1f to %.1f dBm: %02x:%02x:%02x:%02x:%02x:%02x did not acknowledge "
-                 "frames at higher power (this board's supply likely sags). Set radio.txPowerDbm to skip the search.",
-                 fallback_.original, now, p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5]);
-        return;
-    }
-    if (status == Status::Ok) {
-        fallback_.confirming = true;
-        applyTxPower(fallback_.original);
-        fallback_.nextPingAt = nowMs();
-        return;
-    }
-    if (++fallback_.failures < 2) {
-        fallback_.nextPingAt = nowMs() + 50;
-        return;
-    }
-    fallback_.failures = 0;
-    if (++fallback_.index < fallback_.steps) {
-        applyTxPower(fallback_.ladder[fallback_.index]);
-        fallback_.nextPingAt = nowMs();
-        return;
-    }
-    applyTxPower(fallback_.original);
-    fallback_.active = false;
-    ESP_LOGW(kTag, "lowering transmit power did not help with %02x:%02x:%02x:%02x:%02x:%02x: out of range, or its "
-                   "receiver is the problem",
-             p.bytes[0], p.bytes[1], p.bytes[2], p.bytes[3], p.bytes[4], p.bytes[5]);
-}
-
-void EspNowTransport::tickLinkChecks(uint32_t now) {
-    if (fallback_.active && !fallback_.pingInFlight && static_cast<int32_t>(now - fallback_.nextPingAt) >= 0) {
-        sendFallbackPing();
-    }
-    for (size_t i = 0; i < linkChecks_.size(); ++i) {
-        LinkCheck& c = linkChecks_[i];
-        if (c.inFlight || static_cast<int32_t>(now - c.nextAt) < 0) continue;
-        if (c.remaining == 0) {
-            linkChecks_.erase(linkChecks_.begin() + static_cast<std::ptrdiff_t>(i));
-            --i;
-            continue;
-        }
-        c.inFlight = true;
-        c.remaining--;
-        uint32_t id = c.id;
-        Status st = engine_->send(c.peer, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
-                                  [this, id](Status s) {
-                                      for (size_t j = 0; j < linkChecks_.size(); ++j) {
-                                          if (linkChecks_[j].id != id) continue;
-                                          linkChecks_[j].inFlight = false;
-                                          linkChecks_[j].nextAt = nowMs() + 200;
-                                          if (s == Status::Ok) linkChecks_[j].remaining = 0;  // healthy
-                                      }
-                                  },
-                                  now);
-        if (st != Status::Ok) c.inFlight = false;
+void EspNowTransport::MonitorHost::linkEvent(LinkMonitor::Event event, const Mac& peer, float from, float to) {
+    const uint8_t* m = peer.bytes;
+    switch (event) {
+        case LinkMonitor::Event::OneWay:
+            t_.stats_.oneWayLinks++;
+            ESP_LOGW(kTag,
+                     "frames to %02x:%02x:%02x:%02x:%02x:%02x keep failing although its frames arrive: the link is "
+                     "one-way. This board may not sustain %.1f dBm (try radio.txPowerDbm = 15) or the peer may not "
+                     "decode rate %s.",
+                     m[0], m[1], m[2], m[3], m[4], m[5], from, toString(t_.peerRate(peer)));
+            break;
+        case LinkMonitor::Event::FallbackStarted:
+            ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x are not acknowledged: trying lower transmit power",
+                     m[0], m[1], m[2], m[3], m[4], m[5]);
+            break;
+        case LinkMonitor::Event::PowerKept:
+            ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x get through at %.1f dBm again: keeping it", m[0],
+                     m[1], m[2], m[3], m[4], m[5], from);
+            break;
+        case LinkMonitor::Event::PowerLowered:
+            s_learnedCeilingDbm = to;
+            t_.stats_.powerFallbacks++;
+            ESP_LOGW(kTag,
+                     "transmit power lowered from %.1f to %.1f dBm: %02x:%02x:%02x:%02x:%02x:%02x did not acknowledge "
+                     "frames at higher power (this board's supply likely sags). Set radio.txPowerDbm to skip the "
+                     "search.",
+                     from, to, m[0], m[1], m[2], m[3], m[4], m[5]);
+            break;
+        case LinkMonitor::Event::FallbackFailed:
+            ESP_LOGW(kTag,
+                     "lowering transmit power did not help with %02x:%02x:%02x:%02x:%02x:%02x: out of range, or its "
+                     "receiver is the problem",
+                     m[0], m[1], m[2], m[3], m[4], m[5]);
+            break;
     }
 }
 

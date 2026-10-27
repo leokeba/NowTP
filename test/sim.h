@@ -146,9 +146,11 @@ class SimLink : public nowtp::Link {
 public:
     SimLink(Network& net, size_t index) : peers(driver), net_(net), index_(index) {}
     Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override;
-    size_t maxFrameSize(const Mac&) const override { return mtu; }
+    size_t maxFrameSize(const Mac& dst) const override { return sizeFor ? sizeFor(dst) : mtu; }
 
     size_t mtu = 250;
+    /// Per destination instead of `mtu`, as the transport's FrameSizes answers.
+    std::function<size_t(const Mac&)> sizeFor;
     bool inFlight = false;
     int busyReplies = 0;  // next N sendFrame() calls return QueueFull
     /// Set driver.capacity to model the peer table, managed like the ESP-NOW
@@ -182,6 +184,10 @@ struct Node {
     /// Time its frames wait in the driver before going on air: delivery and
     /// the "sent" report come this much later (one direction only, unlike air time).
     uint32_t txQueueMs = 0;
+    /// What the ESP-NOW transport feeds its LinkMonitor: frames heard (before
+    /// the engine), and the radio's report for each unicast frame sent.
+    std::function<void(const Mac& src)> onHeard;
+    std::function<void(const Mac& dst, bool delivered)> onSent;
     /// Local clock: offset and rate error against the simulation's time.
     uint64_t clockOffsetUs = 1000000000;
     double clockSkew = 0;  // e.g. 40e-6 for a crystal 40 ppm fast
@@ -275,8 +281,8 @@ public:
             std::fprintf(stderr, "engine violated one-frame-in-flight\n");
             std::abort();
         }
-        if (len > link.mtu) {
-            std::fprintf(stderr, "frame larger than mtu\n");
+        if (len > link.maxFrameSize(dst)) {
+            std::fprintf(stderr, "frame larger than its destination takes\n");
             std::abort();
         }
         if (link.busyReplies > 0) {
@@ -316,7 +322,7 @@ public:
             }
         }
         uint32_t latency = ok ? 1 : std::max<uint32_t>(1, failLatencyMs);
-        schedule(Event{onAir + latency, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0});
+        schedule(Event{onAir + latency, Event::SendDone, from, from, std::vector<uint8_t>(), ok, 0, dst});
         return Status::Ok;
     }
 
@@ -360,9 +366,11 @@ public:
                 n.link.inFlight = false;
                 Counted counted;
                 n.link.peers.clearInFlight();
+                if (n.onSent) n.onSent(e.dst, e.ok);
                 n.engine.onFrameSent(e.ok, now_, n.clockUs(now_));
             } else if (n.online) {
                 Counted counted;
+                if (n.onHeard) n.onHeard(nodes_[e.from]->mac);
                 n.engine.onFrameReceived(nodes_[e.from]->mac, e.data.data(), e.data.size(), now_, e.rssi,
                                          n.clockUs(now_));
             }
@@ -412,6 +420,7 @@ private:
         std::vector<uint8_t> data;
         bool ok;
         int8_t rssi;
+        Mac dst = Mac();  // SendDone: the frame's destination
     };
 
     int8_t rssi(size_t from, size_t to) const {
