@@ -1003,10 +1003,15 @@ Status Diagnostics::deepDiscover(const DeepDiscoveryOptions& opt, DeepDiscoveryR
 
     std::vector<uint8_t> channels = opt.channels;
     if (channels.empty()) {
-        channels.push_back(home);
+        // Built in an array: growing the vector one channel at a time trips
+        // GCC 15's -Wfree-nonheap-object at -O2 (a false positive).
+        uint8_t all[14];
+        size_t n = 0;
+        all[n++] = home;
         for (uint8_t c = 1; c <= 13; ++c) {
-            if (c != home) channels.push_back(c);
+            if (c != home) all[n++] = c;
         }
+        channels.assign(all, all + n);
     }
 
     bool channelLocked = false;
