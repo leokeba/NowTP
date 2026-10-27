@@ -223,7 +223,7 @@ private:
     uint32_t nextSampleAt_ = 0;
     uint32_t lastSentAt_ = 0;
     uint32_t nextRoundAt_ = 0;
-    Exchange exchanges_[kMaxExchanges];
+    Exchange* exchanges_ = nullptr;  // config_.samples of them, malloc'd for the first round
     bool refStamps_ = false;  // the reference reports its send times
     Answer answers_[kMaxAnswers];
     Mac peer_ = Mac();  // the follower measured by the current calibration round

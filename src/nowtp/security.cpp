@@ -495,6 +495,7 @@ void Security::handle(const Message& m) {
     now_ = engine_.now();  // our last tick() may be long past
     if (m.len < 1) return;
     const uint8_t* d = m.data;
+    if (d[0] != kChallenge && d[0] != kResponse && !pairing_) return;  // not pairing
     switch (d[0]) {
         case kChallenge:
             if (m.len >= 9) respond(m.src, d + 1, now_);
@@ -502,43 +503,43 @@ void Security::handle(const Message& m) {
         case kResponse: verifyResponse(m.src, d, m.len, now_); break;
         case kPairRequest:
             // type | public key (32) | nonce (16)
-            if (pairing_.role != Pairing::Member || pairing_.busy || pairing_.request || m.len < 49) return;
-            pairing_.request = true;
-            pairing_.joiner = m.src;
-            memcpy(pairing_.joinerPub, d + 1, 32);
-            memcpy(pairing_.joinerNonce, d + 33, 16);
+            if (pairing_->role != Pairing::Member || pairing_->busy || pairing_->request || m.len < 49) return;
+            pairing_->request = true;
+            pairing_->joiner = m.src;
+            memcpy(pairing_->joinerPub, d + 1, 32);
+            memcpy(pairing_->joinerNonce, d + 33, 16);
             break;
         case kPairOffer:
             // type | joiner nonce (16) | public key (32) | nonce (16) | tag (16)
-            if (pairing_.role != Pairing::Joiner || pairing_.offer || m.len < 81) return;
-            if (!crypto::equal(d + 1, pairing_.nonce, 16)) return;
-            pairing_.offer = true;
-            pairing_.member = m.src;
-            memcpy(pairing_.memberPub, d + 17, 32);
-            memcpy(pairing_.memberNonce, d + 49, 16);
-            memcpy(pairing_.offerTag, d + 65, 16);
+            if (pairing_->role != Pairing::Joiner || pairing_->offer || m.len < 81) return;
+            if (!crypto::equal(d + 1, pairing_->nonce, 16)) return;
+            pairing_->offer = true;
+            pairing_->member = m.src;
+            memcpy(pairing_->memberPub, d + 17, 32);
+            memcpy(pairing_->memberNonce, d + 49, 16);
+            memcpy(pairing_->offerTag, d + 65, 16);
             break;
         case kPairProof:
-            if (pairing_.role != Pairing::Member || !pairing_.busy || m.src != pairing_.joiner || m.len < 17) return;
-            pairing_.proof = true;
-            memcpy(pairing_.proofTag, d + 1, 16);
+            if (pairing_->role != Pairing::Member || !pairing_->busy || m.src != pairing_->joiner || m.len < 17) return;
+            pairing_->proof = true;
+            memcpy(pairing_->proofTag, d + 1, 16);
             break;
         case kPairKey:
             // type | sealed key (33) | tag (16)
-            if (pairing_.role != Pairing::Joiner || !pairing_.offer || m.src != pairing_.member || m.len < 50) return;
-            pairing_.keyMsg = true;
-            memcpy(pairing_.sealedKey, d + 1, 33);
-            memcpy(pairing_.keyTag, d + 34, 16);
+            if (pairing_->role != Pairing::Joiner || !pairing_->offer || m.src != pairing_->member || m.len < 50) return;
+            pairing_->keyMsg = true;
+            memcpy(pairing_->sealedKey, d + 1, 33);
+            memcpy(pairing_->keyTag, d + 34, 16);
             break;
         case kPairDone:
-            if (pairing_.role != Pairing::Member || !pairing_.busy || m.src != pairing_.joiner || m.len < 17) return;
-            pairing_.done = true;
-            memcpy(pairing_.doneTag, d + 1, 16);
+            if (pairing_->role != Pairing::Member || !pairing_->busy || m.src != pairing_->joiner || m.len < 17) return;
+            pairing_->done = true;
+            memcpy(pairing_->doneTag, d + 1, 16);
             break;
         case kPairRefused:
             // Carries no secret; at worst a forged one changes what acceptPairing() reports.
-            if (pairing_.role != Pairing::Member || !pairing_.busy || m.src != pairing_.joiner) return;
-            pairing_.refused = true;
+            if (pairing_->role != Pairing::Member || !pairing_->busy || m.src != pairing_->joiner) return;
+            pairing_->refused = true;
             break;
         default: break;
     }
@@ -578,10 +579,16 @@ bool Security::waitFor(const std::function<bool()>& done, uint32_t timeoutMs) {
 Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
     if (!running_) return Status::InvalidState;
     host_.lock();
-    if (pairing_.role != Pairing::None) {
+    if (pairing_) {
         host_.unlock();
         return Status::InvalidState;
     }
+    pairing_ = heap::make<Pairing>();
+    if (!pairing_) {
+        host_.unlock();
+        return Status::NoMemory;
+    }
+    pairing_->role = Pairing::Member;
     bool created = false;
     if (key_.empty()) {
         // The first node of an installation creates its key.
@@ -593,8 +600,6 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
         crypto::wipe(fresh, sizeof(fresh));
         created = true;
     }
-    pairing_ = Pairing();
-    pairing_.role = Pairing::Member;
     host_.unlock();
     if (created && keyHandler_) keyHandler_(key());
 
@@ -603,14 +608,14 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
     uint32_t deadline = host_.now() + timeoutMs;
     while (!reached(host_.now(), deadline)) {
         result = Status::Timeout;
-        if (!waitFor([this] { return pairing_.request; }, 50)) continue;
+        if (!waitFor([this] { return pairing_->request; }, 50)) continue;
 
         host_.lock();
-        pairing_.busy = true;
-        Mac joiner = pairing_.joiner;
+        pairing_->busy = true;
+        Mac joiner = pairing_->joiner;
         uint8_t joinerPub[32], joinerNonce[16];
-        memcpy(joinerPub, pairing_.joinerPub, 32);
-        memcpy(joinerNonce, pairing_.joinerNonce, 16);
+        memcpy(joinerPub, pairing_->joinerPub, 32);
+        memcpy(joinerNonce, pairing_->joinerNonce, 16);
         host_.unlock();
 
         uint8_t priv[32], pub[32], nonce[16], dh[32];
@@ -634,10 +639,10 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
         bool proved = false, refused = false;
         for (uint32_t t0 = host_.now(); ok && !proved && !refused && host_.now() - t0 < kPairStepMs;) {
             sendLocked(joiner, offer, sizeof(offer), false);
-            waitFor([this] { return pairing_.proof || pairing_.refused; }, kPairRequestIntervalMs);
+            waitFor([this] { return pairing_->proof || pairing_->refused; }, kPairRequestIntervalMs);
             host_.lock();
-            proved = pairing_.proof;
-            refused = pairing_.refused;
+            proved = pairing_->proof;
+            refused = pairing_->refused;
             host_.unlock();
         }
         if (refused) result = Status::AuthFailed;
@@ -645,7 +650,7 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
             uint8_t expect[16];
             pairTag(*k, "proof", nullptr, 0, expect);
             host_.lock();
-            proved = crypto::equal(expect, pairing_.proofTag, 16);
+            proved = crypto::equal(expect, pairing_->proofTag, 16);
             host_.unlock();
             if (!proved) result = Status::AuthFailed;  // another pairing code
         }
@@ -667,21 +672,20 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
             pairTag(*k, "key", msg + 1, 33, msg + 34);
             for (uint32_t t0 = host_.now(); !done && host_.now() - t0 < kPairStepMs;) {
                 sendLocked(joiner, msg, sizeof(msg), false);
-                done = waitFor([this] { return pairing_.done; }, kPairRequestIntervalMs);
+                done = waitFor([this] { return pairing_->done; }, kPairRequestIntervalMs);
             }
             if (done) {
                 uint8_t expect[16];
                 pairTag(*k, "done", nullptr, 0, expect);
                 host_.lock();
-                done = crypto::equal(expect, pairing_.doneTag, 16);
+                done = crypto::equal(expect, pairing_->doneTag, 16);
                 host_.unlock();
             }
         }
 
         host_.lock();
-        Pairing fresh = Pairing();
-        fresh.role = Pairing::Member;
-        pairing_ = fresh;  // ready for the next joiner
+        *pairing_ = Pairing();  // ready for the next joiner
+        pairing_->role = Pairing::Member;
         host_.unlock();
         if (done) {
             if (joined) *joined = joiner;
@@ -692,7 +696,7 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
     }
     if (result != Status::Ok) result = failed ? Status::AuthFailed : Status::Timeout;
     host_.lock();
-    pairing_ = Pairing();
+    pairing_.reset();
     host_.unlock();
     return result;
 }
@@ -700,12 +704,16 @@ Status Security::acceptPairing(uint32_t timeoutMs, Mac* joined) {
 Status Security::pair(uint32_t timeoutMs, Mac* member) {
     if (!running_) return Status::InvalidState;
     host_.lock();
-    if (pairing_.role != Pairing::None) {
+    if (pairing_) {
         host_.unlock();
         return Status::InvalidState;
     }
-    pairing_ = Pairing();
-    pairing_.role = Pairing::Joiner;
+    pairing_ = heap::make<Pairing>();
+    if (!pairing_) {
+        host_.unlock();
+        return Status::NoMemory;
+    }
+    pairing_->role = Pairing::Joiner;
     host_.unlock();
 
     uint8_t priv[32], pub[32], nonce[16];
@@ -713,7 +721,7 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
     randomBytes(nonce, sizeof(nonce));
     crypto::x25519Base(pub, priv);
     host_.lock();
-    memcpy(pairing_.nonce, nonce, 16);
+    memcpy(pairing_->nonce, nonce, 16);
     host_.unlock();
 
     uint8_t request[49];
@@ -725,14 +733,14 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
     uint32_t deadline = host_.now() + timeoutMs;
     while (!reached(host_.now(), deadline)) {
         sendLocked(Mac::broadcast(), request, sizeof(request), false);
-        if (!waitFor([this] { return pairing_.offer; }, kPairRequestIntervalMs)) continue;
+        if (!waitFor([this] { return pairing_->offer; }, kPairRequestIntervalMs)) continue;
 
         host_.lock();
-        Mac from = pairing_.member;
+        Mac from = pairing_->member;
         uint8_t memberPub[32], memberNonce[16], offerTag[16];
-        memcpy(memberPub, pairing_.memberPub, 32);
-        memcpy(memberNonce, pairing_.memberNonce, 16);
-        memcpy(offerTag, pairing_.offerTag, 16);
+        memcpy(memberPub, pairing_->memberPub, 32);
+        memcpy(memberNonce, pairing_->memberNonce, 16);
+        memcpy(offerTag, pairing_->offerTag, 16);
         host_.unlock();
 
         uint8_t dh[32];
@@ -749,7 +757,7 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
             sendLocked(from, refusal, sizeof(refusal), false);
             result = Status::AuthFailed;
             host_.lock();
-            pairing_.offer = false;
+            pairing_->offer = false;
             host_.unlock();
             host_.sleep(kPairRequestIntervalMs);
             continue;
@@ -761,15 +769,15 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
         bool gotKey = false;
         for (uint32_t t0 = host_.now(); !gotKey && host_.now() - t0 < kPairStepMs;) {
             sendLocked(from, proof, sizeof(proof), false);
-            gotKey = waitFor([this] { return pairing_.keyMsg; }, kPairRequestIntervalMs);
+            gotKey = waitFor([this] { return pairing_->keyMsg; }, kPairRequestIntervalMs);
         }
         uint8_t plain[33];
         bool valid = false;
         if (gotKey) {
             host_.lock();
             uint8_t sealed[33], tag[16];
-            memcpy(sealed, pairing_.sealedKey, 33);
-            memcpy(tag, pairing_.keyTag, 16);
+            memcpy(sealed, pairing_->sealedKey, 33);
+            memcpy(tag, pairing_->keyTag, 16);
             host_.unlock();
             pairTag(*k, "key", sealed, 33, expect);
             if (crypto::equal(expect, tag, 16)) {
@@ -782,7 +790,7 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
         }
         if (!valid) {
             host_.lock();
-            pairing_.offer = pairing_.keyMsg = false;
+            pairing_->offer = pairing_->keyMsg = false;
             host_.unlock();
             continue;
         }
@@ -806,7 +814,7 @@ Status Security::pair(uint32_t timeoutMs, Mac* member) {
     }
     crypto::wipe(priv, sizeof(priv));
     host_.lock();
-    pairing_ = Pairing();
+    pairing_.reset();
     host_.unlock();
     if (result == Status::Ok && keyHandler_) keyHandler_(key());
     return result;

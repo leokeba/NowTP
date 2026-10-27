@@ -146,7 +146,7 @@ private:
     };
 
     struct Pairing {
-        enum Role : uint8_t { None, Member, Joiner } role = None;
+        enum Role : uint8_t { Member, Joiner } role = Member;
         // Member
         bool busy = false;
         bool request = false;
@@ -214,7 +214,7 @@ private:
     };
     static constexpr size_t kChallengers = 8;
     Challenger challengers_[kChallengers];
-    Pairing pairing_;
+    heap::Owned<Pairing> pairing_;  // while acceptPairing() or pair() runs
     Counters counters_;
 };
 

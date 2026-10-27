@@ -87,6 +87,7 @@ TimeSync::TimeSync(Engine& engine, Clock localClockUs, const TimeSyncConfig& con
 
 TimeSync::~TimeSync() {
     stop();
+    heap::release(exchanges_);
 }
 
 void TimeSync::setDiscovery(Discovery* discovery) {
@@ -334,6 +335,13 @@ void TimeSync::tick(uint32_t now) {
             }
             due->nextCalibrationMs = now + due->calibrateEveryMs;
             peer_ = due->to;
+        }
+        if (!exchanges_) {
+            exchanges_ = static_cast<Exchange*>(heap::allocate(config_.samples * sizeof(Exchange)));
+            if (!exchanges_) {  // short heap: try again shortly
+                nextRoundAt_ = now + kFastIntervalMs;
+                return;
+            }
         }
         roundActive_ = true;
         round_++;
