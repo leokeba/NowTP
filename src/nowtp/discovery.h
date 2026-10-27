@@ -81,7 +81,7 @@ struct DiscoveryConfig {
 /// Platform-independent: runs on an Engine, driven by tick(). Every node
 /// announces itself periodically; a query (discover(), sent automatically by
 /// start()) makes every listening node announce itself promptly.
-class Discovery {
+class Discovery : private PeerLimits {
 public:
     static constexpr size_t kMaxName = 32;
     static constexpr size_t kMaxMetadata = 160;
@@ -121,6 +121,7 @@ public:
     /// A copy of the peers tracked.
     std::vector<PeerInfo> peers() const;
     const PeerInfo* find(const Mac& mac) const;
+    size_t maxMessageSize(const Mac& peer) const override;
 
     /// A parsed announcement payload (as carried on kDiscoveryPort).
     struct Announcement {

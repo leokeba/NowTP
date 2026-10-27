@@ -454,6 +454,47 @@ TEST(per_peer_byte_limit) {
           Status::Ok);
 }
 
+// Messages without a handler of their own report to their port's observer,
+// with their tag: one stored callback instead of a std::function per send.
+TEST(completion_observer_reports_tagged_messages) {
+    sim::Network net;
+    size_t a = net.addNode(), b = net.addNode();
+    Inbox inbox;
+    net.engine(b).listen(1, inbox.handler());
+    std::vector<std::pair<uint32_t, Status>> reported;
+    net.engine(a).observeCompletions(1, [&](uint32_t tag, Status st) {
+        testing::HeapExempt app;
+        reported.push_back(std::make_pair(tag, st));
+    });
+    Mac absent = {{0x02, 0x77, 0, 0, 0, 1}};
+    auto msg = pattern(600);
+    SendOptions o = reliable();
+    o.timeoutMs = 400;
+    o.tag = 7;
+    CHECK(net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), o, nullptr, net.now()) == Status::Ok);
+    o.tag = 8;
+    CHECK(net.engine(a).send(absent, 1, msg.data(), msg.size(), o, nullptr, net.now()) == Status::Ok);
+    Outcome own;  // its own handler: not reported to the observer
+    o.tag = 9;
+    CHECK(net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), o, own.handler(), net.now()) == Status::Ok);
+    o.tag = 10;  // another port, no observer: unreported
+    CHECK(net.engine(a).send(net.mac(b), 2, msg.data(), msg.size(), o, nullptr, net.now()) == Status::Ok);
+    CHECK(net.runUntil([&] { return reported.size() == 2 && own.done; }));
+    net.run(500);
+    CHECK_EQ(reported.size(), 2u);
+    std::sort(reported.begin(), reported.end());
+    CHECK(reported[0] == std::make_pair(7u, Status::Ok));
+    CHECK(reported[1].first == 8u && reported[1].second != Status::Ok);  // nobody there
+    CHECK(own.status == Status::Ok);
+
+    net.engine(a).observeCompletions(1, CompletionObserver());
+    o.tag = 11;
+    CHECK(net.engine(a).send(net.mac(b), 1, msg.data(), msg.size(), o, nullptr, net.now()) == Status::Ok);
+    net.run(200);
+    CHECK_EQ(reported.size(), 2u);
+    CHECK_EQ(inbox.messages.size(), 3u);
+}
+
 TEST(send_buffer_takes_ownership) {
     sim::Network net;
     size_t a = net.addNode(), b = net.addNode();

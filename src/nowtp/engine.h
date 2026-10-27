@@ -33,6 +33,14 @@ constexpr size_t kSendHeadroom = wire::kFragmentHeaderSize;
 /// of a multi-frame message.
 constexpr size_t kSendOverhead = kSendHeadroom + wire::kAuthTrailerSize + wire::kCrcSize;
 
+/// What peers announced they accept (see Engine::setPeerLimits()).
+class PeerLimits {
+public:
+    virtual ~PeerLimits() {}
+    /// The largest message `peer` accepts; 0 if unknown.
+    virtual size_t maxMessageSize(const Mac& peer) const = 0;
+};
+
 /// A received frame as seen before any filtering, for diagnostics.
 struct FrameInfo {
     Mac src;
@@ -144,6 +152,10 @@ public:
     /// Sets the handler for messages arriving on `port`; an empty handler removes it.
     /// Messages for ports without a handler are dropped (reliable ones are rejected).
     void listen(uint8_t port, ReceiveHandler handler);
+    /// Reports the outcome of every message on `port` sent without a
+    /// handler, with its SendOptions::tag. An empty observer removes it;
+    /// messages queued meanwhile then end unreported.
+    void observeCompletions(uint8_t port, CompletionObserver observer);
 
     /// Feeds one frame received from the radio. `rssi` is in dBm, 0 if unknown;
     /// `timestampUs` is the local clock when the radio delivered it, 0 if unknown.
@@ -225,14 +237,13 @@ public:
     /// Largest message on `port` that fits in a single frame to `dst`.
     size_t singleFramePayload(const Mac& dst, uint8_t port = 0) const;
 
-    /// The largest message `peer` accepts (its Config::maxMessageSize, as it
-    /// announces it), so that send() refuses a larger one with TooLarge at
-    /// once, instead of the receiver rejecting it. 0 forgets it. Discovery
-    /// sets it; at most kMaxPeerLimits peers are known at once.
-    void setPeerMessageLimit(const Mac& peer, size_t maxMessageSize);
+    /// Where the engine learns the largest message a peer accepts (its
+    /// Config::maxMessageSize, as it announces it), so that send() refuses a
+    /// larger one with TooLarge at once, instead of the receiver rejecting it.
+    /// Discovery sets itself while it runs; null forgets it.
+    void setPeerLimits(const PeerLimits* limits) { peerLimits_ = limits; }
     /// 0 if unknown (no limit is applied then).
-    size_t peerMessageLimit(const Mac& peer) const;
-    static constexpr size_t kMaxPeerLimits = 32;
+    size_t peerMessageLimit(const Mac& peer) const { return peerLimits_ ? peerLimits_->maxMessageSize(peer) : 0; }
 
 private:
     struct TxMessage;
@@ -277,10 +288,6 @@ private:
         uint32_t at[kSeenBlocks];  // last delivery in each block
     };
 
-    struct PeerLimit {
-        Mac peer;
-        size_t maxMessageSize;
-    };
 
     // A destination whose frames failed: served again only after `retryAt`
     // while others have frames to send.
@@ -389,8 +396,10 @@ private:
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
     Table<Seen> seen_;  // memory per sender heard, not reserved for recentSenders
-    Table<PeerLimit> limits_;
+    const PeerLimits* peerLimits_ = nullptr;
     std::vector<std::pair<uint8_t, Callback<void(const Message&)>>> listeners_;
+    std::vector<std::pair<uint8_t, Callback<void(uint32_t, Status)>>> observers_;
+    const Callback<void(uint32_t, Status)>* observer(uint8_t port) const;
     TxMessage* doneHead_ = nullptr;  // finished messages whose handler is still to run
     TxMessage* doneTail_ = nullptr;
 

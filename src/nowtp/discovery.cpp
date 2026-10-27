@@ -44,6 +44,7 @@ Discovery::~Discovery() {
     if (!running_) return;
     engine_.listen(kDiscoveryPort, ReceiveHandler());
     engine_.setHeardObserver(HeardObserver());
+    engine_.setPeerLimits(nullptr);
 }
 
 void Discovery::start(uint32_t now) {
@@ -51,6 +52,7 @@ void Discovery::start(uint32_t now) {
     running_ = true;
     engine_.listen(kDiscoveryPort, [this](const Message& m) { handle(m); });
     engine_.setHeardObserver([this](const Mac& src, bool authenticated, uint32_t t) { heard(src, authenticated, t); });
+    engine_.setPeerLimits(this);
     queryDue_ = true;  // sent from tick() so start() itself never fails
     tick(now);
 }
@@ -63,7 +65,7 @@ void Discovery::stop(uint32_t now) {
     engine_.setHeardObserver(HeardObserver());
     running_ = false;
     replyDue_ = queryDue_ = false;
-    for (const PeerInfo& p : peers_) engine_.setPeerMessageLimit(p.mac, 0);
+    engine_.setPeerLimits(nullptr);
     peers_.clear();
 }
 
@@ -132,6 +134,12 @@ const PeerInfo* Discovery::find(const Mac& mac) const {
         if (p.mac == mac) return &p;
     }
     return nullptr;
+}
+
+// What the peer takes, so send() refuses more at once (0: unknown, none).
+size_t Discovery::maxMessageSize(const Mac& peer) const {
+    const PeerInfo* p = find(peer);
+    return p ? p->maxMessageSize : 0;
 }
 
 bool Discovery::announce(uint8_t flags, uint8_t moveTo) {
@@ -381,8 +389,6 @@ void Discovery::heard(const Mac& src, bool authenticated, uint32_t now) {
 }
 
 void Discovery::emit(PeerEvent event, const PeerInfo& peer) {
-    // What the peer takes, so send() refuses more at once (0: unknown, none).
-    engine_.setPeerMessageLimit(peer.mac, event == PeerEvent::Lost ? 0 : peer.maxMessageSize);
     if (handler_) handler_(event, peer);  // the handler may replace itself
 }
 

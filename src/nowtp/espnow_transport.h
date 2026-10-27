@@ -263,6 +263,11 @@ public:
     /// Sets the handler for a port (may be called before begin()). Ports from
     /// kFirstReservedPort up are reserved and rejected.
     Status listen(uint8_t port, ReceiveHandler handler);
+    /// Reports the outcome of every message on `port` sent without a handler,
+    /// with its SendOptions::tag, in place of a handler per message (whose
+    /// captures beyond 8 bytes cost an allocation per send). May be called
+    /// before begin(); an empty observer removes it. Runs like a handler.
+    Status observeCompletions(uint8_t port, CompletionObserver observer);
 
     /// Discovery (EspNowConfig::enableDiscovery). The handler may be set before
     /// begin() and runs in the NowTP task.
@@ -449,7 +454,8 @@ private:
     LinkHealth* linkHealth(const Mac& mac, bool create);
     void notePeerHeard(const Mac& mac);
     void notePeerSendResult(const Mac& mac, bool delivered);
-    bool hasExplicitFrameSize(const Mac& mac) const;
+    uint16_t frameSizeFor(const Mac& dst) const;
+    void forgetFrameSize(const Mac& mac);
     uint16_t negotiatedFrameSize(const Mac& mac) const;
     bool processEvents(TickType_t wait);  // true if events are left
     TickType_t taskWait() const;
@@ -469,8 +475,9 @@ private:
     std::unique_ptr<Engine> engine_;
     std::unique_ptr<Discovery> discovery_;
     std::vector<std::pair<uint8_t, ReceiveHandler>> listeners_;
+    std::vector<std::pair<uint8_t, CompletionObserver>> observers_;
     Callback<void(PeerEvent, const PeerInfo&)> peerHandler_;
-    std::vector<Mac> explicitFrameSizes_;
+    std::vector<std::pair<Mac, uint16_t>> explicitFrameSizes_;  // set by addPeer()
     std::vector<std::pair<Mac, PhyRate>> peerRates_;
     std::vector<LinkHealth> linkHealth_;
     std::unique_ptr<Host> host_;

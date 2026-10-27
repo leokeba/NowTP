@@ -65,6 +65,9 @@ struct SendOptions {
     bool latestOnly = false;
     /// Deadline for the whole message in ms; 0 uses Config::sendTimeoutMs.
     uint32_t timeoutMs = 0;
+    /// Passed to the port's completion observer (Engine::observeCompletions())
+    /// when the message is sent without its own handler.
+    uint32_t tag = 0;
 };
 
 /// A received message. `data` is only valid during the receive callback,
@@ -105,6 +108,10 @@ constexpr uint8_t kFirstReservedPort = 240;
 
 using ReceiveHandler = std::function<void(const Message&)>;
 using CompletionHandler = std::function<void(Status)>;
+/// The outcome of a message sent with SendOptions::tag and no handler of its
+/// own. One per port: a handler per message costs an allocation each when its
+/// captures don't fit in std::function (8 bytes on ESP32).
+using CompletionObserver = std::function<void(uint32_t tag, Status)>;
 
 /// Protocol engine limits and timings. Defaults suit 250-byte ESP-NOW v1 frames.
 struct Config {

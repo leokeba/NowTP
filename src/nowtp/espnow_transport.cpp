@@ -292,9 +292,9 @@ private:
 // Link implementation over esp_now_send(), with per-peer frame sizes.
 class EspNowTransport::RadioLink : public Link {
 public:
-    RadioLink(uint16_t defaultSize, bool autoAddPeers, PeerTable& peers, SendTracker& tracker,
+    RadioLink(const EspNowTransport& transport, bool autoAddPeers, PeerTable& peers, SendTracker& tracker,
               std::function<void(const Mac&)> added)
-        : defaultSize_(defaultSize),
+        : transport_(transport),
           autoAddPeers_(autoAddPeers),
           peers_(peers),
           tracker_(tracker),
@@ -321,36 +321,14 @@ public:
         return Status::LinkError;
     }
 
-    size_t maxFrameSize(const Mac& dst) const override {
-        for (const auto& p : sizes_) {
-            if (p.first == dst) return p.second;
-        }
-        return defaultSize_;
-    }
-
-    /// A size of 0 reverts the peer to the default. Without `grow`, a new
-    /// entry needs room reserved (see begin()): the receive path never allocates.
-    void setFrameSize(const Mac& mac, uint16_t size, bool grow = true) {
-        for (size_t i = 0; i < sizes_.size(); ++i) {
-            if (sizes_[i].first != mac) continue;
-            if (size) {
-                sizes_[i].second = size;
-            } else {
-                sizes_.erase(sizes_.begin() + static_cast<std::ptrdiff_t>(i));
-            }
-            return;
-        }
-        if (size && (grow || sizes_.size() < sizes_.capacity())) sizes_.push_back(std::make_pair(mac, size));
-    }
-    void reserveSizes(size_t n) { sizes_.reserve(n); }
+    size_t maxFrameSize(const Mac& dst) const override { return transport_.frameSizeFor(dst); }
 
 private:
-    uint16_t defaultSize_;
+    const EspNowTransport& transport_;
     bool autoAddPeers_;
     PeerTable& peers_;
     SendTracker& tracker_;
     std::function<void(const Mac&)> added_;
-    std::vector<std::pair<Mac, uint16_t>> sizes_;
 };
 
 // Lets the blocking diagnostic procedures run in the caller's task while the
@@ -474,7 +452,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     taskExited_ = xSemaphoreCreateBinary();
     peerDriver_.reset(new PeerDriver(interface_));
     peerTable_.reset(new PeerTable(*peerDriver_));
-    link_.reset(new RadioLink(config_.defaultMaxFrameSize, config_.autoAddPeers, *peerTable_, sendTracker_,
+    link_.reset(new RadioLink(*this, config_.autoAddPeers, *peerTable_, sendTracker_,
                               [this](const Mac& mac) { applyPeerRate(mac); }));
     engine_.reset(new Engine(*link_, config_.protocol, static_cast<uint16_t>(esp_random())));
     gate_.reset(new Gate(*this));
@@ -484,6 +462,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
         return Status::NoMemory;
     }
     for (auto& l : listeners_) engine_->listen(l.first, l.second);
+    for (auto& o : observers_) engine_->observeCompletions(o.first, o.second);
     host_.reset(new Host(*this));
 
     SecurityConfig sc = config_.security;
@@ -528,7 +507,6 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     // The receive path never allocates: room for what it records is taken now.
     linkChecks_.reserve(kMaxLinkChecks);
     linkHealth_.reserve(kMaxLinkEntries);
-    link_->reserveSizes(discovery_ ? config_.discovery.maxPeers : 0);
     poller_ = nullptr;
 
     esp_err_t err = esp_now_init();
@@ -853,14 +831,8 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
         }
     }
     lock();
-    explicitFrameSizes_.erase(std::remove(explicitFrameSizes_.begin(), explicitFrameSizes_.end(), mac),
-                              explicitFrameSizes_.end());
-    if (size) {
-        explicitFrameSizes_.push_back(mac);
-        link_->setFrameSize(mac, size);
-    } else {
-        link_->setFrameSize(mac, negotiatedFrameSize(mac));  // what discovery learned, if anything
-    }
+    forgetFrameSize(mac);  // 0: what discovery learned, if anything
+    if (size) explicitFrameSizes_.push_back(std::make_pair(mac, size));
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
@@ -876,7 +848,7 @@ Status EspNowTransport::removePeer(const Mac& mac) {
     lock();
     esp_err_t err = esp_now_del_peer(mac.bytes);
     peerTable_->forget(mac);
-    link_->setFrameSize(mac, 0);
+    forgetFrameSize(mac);
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
@@ -960,6 +932,29 @@ Status EspNowTransport::listen(uint8_t port, ReceiveHandler handler) {
     if (started_) {
         lock();
         engine_->listen(port, std::move(handler));
+        unlock();
+    }
+    return Status::Ok;
+}
+
+Status EspNowTransport::observeCompletions(uint8_t port, CompletionObserver observer) {
+    if (port >= kFirstReservedPort) return Status::InvalidArgument;
+    bool replaced = false;
+    for (size_t i = 0; i < observers_.size(); ++i) {
+        if (observers_[i].first != port) continue;
+        if (observer) {
+            observers_[i].second = observer;
+        } else {
+            observers_.erase(observers_.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        replaced = true;
+        break;
+    }
+    if (!replaced && observer) observers_.push_back(std::make_pair(port, observer));
+
+    if (started_) {
+        lock();
+        engine_->observeCompletions(port, std::move(observer));
         unlock();
     }
     return Status::Ok;
@@ -1532,14 +1527,6 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     }
     // Its slot in ESP-NOW's peer table, if we added it, goes back to the pool.
     if (event == PeerEvent::Lost) peerTable_->release(peer.mac);
-    if (config_.negotiateFrameSize && !hasExplicitFrameSize(peer.mac)) {
-        uint16_t size = 0;  // default
-        if (event != PeerEvent::Lost) {
-            uint16_t common = std::min(peer.maxFrameSize, maxSupportedFrameSize());
-            if (common > config_.defaultMaxFrameSize) size = common;
-        }
-        link_->setFrameSize(peer.mac, size, false);
-    }
     if (peerHandler_) {
         // A copy: another task may replace the handler while it runs unlocked.
         Callback<void(PeerEvent, const PeerInfo&)> handler = peerHandler_;
@@ -1563,8 +1550,23 @@ uint16_t EspNowTransport::negotiatedFrameSize(const Mac& mac) const {
     return common > config_.defaultMaxFrameSize ? common : 0;
 }
 
-bool EspNowTransport::hasExplicitFrameSize(const Mac& mac) const {
-    return std::find(explicitFrameSizes_.begin(), explicitFrameSizes_.end(), mac) != explicitFrameSizes_.end();
+// Frames to `dst`: the size given to addPeer(), else the one negotiated with
+// discovery, else the default. Looked up per frame, so a peer lost or
+// announced again smaller is seen at once (Engine cuts its messages again).
+uint16_t EspNowTransport::frameSizeFor(const Mac& dst) const {
+    for (const auto& e : explicitFrameSizes_) {
+        if (e.first == dst) return e.second;
+    }
+    uint16_t n = negotiatedFrameSize(dst);
+    return n ? n : config_.defaultMaxFrameSize;
+}
+
+void EspNowTransport::forgetFrameSize(const Mac& mac) {
+    for (size_t i = 0; i < explicitFrameSizes_.size(); ++i) {
+        if (explicitFrameSizes_[i].first != mac) continue;
+        explicitFrameSizes_.erase(explicitFrameSizes_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
 }
 
 void EspNowTransport::onPeerEvent(PeerHandler handler) {

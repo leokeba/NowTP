@@ -46,7 +46,6 @@ static Bytes allocZeroed(size_t n) {
 
 constexpr size_t Engine::kMaxControlFrames;
 constexpr uint16_t Engine::kSeenBlocks;
-constexpr size_t Engine::kMaxPeerLimits;
 
 const char* toString(Status s) {
     switch (s) {
@@ -98,6 +97,7 @@ struct Engine::TxMessage {
     uint8_t frameFailures = 0;
     bool waitedForCredit = false;
     CompletionHandler done;
+    uint32_t tag = 0;            // for the port's observer, without `done`
     Status result = Status::Ok;  // once finished
     TxMessage* nextDone = nullptr;
 
@@ -162,7 +162,7 @@ struct Engine::RxMessage {
 };
 
 Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
-    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders), limits_(kMaxPeerLimits) {
+    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders) {
     if (config_.recentEntries == 0) config_.recentEntries = 1;
     if (config_.sendTimeoutMs == 0) config_.sendTimeoutMs = 1;
     recent_.resize(config_.recentEntries);
@@ -184,28 +184,6 @@ size_t Engine::singleFramePayload(const Mac& dst, uint8_t port) const {
     size_t mtu = link_.maxFrameSize(dst);
     size_t overhead = kCommonHeaderSize + (auth_ && auth_->sealing(port) ? kAuthTrailerSize : 0);
     return mtu > overhead ? mtu - overhead : 0;
-}
-
-void Engine::setPeerMessageLimit(const Mac& peer, size_t maxMessageSize) {
-    for (size_t i = 0; i < limits_.size(); ++i) {
-        if (!(limits_[i].peer == peer)) continue;
-        if (maxMessageSize) {
-            limits_[i].maxMessageSize = maxMessageSize;
-        } else {
-            limits_.erase(i);
-        }
-        return;
-    }
-    if (!maxMessageSize || peer.isBroadcast()) return;
-    PeerLimit l = {peer, maxMessageSize};
-    limits_.add(l);  // full or no memory: unknown, as before
-}
-
-size_t Engine::peerMessageLimit(const Mac& peer) const {
-    for (const PeerLimit& l : limits_) {
-        if (l.peer == peer) return l.maxMessageSize;
-    }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +296,7 @@ Status Engine::queue(const Mac& dst, uint8_t port, const uint8_t* data, Bytes ow
     if (messageId) *messageId = tx->id;
     tx->deadline = now + (options.timeoutMs ? options.timeoutMs : config_.sendTimeoutMs);
     tx->done = std::move(done);
+    tx->tag = options.tag;
     txBytes_ += tx->streamLen;
     tx_.push_back(std::move(tx));  // within the reserved capacity
 
@@ -663,7 +642,7 @@ void Engine::finish(TxMessage* tx, Status status) {
         }
         Owned<TxMessage> owned(std::move(tx_[i]));
         tx_.erase(tx_.begin() + static_cast<std::ptrdiff_t>(i));
-        if (owned->done) {
+        if (owned->done || observer(owned->port)) {
             // The handler runs from flushCompletions(); its memory goes back now.
             owned->result = status;
             owned->stream.reset();
@@ -688,8 +667,14 @@ void Engine::flushCompletions() {
         Owned<TxMessage> t(doneHead_);
         doneHead_ = t->nextDone;
         if (!doneHead_) doneTail_ = nullptr;
-        GateScope open(t->port < kFirstReservedPort ? gate_ : nullptr);
-        t->done(t->result);
+        if (t->done) {
+            GateScope open(t->port < kFirstReservedPort ? gate_ : nullptr);
+            t->done(t->result);
+        } else if (const Callback<void(uint32_t, Status)>* o = observer(t->port)) {
+            Callback<void(uint32_t, Status)> report = *o;  // shared: no allocation
+            GateScope open(t->port < kFirstReservedPort ? gate_ : nullptr);
+            report(t->tag, t->result);
+        }
     }
     flushing_ = false;
 }
@@ -834,6 +819,26 @@ void Engine::listen(uint8_t port, ReceiveHandler handler) {
         return;
     }
     if (handler) listeners_.push_back(std::make_pair(port, Callback<void(const Message&)>(std::move(handler))));
+}
+
+void Engine::observeCompletions(uint8_t port, CompletionObserver observer) {
+    for (size_t i = 0; i < observers_.size(); ++i) {
+        if (observers_[i].first != port) continue;
+        if (observer) {
+            observers_[i].second.set(std::move(observer));
+        } else {
+            observers_.erase(observers_.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        return;
+    }
+    if (observer) observers_.push_back(std::make_pair(port, Callback<void(uint32_t, Status)>(std::move(observer))));
+}
+
+const Callback<void(uint32_t, Status)>* Engine::observer(uint8_t port) const {
+    for (const auto& o : observers_) {
+        if (o.first == port) return &o.second;
+    }
+    return nullptr;
 }
 
 bool Engine::hasListener(uint8_t port) const {
