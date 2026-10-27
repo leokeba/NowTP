@@ -388,7 +388,7 @@ The limits below are caps, not reservations: NowTP takes memory per message, whi
 
 `memory()` reports what NowTP holds for messages at any moment: outgoing messages and their bytes, and messages being reassembled and the bytes reserved for them. Sample it next to the free heap to see whether a dip is NowTP's.
 
-The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 2 KB of tables and a frame buffer (plus about 150 bytes per peer), and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
+The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 8 KB of tables and buffers at rest on ESP32, plus 250 to 300 bytes per peer, and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
 
 ```cpp
 cfg.protocol.maxMessageSize = 8 * 1024;

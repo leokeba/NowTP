@@ -151,6 +151,8 @@ inline uint32_t nowMs() {
 }
 
 constexpr uint32_t kChannelPollMs = 250;
+constexpr size_t kMaxLinkEntries = 20;  // one-way link detection: peers heard
+constexpr size_t kMaxLinkChecks = 8;    // new peers being checked
 
 // Large blocks in PSRAM (EspNowConfig::usePsram). Small ones stay internal:
 // message bookkeeping, acks, short messages, all short-lived and often used.
@@ -326,8 +328,9 @@ public:
         return defaultSize_;
     }
 
-    /// A size of 0 reverts the peer to the default.
-    void setFrameSize(const Mac& mac, uint16_t size) {
+    /// A size of 0 reverts the peer to the default. Without `grow`, a new
+    /// entry needs room reserved (see begin()): the receive path never allocates.
+    void setFrameSize(const Mac& mac, uint16_t size, bool grow = true) {
         for (size_t i = 0; i < sizes_.size(); ++i) {
             if (sizes_[i].first != mac) continue;
             if (size) {
@@ -337,8 +340,9 @@ public:
             }
             return;
         }
-        if (size) sizes_.push_back(std::make_pair(mac, size));
+        if (size && (grow || sizes_.size() < sizes_.capacity())) sizes_.push_back(std::make_pair(mac, size));
     }
+    void reserveSizes(size_t n) { sizes_.reserve(n); }
 
 private:
     uint16_t defaultSize_;
@@ -357,6 +361,14 @@ public:
     uint32_t now() override { return nowMs(); }
     void sleep(uint32_t ms) override {
         if (t_.config_.runTask) {
+            TickType_t ticks = pdMS_TO_TICKS(ms);
+            vTaskDelay(ticks ? ticks : 1);
+            return;
+        }
+        // Another task polls: frames are its to process (its handlers and
+        // timers mustn't run on two tasks at once), and its wake hook brings it.
+        TaskHandle_t poller = t_.poller_.load();
+        if (poller && poller != xTaskGetCurrentTaskHandle()) {
             TickType_t ticks = pdMS_TO_TICKS(ms);
             vTaskDelay(ticks ? ticks : 1);
             return;
@@ -513,6 +525,11 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     }
     fallback_ = PowerFallback();
     linkChecks_.clear();
+    // The receive path never allocates: room for what it records is taken now.
+    linkChecks_.reserve(kMaxLinkChecks);
+    linkHealth_.reserve(kMaxLinkEntries);
+    link_->reserveSizes(discovery_ ? config_.discovery.maxPeers : 0);
+    poller_ = nullptr;
 
     esp_err_t err = esp_now_init();
     if (err != ESP_OK) {
@@ -688,7 +705,10 @@ void EspNowTransport::taskEntry(void* arg) {
 }
 
 uint32_t EspNowTransport::poll() {
-    if (started_ && !config_.runTask) processEvents(0);
+    if (started_ && !config_.runTask) {
+        poller_ = xTaskGetCurrentTaskHandle();
+        processEvents(0);
+    }
     return pollDelayMs();
 }
 
@@ -817,10 +837,14 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
         }
     }
     lock();
-    link_->setFrameSize(mac, size);
     explicitFrameSizes_.erase(std::remove(explicitFrameSizes_.begin(), explicitFrameSizes_.end(), mac),
                               explicitFrameSizes_.end());
-    if (size) explicitFrameSizes_.push_back(mac);
+    if (size) {
+        explicitFrameSizes_.push_back(mac);
+        link_->setFrameSize(mac, size);
+    } else {
+        link_->setFrameSize(mac, negotiatedFrameSize(mac));  // what discovery learned, if anything
+    }
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
@@ -1430,7 +1454,6 @@ Status EspNowTransport::setUnicastRate(PhyRate rate) {
 namespace {
 constexpr uint16_t kOneWayFailures = 8;    // consecutive failed frames
 constexpr uint32_t kOneWayHeardMs = 3000;  // peer heard this recently
-constexpr size_t kMaxLinkEntries = 20;
 }  // namespace
 
 EspNowTransport::LinkHealth* EspNowTransport::linkHealth(const Mac& mac, bool create) {
@@ -1487,9 +1510,9 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     if (follower_) follower_->onPeerEvent(event, peer, nowMs());
     if (timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
     // Check new peers hear us; failures feed the one-way detection and fallback.
-    if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < 8) {
-        LinkCheck c = {peer.mac, 3, false, nowMs()};
-        linkChecks_.push_back(c);
+    if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < kMaxLinkChecks) {
+        LinkCheck c = {nextLinkCheck_++, peer.mac, 3, false, nowMs()};
+        linkChecks_.push_back(c);  // within the reserved capacity
     }
     // Its slot in ESP-NOW's peer table, if we added it, goes back to the pool.
     if (event == PeerEvent::Lost) peerTable_->release(peer.mac);
@@ -1499,7 +1522,7 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
             uint16_t common = std::min(peer.maxFrameSize, maxSupportedFrameSize());
             if (common > config_.defaultMaxFrameSize) size = common;
         }
-        link_->setFrameSize(peer.mac, size);
+        link_->setFrameSize(peer.mac, size, false);
     }
     if (peerHandler_) {
         // A copy: another task may replace the handler while it runs unlocked.
@@ -1514,6 +1537,14 @@ void EspNowTransport::channelChanged(uint8_t ch) {
     Callback<void(uint8_t)> handler = channelHandler_;
     GateScope open(gate_.get());
     handler(ch);
+}
+
+// The size negotiated with a discovered peer; 0 (the default) otherwise.
+uint16_t EspNowTransport::negotiatedFrameSize(const Mac& mac) const {
+    const PeerInfo* p = config_.negotiateFrameSize && discovery_ ? discovery_->find(mac) : nullptr;
+    if (!p) return 0;
+    uint16_t common = std::min(p->maxFrameSize, maxSupportedFrameSize());
+    return common > config_.defaultMaxFrameSize ? common : 0;
 }
 
 bool EspNowTransport::hasExplicitFrameSize(const Mac& mac) const {
@@ -1667,18 +1698,19 @@ const uint8_t kPing[1] = {0};  // type 0: ignored by the receiver's diagnostics
 
 void EspNowTransport::startPowerFallback(const Mac& peer) {
     if (fallback_.active) return;
-    if (std::find(fallback_.tried.begin(), fallback_.tried.end(), peer) != fallback_.tried.end()) return;
+    size_t tried = std::min(fallback_.triedCount, sizeof(fallback_.tried) / sizeof(fallback_.tried[0]));
+    if (std::find(fallback_.tried, fallback_.tried + tried, peer) != fallback_.tried + tried) return;
+    fallback_.tried[fallback_.triedCount++ % (sizeof(fallback_.tried) / sizeof(fallback_.tried[0]))] = peer;
     float current = txPower();
-    std::vector<float> ladder;
+    size_t steps = 0;
     for (float p : kFallbackLadder) {
-        if (p < current - 0.1f) ladder.push_back(p);
+        if (p < current - 0.1f) fallback_.ladder[steps++] = p;
     }
-    fallback_.tried.push_back(peer);
-    if (ladder.empty()) return;
+    if (steps == 0) return;
     fallback_.active = true;
     fallback_.peer = peer;
     fallback_.original = current;
-    fallback_.ladder = ladder;
+    fallback_.steps = steps;
     fallback_.index = 0;
     fallback_.failures = 0;
     fallback_.pingInFlight = false;
@@ -1686,7 +1718,7 @@ void EspNowTransport::startPowerFallback(const Mac& peer) {
     fallback_.nextPingAt = nowMs();
     ESP_LOGI(kTag, "frames to %02x:%02x:%02x:%02x:%02x:%02x are not acknowledged: trying lower transmit power",
              peer.bytes[0], peer.bytes[1], peer.bytes[2], peer.bytes[3], peer.bytes[4], peer.bytes[5]);
-    applyTxPower(ladder[0]);
+    applyTxPower(fallback_.ladder[0]);
 }
 
 void EspNowTransport::sendFallbackPing() {
@@ -1737,7 +1769,7 @@ void EspNowTransport::onFallbackPing(Status status) {
         return;
     }
     fallback_.failures = 0;
-    if (++fallback_.index < fallback_.ladder.size()) {
+    if (++fallback_.index < fallback_.steps) {
         applyTxPower(fallback_.ladder[fallback_.index]);
         fallback_.nextPingAt = nowMs();
         return;
@@ -1763,11 +1795,11 @@ void EspNowTransport::tickLinkChecks(uint32_t now) {
         }
         c.inFlight = true;
         c.remaining--;
-        Mac mac = c.peer;
-        Status st = engine_->send(mac, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
-                                  [this, mac](Status s) {
+        uint32_t id = c.id;
+        Status st = engine_->send(c.peer, kDiagnosticsPort, kPing, sizeof(kPing), SendOptions(),
+                                  [this, id](Status s) {
                                       for (size_t j = 0; j < linkChecks_.size(); ++j) {
-                                          if (linkChecks_[j].peer != mac) continue;
+                                          if (linkChecks_[j].id != id) continue;
                                           linkChecks_[j].inFlight = false;
                                           linkChecks_[j].nextAt = nowMs() + 200;
                                           if (s == Status::Ok) linkChecks_[j].remaining = 0;  // healthy

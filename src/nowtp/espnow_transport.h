@@ -386,6 +386,8 @@ public:
 
     /// Processes pending radio events and timers when runTask is false.
     /// Returns pollDelayMs(). end() must not run while another task is in poll().
+    /// Blocking calls (pairing, diagnostics) made from another task leave the
+    /// processing to the task that polls, so it must keep polling meanwhile.
     uint32_t poll();
     /// Milliseconds until poll() must run again (0: at once) for timers:
     /// retransmissions, timeouts, announcements, time rounds. At most 250.
@@ -446,6 +448,7 @@ private:
     void notePeerHeard(const Mac& mac);
     void notePeerSendResult(const Mac& mac, bool delivered);
     bool hasExplicitFrameSize(const Mac& mac) const;
+    uint16_t negotiatedFrameSize(const Mac& mac) const;
     bool processEvents(TickType_t wait);  // true if events are left
     void checkSent();
     void lock() const;
@@ -485,21 +488,25 @@ private:
         bool active = false;
         Mac peer;
         float original = 0;
-        std::vector<float> ladder;
+        float ladder[6];
+        size_t steps = 0;
         size_t index = 0;
         uint8_t failures = 0;
         bool pingInFlight = false;
         bool confirming = false;  // re-testing the original power after a success
         uint32_t nextPingAt = 0;
-        std::vector<Mac> tried;
+        Mac tried[8];  // the most recent peers tried
+        size_t triedCount = 0;
     } fallback_;
     struct LinkCheck {
+        uint32_t id;  // the completion captures it (with `this`, nothing to allocate)
         Mac peer;
         uint8_t remaining;
         bool inFlight;
         uint32_t nextAt;
     };
-    std::vector<LinkCheck> linkChecks_;
+    std::vector<LinkCheck> linkChecks_;  // reserved for kMaxLinkChecks in begin()
+    uint32_t nextLinkCheck_ = 0;
     TransportStats stats_;  // radio-level counters only
     struct SavedRadio {
         bool powerSave = false;
@@ -522,6 +529,7 @@ private:
     SemaphoreHandle_t mutex_ = nullptr;
     SemaphoreHandle_t taskExited_ = nullptr;
     TaskHandle_t task_ = nullptr;
+    std::atomic<TaskHandle_t> poller_{nullptr};  // the task that last called poll()
     wifi_interface_t interface_ = WIFI_IF_STA;
     volatile bool stopping_ = false;
     bool ending_ = false;  // in end(): no more wake-ups for the poller
