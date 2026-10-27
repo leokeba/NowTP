@@ -354,7 +354,7 @@ For unicast, ESP-NOW already acknowledges and retries each frame in hardware. De
 
 ESP-NOW calls its callbacks from the Wi-Fi driver task. NowTP only copies each event into a ring buffer there. Everything else runs elsewhere:
 
-- With `runTask = true` (the default), protocol work and your receive and completion callbacks run in a dedicated NowTP task.
+- With `runTask = true` (the default), protocol work and your receive and completion callbacks run in a dedicated NowTP task. It sleeps until its next timer is due, or until a frame or a call into NowTP gives it work.
 - With `runTask = false`, they run inside `transport.poll()`, which you call from your loop, or from a task of yours that sleeps in between.
 
 A task that polls needn't wake every few milliseconds. `poll()` returns how long it may sleep, at most 250 ms (also available as `pollDelayMs()`). Set `wake` to be told about new work before then: it is called when a frame arrives or the radio reports one sent, from the Wi-Fi driver's task, and when a call into NowTP from any task may have given it work, from that task once NowTP's lock is released. It always runs in task context, never in an interrupt. Keep it short and don't call NowTP from it:
@@ -382,13 +382,23 @@ A handler that can't take a message now, for instance on a short heap, sets `m.r
 
 Sending works the other way round. `send()` copies the payload, so a large message briefly exists twice. `sendBuffer(dst, port, buf, len, capacity)` takes a `malloc()`ed buffer instead and frees it when done, including on errors. Allocate `len + nowtp::kSendOverhead` bytes so NowTP can write its frame headers, trailer and checksum without reallocating.
 
+A completion handler per message is a `std::function`, which allocates on ESP32 when its captures exceed 8 bytes. An application that sends many messages can register one observer per port instead, and tell messages apart by a tag:
+
+```cpp
+transport.observeCompletions(1, [](uint32_t tag, nowtp::Status st) { /* message `tag` ended with st */ });
+nowtp::SendOptions opts;
+opts.reliable = true;
+opts.tag = requestId;
+transport.send(peer, 1, data, len, opts);  // no handler: reported to the port's observer
+```
+
 ### Memory
 
 The limits below are caps, not reservations: NowTP takes memory per message, while it is queued or being reassembled. All of it comes from `malloc()`, and on a short heap a message is refused (`NoMemory`, or a reassembly the sender retries), never an abort. Where the public API holds a `std::string` or `std::vector` (a discovered peer's name and metadata, for instance), NowTP first checks that the heap's largest free block leaves 4 KB to spare. If it doesn't, NowTP does without, for example by ignoring an announcement until the next one: with exceptions off, a failed `operator new` aborts. With a security key installed, reassembly takes memory only for a sender whose epoch it has verified. Unknown senders share a single reassembly slot, and an unauthenticated message where authentication is required is refused at its first fragment.
 
 `memory()` reports what NowTP holds for messages at any moment: outgoing messages and their bytes, and messages being reassembled and the bytes reserved for them. Sample it next to the free heap to see whether a dip is NowTP's.
 
-The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 8 KB of tables and buffers at rest on ESP32, plus 250 to 300 bytes per peer, and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
+The defaults suit a board with 100 KB or more of free heap. On a tight heap, budget for `maxTxBytes + maxRxBytes`, about 5.5 KB of tables and buffers at rest on ESP32, plus 230 to 280 bytes per peer, and the event buffer (`eventBufferSize`, 8 KB; 6 KB still holds 4 frames of 1470 bytes). For example, with 30 to 50 KB free:
 
 ```cpp
 cfg.protocol.maxMessageSize = 8 * 1024;
@@ -408,7 +418,7 @@ Streams, network time, security and diagnostics can be left out of the build to 
 
 - **Peers.** Unknown unicast destinations are registered automatically as unencrypted peers on the current channel. The same happens for senders that need an ack. Set `EspNowConfig::autoAddPeers = false` to manage peers yourself with `addPeer()`. ESP-NOW allows at most 20 peers. When its table is full, the automatically added peer used least recently is removed to make room. Peers you registered with `addPeer()` are never removed that way, and a peer that discovery reports lost gives its automatic slot back.
 - **Encryption.** Use `addPeer(mac, opts)` with `opts.encrypt` and `opts.lmk`, plus `setPrimaryKey()`. Both sides must register each other with the same keys.
-- **Frame size.** Frames are 250 bytes by default, which every ESP-NOW version understands. If both sides run ESP-NOW v2 (ESP-IDF ≥ 5.4, or Arduino-ESP32 ≥ 3.2), larger frames of up to 1470 bytes cut the number of frames by about 6×. Discovery sets this up automatically. Without discovery, set `PeerOptions::maxFrameSize` in `addPeer()`. A v1 receiver silently drops frames larger than 250 bytes, and broadcast always uses `defaultMaxFrameSize` (250).
+- **Frame size.** Frames are 250 bytes by default, which every ESP-NOW version understands. If both sides run ESP-NOW v2 (ESP-IDF ≥ 5.4, or Arduino-ESP32 ≥ 3.2), larger frames of up to 1470 bytes cut the number of frames by about 6×. Discovery sets this up automatically. Without discovery, set `PeerOptions::maxFrameSize` in `addPeer()`. A v1 receiver silently drops frames larger than 250 bytes, and broadcast always uses `defaultMaxFrameSize` (250). If a peer's frame size shrinks while messages are queued for it (it comes back with ESP-NOW v1, say), they are cut again into smaller frames (`stats().messagesRecut`).
 
 ### Throughput and latency
 
