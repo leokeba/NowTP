@@ -461,6 +461,18 @@ private:
     /// `changed`: the caller may have given NowTP work, which a poller asleep
     /// until pollDelayMs() must look at (see EspNowConfig::wake).
     void unlock(bool changed = true) const;
+    /// Holds the lock for a scope; `changed` as for unlock().
+    class Locked {
+    public:
+        explicit Locked(const EspNowTransport& t, bool changed = true) : t_(t), changed_(changed) { t_.lock(); }
+        ~Locked() { t_.unlock(changed_); }
+        Locked(const Locked&) = delete;
+        Locked& operator=(const Locked&) = delete;
+
+    private:
+        const EspNowTransport& t_;
+        bool changed_;
+    };
     void cleanup();
 
     EspNowConfig config_;

@@ -863,14 +863,13 @@ Status EspNowTransport::addPeer(const Mac& mac, const PeerOptions& options) {
 Status EspNowTransport::removePeer(const Mac& mac) {
     if (!started_) return Status::InvalidState;
     if (mac.isBroadcast()) return Status::InvalidArgument;
-    lock();
+    Locked locked(*this);
     esp_err_t err = esp_now_del_peer(mac.bytes);
     peerTable_->forget(mac);
     frameSizes_->set(mac, 0);
     for (size_t i = 0; i < peerRates_.size(); ++i) {
         if (peerRates_[i].first == mac) peerRates_.erase(peerRates_.begin() + static_cast<std::ptrdiff_t>(i));
     }
-    unlock();
     return err == ESP_OK || err == ESP_ERR_ESPNOW_NOT_FOUND ? Status::Ok : Status::LinkError;
 }
 
@@ -886,10 +885,8 @@ Status EspNowTransport::send(const Mac& dst, uint8_t port, const void* data, siz
     if (!config_.autoAddPeers && !dst.isBroadcast() && !esp_now_is_peer_exist(dst.bytes)) {
         return Status::LinkError;
     }
-    lock();
-    Status st = engine_->send(dst, port, static_cast<const uint8_t*>(data), len, options, std::move(done), nowMs());
-    unlock();
-    return st;
+    Locked locked(*this);
+    return engine_->send(dst, port, static_cast<const uint8_t*>(data), len, options, std::move(done), nowMs());
 }
 
 Status EspNowTransport::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer, size_t len, size_t capacity,
@@ -900,10 +897,8 @@ Status EspNowTransport::sendBuffer(const Mac& dst, uint8_t port, uint8_t* buffer
     if (!config_.autoAddPeers && !dst.isBroadcast() && !esp_now_is_peer_exist(dst.bytes)) {
         return Status::LinkError;
     }
-    lock();
-    Status st = engine_->sendBuffer(dst, port, owned.release(), len, capacity, options, std::move(done), nowMs());
-    unlock();
-    return st;
+    Locked locked(*this);
+    return engine_->sendBuffer(dst, port, owned.release(), len, capacity, options, std::move(done), nowMs());
 }
 
 Status EspNowTransport::sendAndWait(const Mac& dst, uint8_t port, const void* data, size_t len,
@@ -987,12 +982,11 @@ Mac EspNowTransport::localMac() const {
 
 EspNowTransport::TransportStats EspNowTransport::stats() const {
     if (!started_) return TransportStats();
-    lock();
+    Locked locked(*this, false);
     TransportStats s;
     static_cast<Stats&>(s) = engine_->stats();
     s.droppedEvents = s_droppedEvents;
     s.oneWayLinks = stats_.oneWayLinks;
-    unlock(false);
     return s;
 }
 
@@ -1352,10 +1346,9 @@ Status EspNowTransport::applyPowerSave(PowerSave mode) {
 Status EspNowTransport::setPowerSave(PowerSave mode) {
     if (!started_) return Status::InvalidState;
     if (static_cast<uint8_t>(mode) > static_cast<uint8_t>(PowerSave::MaxModem)) return Status::InvalidArgument;
-    lock();
+    Locked locked(*this, false);
     Status st = applyPowerSave(mode);
     if (st == Status::Ok) config_.radio.powerSave = mode;
-    unlock(false);
     return st;
 }
 
@@ -1437,18 +1430,14 @@ Status EspNowTransport::applyTxPower(float dbm) {
 Status EspNowTransport::setBroadcastRate(PhyRate rate) {
     if (!started_) return Status::InvalidState;
     if (!rateUsable(rate)) return Status::InvalidArgument;
+    Locked locked(*this);
 #if defined(NOWTP_PER_PEER_RATE)
-    lock();
     config_.radio.broadcastRate = rate;
-    Status st = applyPeerRate(Mac::broadcast());
-    unlock();
-    return st;
+    return applyPeerRate(Mac::broadcast());
 #else
     // One ESP-NOW rate for everything before ESP-IDF 5.1.
-    lock();
     config_.radio.broadcastRate = config_.radio.unicastRate = rate;
     esp_err_t err = esp_wifi_config_espnow_rate(interface_, rateInfo(rate).rate);
-    unlock();
     return err == ESP_OK ? Status::Ok : Status::LinkError;
 #endif
 }
@@ -1472,18 +1461,6 @@ Status EspNowTransport::setUnicastRate(PhyRate rate) {
     return setBroadcastRate(rate);  // one rate for everything before ESP-IDF 5.1
 #endif
 }
-
-// ---------------------------------------------------------------------------
-// One-way link detection
-//
-// Unicast frames that keep failing at the MAC level to a peer whose own frames
-// arrive fine point at this node's transmitter: commonly a board whose supply
-// cannot sustain the driver's default power, or a rate the peer cannot decode.
-
-namespace {
-constexpr uint16_t kOneWayFailures = 8;    // consecutive failed frames
-constexpr uint32_t kOneWayHeardMs = 3000;  // peer heard this recently
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // Discovery
@@ -1519,42 +1496,34 @@ void EspNowTransport::onPeerEvent(PeerHandler handler) {
 
 Status EspNowTransport::discover() {
     if (!started_ || !discovery_) return Status::InvalidState;
-    lock();
+    Locked locked(*this);
     discovery_->discover(nowMs());
-    unlock();
     return Status::Ok;
 }
 
 std::vector<PeerInfo> EspNowTransport::peers() const {
     if (!started_ || !discovery_) return std::vector<PeerInfo>();
-    lock();
-    std::vector<PeerInfo> copy = discovery_->peers();
-    unlock(false);
-    return copy;
+    Locked locked(*this, false);
+    return discovery_->peers();
 }
 
 Engine::MemoryUse EspNowTransport::memory() const {
     if (!started_) return Engine::MemoryUse();
-    lock();
-    Engine::MemoryUse m = engine_->memory();
-    unlock(false);
-    return m;
+    Locked locked(*this, false);
+    return engine_->memory();
 }
 
 size_t EspNowTransport::peerMaxMessageSize(const Mac& peer) const {
     if (!started_) return 0;
-    lock();
-    size_t limit = engine_->peerMessageLimit(peer);
-    unlock(false);
-    return limit;
+    Locked locked(*this, false);
+    return engine_->peerMessageLimit(peer);
 }
 
 Status EspNowTransport::setDiscoveryMetadata(const void* data, size_t len) {
     if (len > Discovery::kMaxMetadata || (data == nullptr && len > 0)) return Status::InvalidArgument;
     if (!started_ || !discovery_) return Status::InvalidState;  // before begin(), use EspNowConfig::discovery
-    lock();
+    Locked locked(*this);
     discovery_->setMetadata(static_cast<const uint8_t*>(data), len, nowMs());
-    unlock();
     return Status::Ok;
 }
 
@@ -1622,10 +1591,9 @@ Status EspNowTransport::setChannel(uint8_t ch) {
     if (channelFixed()) return Status::InvalidState;
     esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) return err == ESP_ERR_INVALID_ARG ? Status::InvalidArgument : Status::LinkError;
-    lock();
+    Locked locked(*this);
     radio_.channel = ch;
     pendingChannel_ = 0;
-    unlock();
     return Status::Ok;
 }
 
@@ -1810,10 +1778,8 @@ Status EspNowTransport::announceChannelChange(uint8_t ch) {
 
 Status EspNowTransport::searchChannels() {
     if (!started_ || !follower_) return Status::InvalidState;
-    lock();
-    Status st = follower_->search(nowMs());
-    unlock();
-    return st;
+    Locked locked(*this);
+    return follower_->search(nowMs());
 }
 
 void EspNowTransport::onChannelChange(std::function<void(uint8_t channel)> handler) {
@@ -1858,10 +1824,8 @@ Status EspNowTransport::forgetSecurityKey() {
 
 bool EspNowTransport::secured() const {
     if (!started_ || !kSecurity) return false;
-    lock();
-    bool on = security_->enabled();
-    unlock(false);
-    return on;
+    Locked locked(*this, false);
+    return security_->enabled();
 }
 
 Status EspNowTransport::acceptPairing(uint32_t timeoutMs, Mac* joined) {
@@ -1882,18 +1846,14 @@ Status EspNowTransport::pair(uint32_t timeoutMs, Mac* member) {
 uint64_t EspNowTransport::networkTimeUs() const {
     uint64_t local = static_cast<uint64_t>(esp_timer_get_time());
     if (!started_ || !kTimeSync || !timeSync_) return local;
-    lock();
-    uint64_t t = timeSync_->toNetwork(local);
-    unlock(false);
-    return t;
+    Locked locked(*this, false);
+    return timeSync_->toNetwork(local);
 }
 
 int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
     if (!started_ || !kTimeSync || !timeSync_) return static_cast<int64_t>(networkUs);
-    lock();
-    uint64_t t = timeSync_->toLocal(networkUs);
-    unlock(false);
-    return static_cast<int64_t>(t);
+    Locked locked(*this, false);
+    return static_cast<int64_t>(timeSync_->toLocal(networkUs));
 }
 
 TimeSyncStatus EspNowTransport::timeSyncStatus() const {
@@ -1904,10 +1864,8 @@ TimeSyncStatus EspNowTransport::timeSyncStatus() const {
                                               : config_.timeSync.role;
         return s;
     }
-    lock();
-    TimeSyncStatus s = timeSync_->status();
-    unlock(false);
-    return s;
+    Locked locked(*this, false);
+    return timeSync_->status();
 }
 
 Status EspNowTransport::setTimeRole(TimeRole role) {
@@ -1917,27 +1875,24 @@ Status EspNowTransport::setTimeRole(TimeRole role) {
         config_.timeSync.reference = false;
         return Status::Ok;
     }
-    lock();
+    Locked locked(*this);
     config_.timeSync.role = role;
     config_.timeSync.reference = false;
     timeSync_->setRole(role, nowMs());
-    unlock();
     return Status::Ok;
 }
 
 Status EspNowTransport::setTimeReference(const Mac& peer) {
     if (!started_ || !kTimeSync || !timeSync_) return Status::InvalidState;
-    lock();
+    Locked locked(*this);
     timeSync_->setReference(peer, nowMs());
-    unlock();
     return Status::Ok;
 }
 
 Status EspNowTransport::clearTimeReference() {
     if (!started_ || !kTimeSync || !timeSync_) return Status::InvalidState;
-    lock();
+    Locked locked(*this);
     timeSync_->clearReference(nowMs());
-    unlock();
     return Status::Ok;
 }
 
@@ -1947,10 +1902,9 @@ Status EspNowTransport::setTimeSyncInterval(uint32_t ms) {
         config_.timeSync.intervalMs = ms;
         return Status::Ok;
     }
-    lock();
+    Locked locked(*this);
     config_.timeSync.intervalMs = ms;
     timeSync_->setInterval(ms);
-    unlock();
     return Status::Ok;
 }
 
@@ -1961,18 +1915,14 @@ Status EspNowTransport::sendStream(const Mac& dst, uint32_t size, StreamReader r
                                    const StreamOptions& options, uint32_t* id) {
     if (!started_ || !kStreams || !streams_) return Status::InvalidState;
     if (!config_.autoAddPeers && !esp_now_is_peer_exist(dst.bytes)) return Status::LinkError;
-    lock();
-    Status st = streams_->send(dst, size, std::move(read), std::move(done), options, nowMs(), id);
-    unlock();
-    return st;
+    Locked locked(*this);
+    return streams_->send(dst, size, std::move(read), std::move(done), options, nowMs(), id);
 }
 
 Status EspNowTransport::cancelStream(uint32_t id) {
     if (!started_ || !kStreams || !streams_) return Status::InvalidState;
-    lock();
-    Status st = streams_->cancel(id, nowMs());
-    unlock();
-    return st;
+    Locked locked(*this);
+    return streams_->cancel(id, nowMs());
 }
 
 void EspNowTransport::onStream(StreamAcceptor acceptor) {
