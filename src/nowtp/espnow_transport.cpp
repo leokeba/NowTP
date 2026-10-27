@@ -3,6 +3,7 @@
 #if defined(ESP_PLATFORM)
 
 #include "espnow_transport.h"
+#include "features.h"
 
 #include <string.h>
 
@@ -144,6 +145,18 @@ void waitForCallbacks() {
     s_task = nullptr;
     s_wake = nullptr;
     while (s_inCallback.load() != 0) vTaskDelay(1);
+}
+
+// Each use of a service a build leaves out is behind one of these constants,
+// so the compiler drops it with the service's code.
+constexpr bool kStreams = NOWTP_STREAMS != 0;
+constexpr bool kTimeSync = NOWTP_TIMESYNC != 0;
+constexpr bool kSecurity = NOWTP_SECURITY != 0;
+constexpr bool kDiagnostics = NOWTP_DIAGNOSTICS != 0;
+
+template <class T>
+void destroyService(T* service) {
+    delete service;
 }
 
 inline uint32_t nowMs() {
@@ -469,9 +482,13 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     if (sc.key.empty() && config_.persistSecurityKey && loadStoredKey(sc.key)) {
         ESP_LOGI(kTag, "using the installation key stored in NVS");
     }
-    security_.reset(new Security(*engine_, *host_, localMac(), sc));
+    if (kSecurity) {
+        security_ = Service<Security>(new Security(*engine_, *host_, localMac(), sc), destroyService<Security>);
+        if (config_.persistSecurityKey) {
+            security_->onKeyChanged([this](const std::vector<uint8_t>& k) { storeKey(k); });
+        }
+    }
     if (!sc.key.empty()) memset(sc.key.data(), 0, sc.key.size());
-    if (config_.persistSecurityKey) security_->onKeyChanged([this](const std::vector<uint8_t>& k) { storeKey(k); });
 
     if (config_.enableDiscovery) {
         discovery_.reset(new Discovery(*engine_, config_.discovery, maxSupportedFrameSize(),
@@ -485,21 +502,26 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
         });
         discovery_->onPeerMoved([this](const PeerInfo& p, uint8_t ch) { follower_->onPeerMoved(p, ch, nowMs()); });
         // A new peer's first announcement waits for its epoch to be verified: ask again at once.
-        security_->onPeerVerified([this](const Mac& mac) {
-            if (!discovery_->find(mac)) discovery_->discover(nowMs());
-        });
+        if (kSecurity) {
+            security_->onPeerVerified([this](const Mac& mac) {
+                if (!discovery_->find(mac)) discovery_->discover(nowMs());
+            });
+        }
     }
-    if (config_.enableDiagnostics) {
-        diagnostics_.reset(new Diagnostics(*engine_, *this, *host_, config_.diagnostics));
+    if (kDiagnostics && config_.enableDiagnostics) {
+        diagnostics_ = Service<Diagnostics>(new Diagnostics(*engine_, *this, *host_, config_.diagnostics),
+                                            destroyService<Diagnostics>);
         diagnostics_->setDiscovery(discovery_.get());
     }
-    if (config_.enableTimeSync) {
-        timeSync_.reset(new TimeSync(*engine_, [] { return static_cast<uint64_t>(esp_timer_get_time()); },
-                                     config_.timeSync, localMac()));
+    if (kTimeSync && config_.enableTimeSync) {
+        timeSync_ = Service<TimeSync>(new TimeSync(*engine_, [] { return static_cast<uint64_t>(esp_timer_get_time()); },
+                                                   config_.timeSync, localMac()),
+                                      destroyService<TimeSync>);
         timeSync_->setDiscovery(discovery_.get());
     }
-    if (config_.enableStreams) {
-        streams_.reset(new Streams(*engine_, [] { return static_cast<uint32_t>(esp_random()); }));
+    if (kStreams && config_.enableStreams) {
+        streams_ = Service<Streams>(new Streams(*engine_, [] { return static_cast<uint32_t>(esp_random()); }),
+                                    destroyService<Streams>);
         streams_->onIncoming(streamAcceptor_);
     }
     fallback_ = PowerFallback();
@@ -554,10 +576,10 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     started_ = true;
     lastChannelPoll_ = nowMs();
     pendingChannel_ = 0;
-    security_->start();  // first, so that every announcement is authenticated
-    if (diagnostics_) diagnostics_->start();
-    if (timeSync_) timeSync_->start(nowMs());
-    if (streams_) streams_->start();
+    if (kSecurity) security_->start();  // first, so that every announcement is authenticated
+    if (kDiagnostics && diagnostics_) diagnostics_->start();
+    if (kTimeSync && timeSync_) timeSync_->start(nowMs());
+    if (kStreams && streams_) streams_->start();
     if (discovery_) discovery_->start(nowMs());
     if (follower_) follower_->start(nowMs());
     if (config_.runTask) {
@@ -579,10 +601,10 @@ void EspNowTransport::end() {
     ending_ = true;
     s_wake = nullptr;
     lock();
-    if (diagnostics_) diagnostics_->stop();
-    if (streams_) streams_->stop();  // pending streams complete with Cancelled
+    if (kDiagnostics && diagnostics_) diagnostics_->stop();
+    if (kStreams && streams_) streams_->stop();  // pending streams complete with Cancelled
     if (follower_) follower_->stop();
-    if (timeSync_) timeSync_->stop();
+    if (kTimeSync && timeSync_) timeSync_->stop();
     unlock();
     if (discovery_) {
         // Say goodbye so peers drop us at once, and give the frame time to go out.
@@ -718,10 +740,10 @@ uint32_t EspNowTransport::pollDelayMs() const {
     Deadline d(nowMs());
     engine_->nextTick(d);
     if (discovery_) discovery_->nextTick(d);
-    if (diagnostics_) diagnostics_->nextTick(d);
+    if (kDiagnostics && diagnostics_) diagnostics_->nextTick(d);
     if (follower_) follower_->nextTick(d);
-    if (timeSync_) timeSync_->nextTick(d);
-    if (streams_) streams_->nextTick(d);
+    if (kTimeSync && timeSync_) timeSync_->nextTick(d);
+    if (kStreams && streams_) streams_->nextTick(d);
     d.at(lastChannelPoll_ + kChannelPollMs);
     if (fallback_.active && !fallback_.pingInFlight) d.at(fallback_.nextPingAt);
     for (const LinkCheck& c : linkChecks_) {
@@ -780,16 +802,16 @@ bool EspNowTransport::processEvents(TickType_t wait) {
     }
     uint32_t now = nowMs();
     engine_->tick(now);
-    if (security_) security_->tick(now);
+    if (kSecurity && security_) security_->tick(now);
     if (discovery_) discovery_->tick(now);
-    if (diagnostics_) diagnostics_->tick(now);
+    if (kDiagnostics && diagnostics_) diagnostics_->tick(now);
     pollChannel(now);
     if (follower_) {
-        follower_->setSuspended(diagnostics_ && diagnostics_->busy(), now);
+        follower_->setSuspended(kDiagnostics && diagnostics_ && diagnostics_->busy(), now);
         follower_->tick(now);
     }
-    if (timeSync_) timeSync_->tick(now);
-    if (streams_) streams_->tick(now);
+    if (kTimeSync && timeSync_) timeSync_->tick(now);
+    if (kStreams && streams_) streams_->tick(now);
     tickLinkChecks(now);
     unlock(false);
     return n >= 32;
@@ -1215,8 +1237,8 @@ void EspNowTransport::followInterface() {
     if (global != PhyRate::Default) esp_wifi_config_espnow_rate(want, rateInfo(global).rate);
 #endif
     Mac self = localMac();
-    if (security_) security_->setLocalMac(self);
-    if (timeSync_) timeSync_->setLocalMac(self);
+    if (kSecurity && security_) security_->setLocalMac(self);
+    if (kTimeSync && timeSync_) timeSync_->setLocalMac(self);
     ESP_LOGI(kTag, "Wi-Fi mode changed: ESP-NOW now uses the %s interface, as %02x:%02x:%02x:%02x:%02x:%02x",
              want == WIFI_IF_AP ? "AP" : "STA", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
              self.bytes[4], self.bytes[5]);
@@ -1519,7 +1541,7 @@ void EspNowTransport::notePeerSendResult(const Mac& mac, bool delivered) {
 void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     // Runs in the NowTP task with the lock held.
     if (follower_) follower_->onPeerEvent(event, peer, nowMs());
-    if (timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
+    if (kTimeSync && timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
     // Check new peers hear us; failures feed the one-way detection and fallback.
     if (event == PeerEvent::Found && config_.radio.autoPowerFallback && linkChecks_.size() < kMaxLinkChecks) {
         LinkCheck c = {nextLinkCheck_++, peer.mac, 3, false, nowMs()};
@@ -1843,7 +1865,7 @@ void EspNowTransport::pollChannel(uint32_t now) {
     followInterface();  // also without Wi-Fi events
     bool fixed = channelFixed();
     if (discovery_) discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || fixed, now);
-    if (diagnostics_ && diagnostics_->busy()) {
+    if (kDiagnostics && diagnostics_ && diagnostics_->busy()) {
         pendingChannel_ = 0;  // deep discovery is visiting other channels
         return;
     }
@@ -1888,7 +1910,7 @@ void EspNowTransport::stationChanged(uint32_t now) {
     uint8_t home = homeChannel_.exchange(0);
     bool fixed = channelFixed();
     radio_.stationConnected = stationConnected();
-    if (diagnostics_ && diagnostics_->busy()) return;  // deep discovery is visiting other channels
+    if (kDiagnostics && diagnostics_ && diagnostics_->busy()) return;  // deep discovery is visiting other channels
     if (home != 0 && home != radio_.channel && channel() == home) {
         adoptChannel(home, fixed, now);
         return;
@@ -1975,7 +1997,7 @@ void EspNowTransport::storeKey(const std::vector<uint8_t>& key) {
 }
 
 Status EspNowTransport::setSecurityKey(const void* key, size_t len) {
-    if (!started_) return Status::InvalidState;
+    if (!started_ || !kSecurity) return Status::InvalidState;
     if (len < Security::kMinKey || len > Security::kMaxKey || !key) return Status::InvalidArgument;
     Status st = security_->setKey(static_cast<const uint8_t*>(key), len);
     if (st == Status::Ok && config_.persistSecurityKey) {
@@ -1986,14 +2008,14 @@ Status EspNowTransport::setSecurityKey(const void* key, size_t len) {
 }
 
 Status EspNowTransport::forgetSecurityKey() {
-    if (!started_) return Status::InvalidState;
+    if (!started_ || !kSecurity) return Status::InvalidState;
     security_->setKey(nullptr, 0);
     if (config_.persistSecurityKey) storeKey(std::vector<uint8_t>());
     return Status::Ok;
 }
 
 bool EspNowTransport::secured() const {
-    if (!started_) return false;
+    if (!started_ || !kSecurity) return false;
     lock();
     bool on = security_->enabled();
     unlock(false);
@@ -2001,11 +2023,13 @@ bool EspNowTransport::secured() const {
 }
 
 Status EspNowTransport::acceptPairing(uint32_t timeoutMs, Mac* joined) {
+    if (!kSecurity) return Status::InvalidState;
     Status st = appTaskReady();
     return st == Status::Ok ? security_->acceptPairing(timeoutMs, joined) : st;
 }
 
 Status EspNowTransport::pair(uint32_t timeoutMs, Mac* member) {
+    if (!kSecurity) return Status::InvalidState;
     Status st = appTaskReady();
     return st == Status::Ok ? security_->pair(timeoutMs, member) : st;
 }
@@ -2015,7 +2039,7 @@ Status EspNowTransport::pair(uint32_t timeoutMs, Mac* member) {
 
 uint64_t EspNowTransport::networkTimeUs() const {
     uint64_t local = static_cast<uint64_t>(esp_timer_get_time());
-    if (!started_ || !timeSync_) return local;
+    if (!started_ || !kTimeSync || !timeSync_) return local;
     lock();
     uint64_t t = timeSync_->toNetwork(local);
     unlock(false);
@@ -2023,7 +2047,7 @@ uint64_t EspNowTransport::networkTimeUs() const {
 }
 
 int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
-    if (!started_ || !timeSync_) return static_cast<int64_t>(networkUs);
+    if (!started_ || !kTimeSync || !timeSync_) return static_cast<int64_t>(networkUs);
     lock();
     uint64_t t = timeSync_->toLocal(networkUs);
     unlock(false);
@@ -2031,7 +2055,7 @@ int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
 }
 
 TimeSyncStatus EspNowTransport::timeSyncStatus() const {
-    if (!started_ || !timeSync_) {
+    if (!started_ || !kTimeSync || !timeSync_) {
         TimeSyncStatus s;
         s.role = !config_.enableTimeSync     ? TimeRole::Off
                  : config_.timeSync.reference ? TimeRole::Reference
@@ -2045,7 +2069,7 @@ TimeSyncStatus EspNowTransport::timeSyncStatus() const {
 }
 
 Status EspNowTransport::setTimeRole(TimeRole role) {
-    if (!config_.enableTimeSync) return Status::InvalidState;
+    if (!kTimeSync || !config_.enableTimeSync) return Status::InvalidState;
     if (!started_) {
         config_.timeSync.role = role;
         config_.timeSync.reference = false;
@@ -2060,7 +2084,7 @@ Status EspNowTransport::setTimeRole(TimeRole role) {
 }
 
 Status EspNowTransport::setTimeReference(const Mac& peer) {
-    if (!started_ || !timeSync_) return Status::InvalidState;
+    if (!started_ || !kTimeSync || !timeSync_) return Status::InvalidState;
     lock();
     timeSync_->setReference(peer, nowMs());
     unlock();
@@ -2068,7 +2092,7 @@ Status EspNowTransport::setTimeReference(const Mac& peer) {
 }
 
 Status EspNowTransport::clearTimeReference() {
-    if (!started_ || !timeSync_) return Status::InvalidState;
+    if (!started_ || !kTimeSync || !timeSync_) return Status::InvalidState;
     lock();
     timeSync_->clearReference(nowMs());
     unlock();
@@ -2076,7 +2100,7 @@ Status EspNowTransport::clearTimeReference() {
 }
 
 Status EspNowTransport::setTimeSyncInterval(uint32_t ms) {
-    if (!config_.enableTimeSync) return Status::InvalidState;
+    if (!kTimeSync || !config_.enableTimeSync) return Status::InvalidState;
     if (!started_) {
         config_.timeSync.intervalMs = ms;
         return Status::Ok;
@@ -2093,7 +2117,7 @@ Status EspNowTransport::setTimeSyncInterval(uint32_t ms) {
 
 Status EspNowTransport::sendStream(const Mac& dst, uint32_t size, StreamReader read, StreamDone done,
                                    const StreamOptions& options, uint32_t* id) {
-    if (!started_ || !streams_) return Status::InvalidState;
+    if (!started_ || !kStreams || !streams_) return Status::InvalidState;
     if (!config_.autoAddPeers && !esp_now_is_peer_exist(dst.bytes)) return Status::LinkError;
     lock();
     Status st = streams_->send(dst, size, std::move(read), std::move(done), options, nowMs(), id);
@@ -2102,7 +2126,7 @@ Status EspNowTransport::sendStream(const Mac& dst, uint32_t size, StreamReader r
 }
 
 Status EspNowTransport::cancelStream(uint32_t id) {
-    if (!started_ || !streams_) return Status::InvalidState;
+    if (!started_ || !kStreams || !streams_) return Status::InvalidState;
     lock();
     Status st = streams_->cancel(id, nowMs());
     unlock();
@@ -2112,7 +2136,7 @@ Status EspNowTransport::cancelStream(uint32_t id) {
 void EspNowTransport::onStream(StreamAcceptor acceptor) {
     if (started_) lock();
     streamAcceptor_ = acceptor;
-    if (streams_) streams_->onIncoming(std::move(acceptor));
+    if (kStreams && streams_) streams_->onIncoming(std::move(acceptor));
     if (started_) unlock();
 }
 
@@ -2120,29 +2144,33 @@ void EspNowTransport::onStream(StreamAcceptor acceptor) {
 // Diagnostics API
 
 Status EspNowTransport::diagnosticsReady() const {
-    if (!started_ || !diagnostics_) return Status::InvalidState;
+    if (!started_ || !kDiagnostics || !diagnostics_) return Status::InvalidState;
     if (task_ && xTaskGetCurrentTaskHandle() == task_) return Status::InvalidState;  // would deadlock
     return Status::Ok;
 }
 
 Status EspNowTransport::ping(const Mac& peer, float* requestPowerDbm, float* replyPowerDbm) {
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     return st == Status::Ok ? diagnostics_->ping(peer, requestPowerDbm, replyPowerDbm) : st;
 }
 
 Status EspNowTransport::measureLink(const Mac& peer, const std::vector<ProbeStep>& steps, uint8_t framesPerStep,
                                    std::vector<ProbeResult>* forward, std::vector<ProbeResult>* reverse) {
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     return st == Status::Ok ? diagnostics_->measure(peer, steps, framesPerStep, forward, reverse) : st;
 }
 
 Status EspNowTransport::diagnose(const Mac& peer, LinkDiagnosis& out) {
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     return st == Status::Ok ? diagnostics_->diagnose(peer, out) : st;
 }
 
 Status EspNowTransport::optimizeLink(const Mac& peer, LinkProfile& out, const OptimizeOptions& options,
                                      const LinkDiagnosis* known) {
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     if (st != Status::Ok) return st;
     st = diagnostics_->optimize(peer, options, out, known);
@@ -2155,6 +2183,7 @@ Status EspNowTransport::optimizeLink(const Mac& peer, LinkProfile& out, const Op
 
 Status EspNowTransport::optimizeAll(std::vector<LinkProfile>& out, const OptimizeOptions& options) {
     out.clear();
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     if (st != Status::Ok) return st;
     std::vector<PeerInfo> list = peers();
@@ -2173,6 +2202,7 @@ Status EspNowTransport::optimizeAll(std::vector<LinkProfile>& out, const Optimiz
 }
 
 Status EspNowTransport::deepDiscover(DeepDiscoveryReport& out, const DeepDiscoveryOptions& options) {
+    if (!kDiagnostics) return Status::InvalidState;
     Status st = diagnosticsReady();
     return st == Status::Ok ? diagnostics_->deepDiscover(options, out) : st;
 }

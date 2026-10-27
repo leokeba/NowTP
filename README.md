@@ -400,6 +400,10 @@ cfg.protocol.maxRxMessages = 3;
 
 On chips with PSRAM (most ESP32-S3 modules, WROVER), NowTP takes its large buffers from it: message copies, reassembly and stream buffers (blocks of 256 bytes and more), and the event buffer. Internal RAM, which Wi-Fi, lwIP and DMA need, then only holds NowTP's tables and small messages. Without PSRAM, or when it is full, everything comes from internal RAM as before. `usePsram = false` turns this off.
 
+### Leaving services out
+
+Streams, network time, security and diagnostics can be left out of the build to save flash. All four together are about 31 KB in the ESP-IDF echo example. On ESP-IDF, turn them off in `idf.py menuconfig`, under Component config > NowTP. Elsewhere, define `NOWTP_STREAMS`, `NOWTP_TIMESYNC`, `NOWTP_SECURITY` or `NOWTP_DIAGNOSTICS` as 0 in your build flags, e.g. `build_flags = -DNOWTP_STREAMS=0` with PlatformIO. A service left out is never created, whatever `EspNowConfig` says, and its calls return `InvalidState`. Without diagnostics, peers can't run diagnostics against the node either. The code is only dropped when the compiler optimizes, which is the default.
+
 ### Peers and frame size
 
 - **Peers.** Unknown unicast destinations are registered automatically as unencrypted peers on the current channel. The same happens for senders that need an ack. Set `EspNowConfig::autoAddPeers = false` to manage peers yourself with `addPeer()`. ESP-NOW allows at most 20 peers. When its table is full, the automatically added peer used least recently is removed to make room. Peers you registered with `addPeer()` are never removed that way, and a peer that discovery reports lost gives its automatic slot back.

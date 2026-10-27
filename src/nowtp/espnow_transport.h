@@ -483,11 +483,15 @@ private:
     std::unique_ptr<Host> host_;
     std::unique_ptr<Gate> gate_;
     std::atomic<int> callbacks_{0};  // application callbacks running, with the lock let go
-    std::unique_ptr<Diagnostics> diagnostics_;
-    std::unique_ptr<Security> security_;
+    // Services a build may leave out (features.h) are destroyed through a
+    // function set where they are created, so nothing else refers to them.
+    template <class T>
+    using Service = std::unique_ptr<T, void (*)(T*)>;
+    Service<Diagnostics> diagnostics_{nullptr, nullptr};
+    Service<Security> security_{nullptr, nullptr};
     std::unique_ptr<ChannelFollower> follower_;
-    std::unique_ptr<TimeSync> timeSync_;
-    std::unique_ptr<Streams> streams_;
+    Service<TimeSync> timeSync_{nullptr, nullptr};
+    Service<Streams> streams_{nullptr, nullptr};
     StreamAcceptor streamAcceptor_;
     Callback<void(uint8_t)> channelHandler_;
     uint32_t lastChannelPoll_ = 0;

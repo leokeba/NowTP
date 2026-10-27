@@ -1,0 +1,30 @@
+menu "NowTP"
+
+    config NOWTP_NO_STREAMS
+        bool "Leave out streams (port 251)"
+        default n
+        help
+            EspNowTransport never creates Streams, and sendStream() returns
+            InvalidState. Saves about 5.5 KB of flash.
+
+    config NOWTP_NO_TIMESYNC
+        bool "Leave out network time (port 252)"
+        default n
+        help
+            EspNowTransport never creates TimeSync; network time is the local clock.
+
+    config NOWTP_NO_SECURITY
+        bool "Leave out authentication and pairing (port 253)"
+        default n
+        help
+            EspNowTransport never creates Security: no installation key, no pairing.
+
+    config NOWTP_NO_DIAGNOSTICS
+        bool "Leave out diagnostics (port 254)"
+        default n
+        help
+            No diagnostics responder, and ping(), measureLink(), diagnose(),
+            optimizeLink() and deepDiscover() return InvalidState. Peers can't
+            run diagnostics against this node either.
+
+endmenu
