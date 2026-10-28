@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "callback.h"
+#include "credit_book.h"
+#include "duplicate_filter.h"
 #include "deadline.h"
 #include "heap.h"
 #include "link.h"
@@ -274,35 +276,12 @@ private:
         uint8_t bind[wire::kAckBindSize];
     };
 
-    // Message ids delivered from one sender, so a duplicate is recognized
-    // however many other senders' messages arrived since. Ids fall in
-    // kSeenBlocks blocks of 32 (block id / 32 at slot (id / 32) % kSeenBlocks),
-    // ending with the block of the newest id. A block's bits count for
-    // recentTtlMs after its last delivery, as entries of `recent_` do.
-    static constexpr uint16_t kSeenBlocks = 4;
-    struct Seen {  // 44 bytes
-        Mac src;
-        uint16_t top;   // newest id delivered
-        uint32_t last;  // last delivery
-        uint32_t bits[kSeenBlocks];
-        uint32_t at[kSeenBlocks];  // last delivery in each block
-    };
-
-
     // A destination whose frames failed: served again only after `retryAt`
     // while others have frames to send.
     struct Backoff {
         Mac dst;
         uint8_t failures;
         uint32_t retryAt;
-    };
-
-    // Room a receiver said it has for our next message, less what we started
-    // since (Config::receiverCredit). Good for creditTtl().
-    struct Credit {
-        Mac dst;
-        uint32_t room;  // bytes; UINT32_MAX: plenty
-        uint32_t at;
     };
 
     struct InFlight {
@@ -318,15 +297,10 @@ private:
     void pump(uint32_t now);
     TxMessage* nextMessage(uint32_t now);
     Backoff* backoff(const Mac& dst);
-    Credit* credit(const Mac& dst);
-    const Credit* credit(const Mac& dst) const;
-    uint32_t creditTtl() const { return 3 * config_.ackTimeoutMs + 1; }
     /// True while `tx` may not start: its receiver said it has no room for it.
     /// `until` receives when that word expires.
     bool waitsForCredit(const TxMessage& tx, uint32_t now, uint32_t* until = nullptr) const;
     void resealOne(TxMessage& tx, uint32_t now);
-    void noteCredit(const Mac& dst, uint8_t units, uint32_t now);
-    void spendCredit(const TxMessage& tx);
     /// What we tell `src` in an ack: room for its next message, in kCreditUnit.
     uint8_t creditFor(const Mac& src, uint32_t now) const;
     uint8_t* buildFrame(TxMessage& tx, uint16_t index, bool ackRequest, uint8_t* saved, size_t& headerLen,
@@ -370,8 +344,6 @@ private:
     /// True if message `id` from `src` was delivered recently. `bind` is set
     /// to its epoch and sequence when remembered (authenticated messages).
     bool isDuplicate(const Mac& src, uint16_t id, uint32_t now, const uint8_t*& bind) const;
-    void markSeen(const Mac& src, uint16_t id, uint32_t now);
-    bool wasSeen(const Mac& src, uint16_t id, uint32_t now) const;
     bool isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const;
     void dropOlderLatest(const Mac& src, uint8_t port, uint16_t id);
 
@@ -395,7 +367,7 @@ private:
     size_t controlCount_ = 0;
     std::vector<Recent> recent_;
     size_t recentNext_ = 0;
-    Table<Seen> seen_;  // memory per sender heard, not reserved for recentSenders
+    DuplicateFilter seen_;  // per sender; `recent_` across them
     const PeerLimits* peerLimits_ = nullptr;
     std::vector<std::pair<uint8_t, Callback<void(const Message&)>>> listeners_;
     std::vector<std::pair<uint8_t, Callback<void(uint32_t, Status)>>> observers_;
@@ -404,7 +376,7 @@ private:
     TxMessage* doneTail_ = nullptr;
 
     std::vector<Backoff> backoffs_;
-    std::vector<Credit> credits_;
+    CreditBook credits_;
     Mac lastDst_{};  // destination of the last data frame, for round-robin
     InFlight inflight_;
     size_t txBytes_ = 0;

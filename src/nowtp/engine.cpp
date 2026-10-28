@@ -45,7 +45,6 @@ static Bytes allocZeroed(size_t n) {
 }
 
 constexpr size_t Engine::kMaxControlFrames;
-constexpr uint16_t Engine::kSeenBlocks;
 
 const char* toString(Status s) {
     switch (s) {
@@ -162,7 +161,9 @@ struct Engine::RxMessage {
 };
 
 Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
-    : link_(link), config_(config), nextId_(firstMessageId), seen_(config.recentSenders) {
+    : link_(link), config_(config), nextId_(firstMessageId),
+      seen_(config.recentSenders, config.recentTtlMs),
+      credits_(config.maxTxMessages, 3 * config.ackTimeoutMs + 1) {
     if (config_.recentEntries == 0) config_.recentEntries = 1;
     if (config_.sendTimeoutMs == 0) config_.sendTimeoutMs = 1;
     recent_.resize(config_.recentEntries);
@@ -170,7 +171,6 @@ Engine::Engine(Link& link, const Config& config, uint16_t firstMessageId)
     tx_.reserve(config_.maxTxMessages);
     rx_.reserve(config_.maxRxMessages);
     backoffs_.reserve(config_.maxTxMessages);
-    credits_.reserve(config_.maxTxMessages);
 }
 
 Engine::~Engine() {
@@ -493,60 +493,9 @@ Engine::Backoff* Engine::backoff(const Mac& dst) {
 // of costing a frame and a Busy ack; one refused already probes as before,
 // and its acks bring fresh credit. Single-frame messages need no room.
 
-Engine::Credit* Engine::credit(const Mac& dst) {
-    for (Credit& c : credits_) {
-        if (c.dst == dst) return &c;
-    }
-    return nullptr;
-}
-
-const Engine::Credit* Engine::credit(const Mac& dst) const {
-    for (const Credit& c : credits_) {
-        if (c.dst == dst) return &c;
-    }
-    return nullptr;
-}
-
-namespace {
-// What reassembling `count` fragments of `fragSize` takes at the receiver (see admitRx()).
-inline size_t rxNeed(uint16_t count, uint16_t fragSize) {
-    return static_cast<size_t>(count) * fragSize + (count + 7u) / 8;
-}
-}  // namespace
-
 bool Engine::waitsForCredit(const TxMessage& tx, uint32_t now, uint32_t* until) const {
     if (tx.count < 2 || tx.nextIndex > 0 || tx.resendCount > 0 || tx.awaitingAck) return false;  // started
-    const Credit* c = credit(tx.dst);
-    if (!c || reached(now, c->at + creditTtl()) || c->room >= rxNeed(tx.count, tx.fragSize)) return false;
-    if (until) *until = c->at + creditTtl();
-    return true;
-}
-
-void Engine::noteCredit(const Mac& dst, uint8_t units, uint32_t now) {
-    Credit* c = credit(dst);
-    if (!c && credits_.size() < credits_.capacity()) {  // never grows (see tx_)
-        Credit fresh = {dst, 0, 0};
-        credits_.push_back(fresh);
-        c = &credits_.back();
-    }
-    if (!c) {  // full: the oldest word goes, likely expired (they are forgotten only in tick())
-        if (credits_.empty()) return;
-        c = &credits_[0];
-        for (Credit& x : credits_) {
-            if (static_cast<int32_t>(x.at - c->at) < 0) c = &x;
-        }
-        c->dst = dst;
-    }
-    c->room = units >= kCreditMax ? UINT32_MAX : static_cast<uint32_t>(units * kCreditUnit);
-    c->at = now;
-}
-
-// Messages started after the receiver's word take room it didn't count.
-void Engine::spendCredit(const TxMessage& tx) {
-    Credit* c = credit(tx.dst);
-    if (!c || c->room == UINT32_MAX) return;
-    size_t need = rxNeed(tx.count, tx.fragSize);
-    c->room = c->room > need ? static_cast<uint32_t>(c->room - need) : 0;
+    return credits_.waits(tx.dst, CreditBook::need(tx.count, tx.fragSize), now, until);
 }
 
 // As admitRx() sees it: partial messages idle long enough to be evicted are room.
@@ -604,7 +553,8 @@ void Engine::frameSent(bool delivered, uint32_t now, uint64_t sentUs) {
     if (b) backoffs_.erase(backoffs_.begin() + (b - backoffs_.data()));
     tx->frameFailures = 0;
     // Only once delivered: a first frame lost at the MAC level goes again at once.
-    if (f.firstPass && f.index == 0 && tx->count > 1) spendCredit(*tx);
+    // Messages started after the receiver's word take room it didn't count.
+    if (f.firstPass && f.index == 0 && tx->count > 1) credits_.spend(tx->dst, CreditBook::need(tx->count, tx->fragSize));
     // Reported once the frame's bookkeeping is done: tx may be gone by then.
     bool report = sentUs != 0 && tx->count == 1 && sent_;
     Mac dst = tx->dst;
@@ -750,13 +700,7 @@ void Engine::tick(uint32_t now) {
         ++i;
     }
 
-    for (size_t i = 0; i < credits_.size();) {
-        if (reached(now, credits_[i].at + creditTtl())) {
-            credits_.erase(credits_.begin() + static_cast<std::ptrdiff_t>(i));
-            continue;
-        }
-        ++i;
-    }
+    credits_.expire(now);
 
     for (size_t i = 0; i < rx_.size();) {
         RxMessage* rx = rx_[i].get();
@@ -1339,7 +1283,7 @@ void Engine::handleAck(const Mac& src, const Header& h, const uint8_t* payload, 
     }
     if ((h.flags & kFlagCredit) && len >= 2) {
         len--;  // the credit byte, after any missing fragments
-        if (config_.receiverCredit) noteCredit(src, payload[len], now);
+        if (config_.receiverCredit) credits_.note(src, payload[len], now);
     }
     if (heard_) heard_(src, (tx->flags & kFlagAuth) != 0, now);
 
@@ -1434,7 +1378,7 @@ void Engine::popControl() {
 // Recently completed messages: duplicate suppression and latest-only ordering
 
 void Engine::remember(const Mac& src, uint8_t port, uint8_t flags, uint16_t id, const uint8_t* bind, uint32_t now) {
-    markSeen(src, id, now);
+    seen_.mark(src, id, now);
     Recent& r = recent_[recentNext_];
     r.bound = bind != nullptr;
     if (bind) memcpy(r.bind, bind, sizeof(r.bind));
@@ -1463,63 +1407,7 @@ bool Engine::isDuplicate(const Mac& src, uint16_t id, uint32_t now, const uint8_
         if (r->bound) bind = r->bind;
         return true;
     }
-    return wasSeen(src, id, now);
-}
-
-namespace {
-// Block of 32 ids; 2048 of them cover the id space, so differences wrap at 11 bits.
-inline uint16_t blocksBehind(uint16_t newer, uint16_t older) {
-    return static_cast<uint16_t>(((newer >> 5) - (older >> 5)) & 0x7FF);
-}
-}  // namespace
-
-void Engine::markSeen(const Mac& src, uint16_t id, uint32_t now) {
-    Seen* s = nullptr;
-    size_t oldest = 0;
-    for (size_t i = 0; i < seen_.size(); ++i) {
-        if (seen_[i].src == src) {
-            s = &seen_[i];
-            break;
-        }
-        if (static_cast<int32_t>(seen_[i].last - seen_[oldest].last) < 0) oldest = i;
-    }
-    bool fresh = s == nullptr || reached(now, s->last + config_.recentTtlMs);
-    if (!s) {
-        Seen blank;
-        memset(&blank, 0, sizeof(blank));
-        blank.src = src;
-        s = seen_.add(blank);
-        // Full, or no memory for another: the sender heard least recently gives way.
-        if (!s && !seen_.empty()) s = &seen_[oldest];
-        if (!s) return;  // `recent_` still holds the id
-        s->src = src;
-    }
-    if (fresh) {
-        memset(s->bits, 0, sizeof(s->bits));
-        s->top = id;
-    } else if (static_cast<int16_t>(id - s->top) > 0) {
-        // Newer: clear the blocks the window moves onto.
-        uint16_t steps = std::min(blocksBehind(id, s->top), kSeenBlocks);
-        for (uint16_t k = 1; k <= steps; ++k) s->bits[((s->top >> 5) + k) % kSeenBlocks] = 0;
-        s->top = id;
-    } else if (blocksBehind(s->top, id) >= kSeenBlocks) {
-        return;  // older than the window; `recent_` may still hold it
-    }
-    size_t slot = (id >> 5) % kSeenBlocks;
-    s->bits[slot] |= 1u << (id & 31);
-    s->at[slot] = now;
-    s->last = now;
-}
-
-bool Engine::wasSeen(const Mac& src, uint16_t id, uint32_t now) const {
-    for (const Seen& s : seen_) {
-        if (!(s.src == src)) continue;
-        if (reached(now, s.last + config_.recentTtlMs)) return false;
-        if (static_cast<int16_t>(id - s.top) > 0 || blocksBehind(s.top, id) >= kSeenBlocks) return false;
-        size_t slot = (id >> 5) % kSeenBlocks;
-        return ((s.bits[slot] >> (id & 31)) & 1) && !reached(now, s.at[slot] + config_.recentTtlMs);
-    }
-    return false;
+    return seen_.seen(src, id, now);
 }
 
 bool Engine::isStaleLatest(const Mac& src, uint8_t port, uint16_t id, uint32_t now) const {

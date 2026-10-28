@@ -17,7 +17,9 @@
 #include "nowtp/channel.h"
 #include "nowtp/crypto.h"
 #include "nowtp/diagnostics.h"
+#include "nowtp/credit_book.h"
 #include "nowtp/discovery.h"
+#include "nowtp/duplicate_filter.h"
 #include "nowtp/engine.h"
 #include "nowtp/frame_sizes.h"
 #include "nowtp/link_monitor.h"
@@ -495,6 +497,72 @@ TEST(completion_observer_reports_tagged_messages) {
     net.run(200);
     CHECK_EQ(reported.size(), 2u);
     CHECK_EQ(inbox.messages.size(), 3u);
+}
+
+// A sender's last ~128 ids, whatever other senders deliver meanwhile.
+TEST(duplicate_filter_windows_per_sender) {
+    Mac a = {{2, 0, 0, 0, 0, 1}}, b = {{2, 0, 0, 0, 0, 2}};
+    uint32_t t = sim::clockStart();
+    DuplicateFilter f(2, 5000);
+    for (uint16_t id = 0; id < 128; ++id) f.mark(a, id, t);
+    for (uint16_t id = 0; id < 1000; ++id) f.mark(b, id, t);  // b's traffic doesn't push a's out
+    bool all = true;
+    for (uint16_t id = 0; id < 128; ++id) all = all && f.seen(a, id, t);
+    CHECK(all);
+    CHECK(!f.seen(a, 200, t));
+    CHECK(f.seen(b, 999, t) && !f.seen(b, 800, t));  // b's window moved on
+    f.mark(a, 128, t);  // a new block: the oldest (ids 0-31) goes
+    CHECK(!f.seen(a, 0, t) && !f.seen(a, 31, t) && f.seen(a, 32, t) && f.seen(a, 128, t));
+    f.mark(a, 5, t);  // older than the window: not recorded
+    CHECK(!f.seen(a, 5, t));
+
+    // Ids wrap.
+    DuplicateFilter w(1, 5000);
+    w.mark(a, 0xFFFE, t);
+    w.mark(a, 0x0001, t);
+    CHECK(w.seen(a, 0xFFFE, t) && w.seen(a, 0x0001, t) && !w.seen(a, 0xFFFF, t));
+
+    // Remembered for ttlMs, a block from its last delivery.
+    CHECK(f.seen(a, 128, t + 4999));
+    CHECK(!f.seen(a, 128, t + 5000));
+
+    // Full: the sender that delivered least recently gives way.
+    Mac c = {{2, 0, 0, 0, 0, 3}};
+    f.mark(b, 1000, t + 10);
+    f.mark(a, 129, t + 20);
+    f.mark(c, 7, t + 30);
+    CHECK_EQ(f.senders(), 2u);
+    CHECK(f.seen(c, 7, t + 30) && f.seen(a, 129, t + 30) && !f.seen(b, 1000, t + 30));
+}
+
+// Receiver credit on the sending side: a word holds until it expires, a
+// message started spends room, and the book never grows past its capacity.
+TEST(credit_book_holds_messages_a_receiver_has_no_room_for) {
+    Mac a = {{2, 0, 0, 0, 0, 1}}, b = {{2, 0, 0, 0, 0, 2}}, c = {{2, 0, 0, 0, 0, 3}};
+    uint32_t t = sim::clockStart();
+    CreditBook book(2, 301);
+    size_t need = CreditBook::need(3, 1461);  // a 3-fragment message
+    CHECK_EQ(need, 3u * 1461u + 1u);
+    CHECK(!book.waits(a, need, t));  // no word: go
+    book.note(a, 20, t);             // 5120 bytes of room
+    CHECK(!book.waits(a, need, t));
+    book.spend(a, need);  // 5120 - 4384 = 736 left
+    uint32_t until = 0;
+    CHECK(book.waits(a, need, t + 10, &until));
+    CHECK_EQ(until, t + 301);
+    CHECK(!book.waits(a, need, t + 301));  // the word expired: probe
+    book.note(a, wire::kCreditMax, t);     // plenty, whatever is spent
+    book.spend(a, 100000);
+    CHECK(!book.waits(a, need, t));
+    book.note(b, 0, t + 1);
+    CHECK(book.waits(b, 1, t + 1));
+    book.note(c, 0, t + 2);  // full: a's word, the oldest, goes
+    CHECK_EQ(book.size(), 2u);
+    CHECK(book.waits(c, 1, t + 2) && book.waits(b, 1, t + 2));
+    book.expire(t + 302);
+    CHECK_EQ(book.size(), 1u);  // b's expired, c's holds a moment longer
+    book.expire(t + 303);
+    CHECK_EQ(book.size(), 0u);
 }
 
 TEST(send_buffer_takes_ownership) {
