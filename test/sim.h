@@ -308,7 +308,7 @@ public:
             for (size_t i = 0; i < nodes_.size(); ++i) {
                 if (i == from || !hears(from, i, rate)) continue;
                 if (forced || chance(airLoss) || chance(appLoss)) continue;
-                schedule(Event{arrives, Event::Deliver, i, from, f.data, true, rssi(from, i)});
+                schedule(Event{arrives, Event::Deliver, i, from, f.data, true, rssi(from, i), Mac()});
             }
         } else {
             size_t to = find(dst);
@@ -316,7 +316,7 @@ public:
             if (!reachable || chance(airLoss)) {
                 ok = false;
             } else {
-                if (!forced && !chance(appLoss)) schedule(Event{arrives, Event::Deliver, to, from, f.data, true, rssi(from, to)});
+                if (!forced && !chance(appLoss)) schedule(Event{arrives, Event::Deliver, to, from, f.data, true, rssi(from, to), Mac()});
                 // The receiver's MAC acknowledgement must make it back.
                 if (chance(macAckLoss) || !hears(to, from, nowtp::PhyRate::B1M)) ok = false;
             }
