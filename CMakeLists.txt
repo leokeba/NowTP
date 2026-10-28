@@ -1,7 +1,7 @@
 # ESP-IDF component when built by idf.py, host library + tests otherwise.
 if(ESP_PLATFORM)
     idf_component_register(
-        SRCS "src/nowtp/wire.cpp" "src/nowtp/engine.cpp" "src/nowtp/discovery.cpp" "src/nowtp/radio.cpp" "src/nowtp/diagnostics.cpp"
+        SRCS "src/nowtp/wire.cpp" "src/nowtp/engine.cpp" "src/nowtp/engine_tx.cpp" "src/nowtp/engine_rx.cpp" "src/nowtp/discovery.cpp" "src/nowtp/radio.cpp" "src/nowtp/diagnostics.cpp"
              "src/nowtp/crypto.cpp" "src/nowtp/security.cpp" "src/nowtp/channel.cpp" "src/nowtp/timesync.cpp" "src/nowtp/stream.cpp"
              "src/nowtp/peer_table.cpp" "src/nowtp/link_monitor.cpp" "src/nowtp/duplicate_filter.cpp"
              "src/nowtp/credit_book.cpp"
@@ -18,7 +18,7 @@ option(NOWTP_BUILD_TESTS "Build host-side tests" ON)
 option(NOWTP_SANITIZE "Build tests with ASan/UBSan" ON)
 
 # The core stays C++11 so it builds on Arduino-ESP32 2.x.
-add_library(nowtp_core src/nowtp/wire.cpp src/nowtp/engine.cpp src/nowtp/discovery.cpp src/nowtp/radio.cpp src/nowtp/diagnostics.cpp
+add_library(nowtp_core src/nowtp/wire.cpp src/nowtp/engine.cpp src/nowtp/engine_tx.cpp src/nowtp/engine_rx.cpp src/nowtp/discovery.cpp src/nowtp/radio.cpp src/nowtp/diagnostics.cpp
             src/nowtp/crypto.cpp src/nowtp/security.cpp src/nowtp/channel.cpp src/nowtp/timesync.cpp src/nowtp/stream.cpp
             src/nowtp/peer_table.cpp src/nowtp/link_monitor.cpp src/nowtp/duplicate_filter.cpp
             src/nowtp/credit_book.cpp)
