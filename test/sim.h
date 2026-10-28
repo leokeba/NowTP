@@ -420,7 +420,7 @@ private:
         std::vector<uint8_t> data;
         bool ok;
         int8_t rssi;
-        Mac dst = Mac();  // SendDone: the frame's destination
+        Mac dst;  // SendDone: the frame's destination (no initializer: C++11 aggregate)
     };
 
     int8_t rssi(size_t from, size_t to) const {
