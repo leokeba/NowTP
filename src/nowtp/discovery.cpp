@@ -13,11 +13,12 @@ namespace {
 //   | name length (1) | name | metadata length (1) | metadata
 //   | extension flags (1) | channel (1) | [move-to channel (1), moving notices only]
 //   | [largest message accepted (4, LE), with extension flag kExtMaxMessage]
+//   | [device id (6), with extension flag kExtDeviceId]
 // The extension is optional: earlier versions neither send nor read it, and
 // 0.5 reads no further than the move-to channel.
 constexpr uint8_t kHello = 1;
 constexpr size_t kFixedSize = 6;  // type, flags, frame size, two length bytes
-constexpr size_t kExtSize = 7;
+constexpr size_t kExtSize = 13;
 
 inline bool reached(uint32_t now, uint32_t deadline) {
     return static_cast<int32_t>(now - deadline) >= 0;
@@ -115,6 +116,15 @@ void Discovery::setTimeState(bool reference, bool candidate, bool synced) {
     if (running_) announceDue_ = true;
 }
 
+void Discovery::setDeviceId(const Mac& id) {
+    bool has = id != Mac();
+    uint8_t flags = static_cast<uint8_t>(has ? (extFlags_ | kExtDeviceId) : (extFlags_ & ~kExtDeviceId));
+    if (flags == extFlags_ && (!has || id == deviceId_)) return;
+    extFlags_ = flags;
+    deviceId_ = id;
+    if (running_) announceDue_ = true;
+}
+
 void Discovery::setMetadata(const uint8_t* data, size_t len, uint32_t now) {
     config_.metadata.assign(data, data + std::min(len, kMaxMetadata));
     if (!running_) return;
@@ -132,6 +142,13 @@ std::vector<PeerInfo> Discovery::peers() const {
 const PeerInfo* Discovery::find(const Mac& mac) const {
     for (const PeerInfo& p : peers_) {
         if (p.mac == mac) return &p;
+    }
+    return nullptr;
+}
+
+const PeerInfo* Discovery::findDevice(const Mac& id) const {
+    for (const PeerInfo& p : peers_) {
+        if (p.deviceId == id) return &p;
     }
     return nullptr;
 }
@@ -161,6 +178,10 @@ bool Discovery::announce(uint8_t flags, uint8_t moveTo) {
     size_t limit = engine_.config().maxMessageSize;
     wire::putU32(buf + n, static_cast<uint32_t>(std::min<size_t>(limit, 0xFFFFFFFFu)));
     n += 4;
+    if (extFlags_ & kExtDeviceId) {
+        memcpy(buf + n, deviceId_.bytes, sizeof(deviceId_.bytes));
+        n += sizeof(deviceId_.bytes);
+    }
 
     SendOptions opts;
     opts.latestOnly = (flags & kMoving) == 0;  // a queued announcement is replaced by a fresher one
@@ -248,7 +269,14 @@ bool Discovery::view(const uint8_t* p, size_t len, Announcement& out) {
             if (len >= ext + 3) out.moveTo = p[ext + 2];
             at++;
         }
-        if ((out.extFlags & kExtMaxMessage) && len >= at + 4) out.maxMessageSize = wire::getU32(p + at);
+        if (out.extFlags & kExtMaxMessage) {
+            if (len >= at + 4) out.maxMessageSize = wire::getU32(p + at);
+            at += 4;
+        }
+        if ((out.extFlags & kExtDeviceId) && len >= at + 6) {
+            out.hasDeviceId = true;
+            out.deviceId = Mac::from(p + at);
+        }
     }
     return true;
 }
@@ -300,6 +328,7 @@ void Discovery::handle(const Message& m) {
     bool timeReference = (a.extFlags & kExtTimeReference) != 0;
     bool timeCandidate = (a.extFlags & kExtTimeCandidate) != 0;
     bool timeSynced = (a.extFlags & kExtTimeSynced) != 0;
+    Mac deviceId = a.hasDeviceId ? a.deviceId : m.src;
     if (!peer) {
         if (!heap::fits(need)) return;
         if (peers_.full()) {
@@ -331,6 +360,7 @@ void Discovery::handle(const Message& m) {
         }
         PeerInfo fresh;
         fresh.mac = m.src;
+        fresh.deviceId = deviceId;
         fresh.name.assign(a.nameData, a.nameLen);
         fresh.metadata.assign(a.metadata, a.metadata + a.metadataLen);
         fresh.maxFrameSize = a.maxFrameSize;
@@ -356,7 +386,7 @@ void Discovery::handle(const Message& m) {
                    peer->metadata.size() != a.metadataLen ||
                    !std::equal(peer->metadata.begin(), peer->metadata.end(), a.metadata) ||
                    peer->channel != a.channel || peer->anchor != anchor || peer->timeReference != timeReference ||
-                   peer->timeCandidate != timeCandidate || peer->timeSynced != timeSynced ||
+                   peer->timeCandidate != timeCandidate || peer->timeSynced != timeSynced || peer->deviceId != deviceId ||
                    peer->authenticated != m.authenticated;
     if (changed && heap::fits(need)) {
         peer->name.assign(a.nameData, a.nameLen);
@@ -369,6 +399,7 @@ void Discovery::handle(const Message& m) {
         peer->timeReference = timeReference;
         peer->timeCandidate = timeCandidate;
         peer->timeSynced = timeSynced;
+        peer->deviceId = deviceId;
         peer->authenticated = m.authenticated;
         PeerInfo copy = *peer;
         emit(PeerEvent::Updated, copy);

@@ -13,6 +13,9 @@ namespace nowtp {
 /// A peer seen by discovery.
 struct PeerInfo {
     Mac mac;
+    /// The device's id: its station MAC, which it announces while it sends
+    /// from another address (its soft-AP's: see EspNowTransport); else `mac`.
+    Mac deviceId = Mac();
     std::string name;
     std::vector<uint8_t> metadata;
     uint16_t maxFrameSize = 250;  ///< Largest frame the peer's driver can receive.
@@ -115,12 +118,17 @@ public:
     /// What this node announces about network time (see TimeSync), with the
     /// next announcement.
     void setTimeState(bool reference, bool candidate, bool synced);
+    /// The device id to announce (our station MAC) while we send from another
+    /// address; none (Mac()) while we send from it.
+    void setDeviceId(const Mac& id);
     void onPeerEvent(PeerHandler handler) { handler_.set(std::move(handler)); }
     void onPeerMoved(MoveHandler handler) { moveHandler_.set(std::move(handler)); }
 
     /// A copy of the peers tracked.
     std::vector<PeerInfo> peers() const;
     const PeerInfo* find(const Mac& mac) const;
+    /// The peer whose device id is `id` (see PeerInfo::deviceId).
+    const PeerInfo* findDevice(const Mac& id) const;
     size_t maxMessageSize(const Mac& peer) const override;
 
     /// A parsed announcement payload (as carried on kDiscoveryPort).
@@ -136,6 +144,8 @@ public:
         uint8_t extFlags = 0;
         uint8_t moveTo = 0;   ///< Channel of a moving notice, else 0.
         uint32_t maxMessageSize = 0;  ///< 0 when the sender does not say.
+        bool hasDeviceId = false;     ///< The sender says its device id (kExtDeviceId).
+        Mac deviceId = Mac();
     };
     static bool parse(const uint8_t* data, size_t len, Announcement& out);
     /// parse() without copying the name (left empty: see nameData), which may take heap.
@@ -150,6 +160,7 @@ private:
         kExtMaxMessage = 0x04,
         kExtTimeCandidate = 0x08,
         kExtTimeSynced = 0x10,
+        kExtDeviceId = 0x20,
     };
 
     void handle(const Message& m);
@@ -167,6 +178,7 @@ private:
     Table<PeerInfo> peers_;  // memory per peer heard, not reserved for maxPeers
     uint8_t channel_ = 0;
     uint8_t extFlags_ = 0;
+    Mac deviceId_ = Mac();  // with kExtDeviceId
     uint32_t now_ = 0;
     uint32_t nextAnnounce_ = 0;
     uint32_t replyAt_ = 0;

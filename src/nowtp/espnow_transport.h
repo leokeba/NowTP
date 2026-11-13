@@ -337,6 +337,21 @@ public:
     /// Pause between synchronization rounds once synchronized (at least 1 s);
     /// also applies to the next begin().
     Status setTimeSyncInterval(uint32_t ms);
+    /// Serves `core`, a TimeSync owned elsewhere (a network clock over several
+    /// carriers), instead of one of its own: ESP-NOW becomes one of core's
+    /// carriers (timeCarrier(), "nowtp", added to core here; peers named by
+    /// their station MAC), discovery announces core's role, and
+    /// networkTimeUs() and localTimeUs() read it. What ESP-NOW brings is
+    /// queued for core's tick(), and `wake` runs (in the NowTP task, holding
+    /// its lock: it must not wait) when something was. Call before begin(),
+    /// from core's task; with null, the next begin() runs a TimeSync of its
+    /// own again (remove the carrier from core first). Core must remove the
+    /// carrier, or be gone, before this transport is destroyed. The time
+    /// setters then return InvalidState, and timeSyncStatus() gives only the
+    /// role, synced, isReference and offset: ask core's status().
+    Status serveTimeSync(TimeSync* core, std::function<void()> wake = nullptr);
+    /// The carrier serveTimeSync() made, null before.
+    TimeCarrier* timeCarrier() { return timeCarrier_.get(); }
 
     // --- Streams (see Streams) -----------------------------------------------
     /// Sends `size` bytes pulled from `read` to `dst`. `done` runs once in the
@@ -444,6 +459,10 @@ private:
     Status appTaskReady() const;
     void storeKey(const std::vector<uint8_t>& key);
     /// The link monitor's view of the radio: power, and events to log and count.
+    class TimeGuard;
+    void detachTimeCarrier();
+    /// Our station MAC while ESP-NOW sends from another address (the soft-AP's), else none.
+    Mac announcedDeviceId() const;
     class MonitorHost : public LinkMonitor::Host {
     public:
         explicit MonitorHost(EspNowTransport& t) : t_(t) {}
@@ -499,6 +518,12 @@ private:
     Service<Security> security_{nullptr, nullptr};
     std::unique_ptr<ChannelFollower> follower_;
     Service<TimeSync> timeSync_{nullptr, nullptr};
+    // A TimeSync owned elsewhere (serveTimeSync()), and its carrier.
+    TimeSync* externalTime_ = nullptr;
+    Service<EngineTimeCarrier> timeCarrier_{nullptr, nullptr};
+    std::unique_ptr<TimeGuard> timeGuard_;
+    std::atomic<bool> timeAttached_{false};  // the carrier runs on the engine
+    std::atomic<int> timeUsers_{0};           // core's calls into it under way
     Service<Streams> streams_{nullptr, nullptr};
     StreamAcceptor streamAcceptor_;
     Callback<void(uint8_t)> channelHandler_;

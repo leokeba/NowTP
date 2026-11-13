@@ -4026,6 +4026,538 @@ TEST(timesync_roles_and_reference_change_at_runtime) {
 }
 
 // ---------------------------------------------------------------------------
+// Time synchronization over several carriers
+
+namespace {
+
+struct FakeWire;
+
+// A carrier between TimeSyncs, as UDP on a LAN: a datagram arrives after a
+// fixed delay, stamped with the nodes' clocks as it leaves and arrives.
+struct FakeCarrier : TimeCarrier {
+    FakeWire* wire = nullptr;
+    size_t node = 0;
+    TimeSync* core = nullptr;
+    uint32_t nextToken = 1;
+    TimeCarrierLimits lim;
+    const char* name() const override;
+    Status send(const Mac& device, const uint8_t* data, size_t len, uint32_t* token) override;
+    bool reaches(const Mac& device) const override;
+    TimeCarrierLimits limits() const override { return lim; }
+};
+
+struct FakeWire {
+    struct Packet {
+        size_t from, to;
+        std::vector<uint8_t> data;
+        uint32_t at;
+    };
+    struct Report {
+        size_t node;
+        uint32_t token;
+        uint64_t us;
+    };
+    sim::Network& net;
+    const std::vector<Mac>& ids;  // devices, by node
+    std::string name;
+    uint32_t delayMs;
+    uint32_t requestDelayMs = 0;  // more for requests: a delay in one direction, after the stamps
+    std::vector<std::unique_ptr<FakeCarrier>> at;  // by node; null: not on this wire
+    std::vector<bool> unplugged;  // nothing goes in or out, and reaches() says so
+    std::vector<bool> silent;     // nothing goes in or out, but reaches() doesn't say so
+    std::vector<Packet> packets;
+    std::vector<Report> reports;
+    size_t sentCount = 0;
+
+    FakeWire(sim::Network& n, const std::vector<Mac>& i, std::string nm, uint32_t delay)
+        : net(n), ids(i), name(std::move(nm)), delayMs(delay) {
+        net.tickers.push_back(sim::Ticker([this](uint32_t now) { step(now); }, [this](Deadline& d) { due(d); }));
+    }
+    FakeCarrier& join(size_t node, TimeSync& core) {
+        if (at.size() <= node) {
+            at.resize(node + 1);
+            unplugged.resize(node + 1);
+            silent.resize(node + 1);
+        }
+        at[node].reset(new FakeCarrier());
+        FakeCarrier& c = *at[node];
+        c.wire = this;
+        c.node = node;
+        c.core = &core;
+        if (core.addCarrier(c) != Status::Ok) std::abort();
+        return c;
+    }
+    bool open(size_t i) const { return i < at.size() && at[i] && !unplugged[i] && !silent[i]; }
+    int find(const Mac& m) const {
+        for (size_t i = 0; i < at.size(); ++i) {
+            if (at[i] && ids[i] == m) return static_cast<int>(i);
+        }
+        return -1;
+    }
+    void step(uint32_t now) {
+        testing::HeapCounted nowtp;
+        std::vector<Report> r;
+        r.swap(reports);
+        for (const Report& x : r) {
+            if (at[x.node]) at[x.node]->core->sent(*at[x.node], x.token, x.us);
+        }
+        for (size_t i = 0; i < packets.size();) {
+            if (static_cast<int32_t>(now - packets[i].at) < 0) {
+                ++i;
+                continue;
+            }
+            Packet p = std::move(packets[i]);
+            packets.erase(packets.begin() + static_cast<std::ptrdiff_t>(i));
+            if (!open(p.from) || !open(p.to)) continue;
+            at[p.to]->core->received(*at[p.to], ids[p.from], p.data.data(), p.data.size(),
+                                     net.node(p.to).clockUs(now));
+        }
+    }
+    void due(Deadline& d) const {
+        if (!reports.empty()) d.in(0);
+        for (const Packet& p : packets) d.at(p.at);
+    }
+};
+
+const char* FakeCarrier::name() const {
+    return wire->name.c_str();
+}
+
+Status FakeCarrier::send(const Mac& device, const uint8_t* data, size_t len, uint32_t* token) {
+    testing::HeapExempt wireMemory;
+    if (len > TimeSync::kMaxDatagram) std::abort();
+    if (wire->unplugged[node]) return Status::LinkError;
+    std::vector<size_t> to;
+    if (device.isBroadcast()) {
+        for (size_t j = 0; j < wire->at.size(); ++j) {
+            if (j != node && wire->at[j]) to.push_back(j);
+        }
+    } else {
+        int j = wire->find(device);
+        if (j < 0) return Status::LinkError;
+        to.push_back(static_cast<size_t>(j));
+    }
+    uint32_t now = wire->net.now();
+    uint32_t extra = len > 0 && data[0] == 1 ? wire->requestDelayMs : 0;
+    for (size_t j : to) {
+        wire->packets.push_back(FakeWire::Packet{node, j, std::vector<uint8_t>(data, data + len), now + wire->delayMs + extra});
+    }
+    *token = nextToken++;
+    wire->reports.push_back(FakeWire::Report{node, *token, wire->net.node(node).clockUs(now)});
+    wire->sentCount++;
+    return Status::Ok;
+}
+
+bool FakeCarrier::reaches(const Mac& device) const {
+    int j = wire->find(device);
+    return j >= 0 && !wire->unplugged[node] && !wire->unplugged[static_cast<size_t>(j)];
+}
+
+// TimeSyncs on fake wires and, for some, NowTP's engine (EngineTimeCarrier).
+struct CarrierRig {
+    sim::Network net{8};
+    std::mt19937 rng{11};
+    std::vector<Mac> ids;  // device ids, by node: the node's MAC unless set otherwise
+    std::vector<std::unique_ptr<TimeSync>> ts;
+    std::vector<std::unique_ptr<Discovery>> disc;
+    std::vector<std::unique_ptr<EngineTimeCarrier>> radio;
+    std::vector<std::unique_ptr<FakeWire>> wires;
+    std::function<void(size_t, TimeSyncConfig&)> configure;
+
+    FakeWire& wire(const char* name, uint32_t delayMs = 1) {
+        wires.emplace_back(new FakeWire(net, ids, name, delayMs));
+        return *wires.back();
+    }
+    size_t add(TimeRole role, uint64_t clockOffsetUs, double skew, Mac id = Mac()) {
+        size_t i = net.addNode();
+        net.node(i).clockOffsetUs = clockOffsetUs;
+        net.node(i).clockSkew = skew;
+        ids.push_back(id == Mac() ? net.mac(i) : id);
+        TimeSyncConfig tc;
+        tc.role = role;
+        if (configure) configure(i, tc);
+        sim::Node* node = &net.node(i);
+        sim::Network* nw = &net;
+        ts.emplace_back(new TimeSync([node, nw] { return node->clockUs(nw->now()); }, tc, ids[i],
+                                     [nw] { return nw->now(); }));
+        disc.emplace_back();
+        radio.emplace_back();
+        net.tickers.push_back(sim::Ticker([this, i](uint32_t now) {
+            if (disc[i]) disc[i]->tick(now);
+            ts[i]->tick(now);
+        },
+                                          [this, i](Deadline& d) {
+                                              if (disc[i]) disc[i]->nextTick(d);
+                                              ts[i]->nextTick(d);
+                                          },
+                                          i));
+        return i;
+    }
+    // Node i on ESP-NOW too: its engine as a carrier, peers named by device id.
+    EngineTimeCarrier& addRadio(size_t i) {
+        DiscoveryConfig dc;
+        dc.name = "c" + std::to_string(i);
+        disc[i].reset(new Discovery(net.engine(i), dc, 250, [this] { return static_cast<uint32_t>(rng()); }));
+        if (ids[i] != net.mac(i)) disc[i]->setDeviceId(ids[i]);
+        radio[i].reset(new EngineTimeCarrier());
+        EngineTimeCarrier& c = *radio[i];
+        sim::Network* nw = &net;
+        c.setClock([nw] { return nw->now(); });
+        c.setDiscovery(disc[i].get());
+        c.setDeviceIds(true);
+        if (ts[i]->addCarrier(c) != Status::Ok) std::abort();
+        c.attach(&net.engine(i), ts[i].get());
+        disc[i]->onPeerEvent([this, i](PeerEvent e, const PeerInfo& p) { radio[i]->peerEvent(e, p); });
+        return c;
+    }
+    void start() {
+        for (size_t i = 0; i < ts.size(); ++i) {
+            if (disc[i]) disc[i]->start(net.now());
+            ts[i]->start(net.now());
+        }
+    }
+    size_t acting() const {
+        size_t n = 0;
+        for (const auto& t : ts) n += t->isReference() ? 1 : 0;
+        return n;
+    }
+    bool allSynced() const {
+        for (const auto& t : ts) {
+            if (!t->synced()) return false;
+        }
+        return true;
+    }
+    int64_t error(size_t i, size_t ref) {
+        return static_cast<int64_t>(ts[i]->networkTime() - net.node(ref).clockUs(net.now()));
+    }
+    int64_t apart(size_t i, size_t j) { return static_cast<int64_t>(ts[i]->networkTime() - ts[j]->networkTime()); }
+    std::string carrier(size_t i) const { return ts[i]->status().carrier; }
+    // Runs `ms`, checking node i stays synchronized; returns its largest error against `ref`.
+    int64_t watch(size_t i, size_t ref, uint32_t ms) {
+        int64_t worst = 0;
+        for (uint32_t t = 0; t < ms; t += 10) {
+            net.run(10);
+            if (!ts[i]->synced()) worst = INT64_MAX;  // fails the caller's bound
+            if (worst != INT64_MAX) worst = std::max(worst, absValue(error(i, ref)));
+        }
+        return worst;
+    }
+};
+
+Mac deviceMac(uint8_t last) {
+    Mac m;
+    const uint8_t b[6] = {0x02, 0xde, 0xad, 0xbe, 0xef, last};
+    memcpy(m.bytes, b, sizeof(b));
+    return m;
+}
+
+}  // namespace
+
+TEST(timesync_elects_and_synchronizes_over_beacons) {
+    // No discovery on the carrier: offers go out as beacons. Four candidates
+    // agree on one reference, the lowest MAC, and keep its time when it goes.
+    CarrierRig rig;
+    FakeWire& udp = rig.wire("udp");
+    const double skews[] = {10e-6, -20e-6, 30e-6, -5e-6};
+    for (size_t k = 0; k < 4; ++k) {
+        size_t i = rig.add(TimeRole::Candidate, 1000000000ull * (k + 1) + 12345 * k, skews[k]);
+        udp.join(i, *rig.ts[i]);
+    }
+    rig.start();
+    rig.net.run(4000);
+    CHECK_EQ(rig.acting(), 0u);  // listening for an incumbent first
+    CHECK(rig.net.runUntil([&] { return rig.acting() == 1 && rig.allSynced(); }, 30000));
+    CHECK(rig.ts[0]->isReference());
+    rig.net.run(30000);
+    CHECK_EQ(rig.acting(), 1u);
+    for (size_t k = 1; k < 4; ++k) {
+        CHECK(absValue(rig.error(k, 0)) < kHopUs);
+        TimeSyncStatus s = rig.ts[k]->status();
+        CHECK(s.reference == rig.ids[0]);
+        CHECK(std::string(s.carrier) == "udp");
+    }
+    CHECK(std::string(rig.ts[0]->status().carrier).empty());
+    // Beacons every 2 s from the four (all candidates), and the exchanges:
+    // nothing like a flood.
+    size_t before = udp.sentCount;
+    rig.net.run(10000);
+    CHECK(udp.sentCount - before < 250);
+
+    // The reference goes for good: the next one keeps its network time.
+    udp.unplugged[0] = true;
+    sim::Node* n0 = &rig.net.node(0);
+    int64_t worst = 0;
+    for (int i = 0; i < 3000; ++i) {
+        rig.net.run(10);
+        worst = std::max(worst, absValue(static_cast<int64_t>(rig.ts[2]->networkTime() - n0->clockUs(rig.net.now()))));
+    }
+    CHECK(rig.ts[1]->isReference());
+    CHECK_EQ(rig.acting(), 2u);  // node 0 still acts, alone
+    CHECK(rig.ts[2]->status().reference == rig.ids[1]);
+    CHECK(rig.ts[3]->synced());
+    CHECK(worst < kTwoHopsUs);
+}
+
+TEST(timesync_fails_over_between_carriers) {
+    CarrierRig rig;
+    FakeWire& udp = rig.wire("udp", 1);
+    FakeWire& radio = rig.wire("radio", 3);
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0), f = rig.add(TimeRole::Follow, 1234ull, 30e-6);
+    for (size_t i : {ref, f}) {
+        udp.join(i, *rig.ts[i]);  // first: preferred
+        radio.join(i, *rig.ts[i]);
+    }
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.ts[f]->synced(); }, 5000));
+    rig.net.run(20000);
+    CHECK(rig.carrier(f) == "udp");
+    CHECK(absValue(rig.error(f, ref)) < kHopUs);
+
+    // Unplugged: the next round goes by radio, from the same estimate.
+    udp.unplugged[f] = true;
+    CHECK(rig.watch(f, ref, 30000) < kHopUs);
+    CHECK(rig.carrier(f) == "radio");
+    CHECK(rig.ts[f]->status().reference == rig.ids[ref]);
+    // Back on the preferred carrier at the next round.
+    udp.unplugged[f] = false;
+    CHECK(rig.watch(f, ref, 12000) < kHopUs);
+    CHECK(rig.carrier(f) == "udp");
+
+    // Silent, though it still reaches it: a round without an answer moves it,
+    // and the carrier gets another chance later.
+    udp.silent[f] = true;
+    CHECK(rig.watch(f, ref, 15000) < kHopUs);
+    CHECK(rig.carrier(f) == "radio");
+    udp.silent[f] = false;
+    CHECK(rig.watch(f, ref, 40000) < kHopUs);
+    CHECK(rig.carrier(f) == "udp");
+
+    // Left out of the order: radio only, at once.
+    const char* order[] = {"radio"};
+    CHECK_EQ(rig.ts[f]->setCarrierOrder(order, 1, rig.net.now()), 1u);
+    CHECK(rig.watch(f, ref, 12000) < kHopUs);
+    CHECK(rig.carrier(f) == "radio");
+    const char* both[] = {"radio", "udp"};
+    CHECK_EQ(rig.ts[f]->setCarrierOrder(both, 2, rig.net.now()), 2u);
+    rig.net.run(12000);
+    CHECK(rig.carrier(f) == "radio");  // preferred now
+    // Removed: what came through it goes too.
+    rig.ts[f]->removeCarrier(*radio.at[f], rig.net.now());
+    CHECK(rig.watch(f, ref, 12000) < kHopUs);
+    CHECK(rig.carrier(f) == "udp");
+}
+
+TEST(timesync_answers_on_the_carrier_asked) {
+    // One reference serves a follower on each carrier.
+    CarrierRig rig;
+    FakeWire& udp = rig.wire("udp", 1);
+    FakeWire& radio = rig.wire("radio", 2);
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0), a = rig.add(TimeRole::Follow, 1234ull, 30e-6),
+           b = rig.add(TimeRole::Follow, 99999ull, -25e-6);
+    udp.join(ref, *rig.ts[ref]);
+    radio.join(ref, *rig.ts[ref]);
+    udp.join(a, *rig.ts[a]);
+    radio.join(b, *rig.ts[b]);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.allSynced(); }, 10000));
+    rig.net.run(30000);
+    CHECK(rig.carrier(a) == "udp");
+    CHECK(rig.carrier(b) == "radio");
+    CHECK(absValue(rig.error(a, ref)) < kHopUs);
+    CHECK(absValue(rig.error(b, ref)) < kHopUs);
+    CHECK(absValue(rig.apart(a, b)) < kTwoHopsUs);
+}
+
+TEST(timesync_calibration_is_kept_per_carrier) {
+    // Requests wait 2 ms after their stamps on udp, none on radio: each
+    // carrier has its own correction, and a failover doesn't carry one over.
+    CarrierRig rig;
+    rig.configure = [](size_t, TimeSyncConfig& c) { c.calibrationIntervalMs = 10000; };
+    FakeWire& udp = rig.wire("udp", 1);
+    FakeWire& radio = rig.wire("radio", 1);
+    udp.requestDelayMs = 2;
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0), f = rig.add(TimeRole::Follow, 1234ull, 35e-6);
+    for (size_t i : {ref, f}) {
+        udp.join(i, *rig.ts[i]);
+        radio.join(i, *rig.ts[i]);
+    }
+    rig.start();
+    rig.net.run(90000);
+    TimeSyncStatus s = rig.ts[f]->status();
+    CHECK(std::string(s.carrier) == "udp");
+    CHECK(absValue(rig.error(f, ref)) < 50);
+    CHECK(s.calibrationUs > 900 && s.calibrationUs < 1100);
+
+    udp.unplugged[f] = true;
+    CHECK(rig.watch(f, ref, 60000) < 300);
+    s = rig.ts[f]->status();
+    CHECK(std::string(s.carrier) == "radio");
+    CHECK(absValue(s.calibrationUs) < 50);
+    CHECK(s.calibrations >= 3u);
+
+    udp.unplugged[f] = false;  // its correction is still there
+    CHECK(rig.watch(f, ref, 30000) < 300);
+    s = rig.ts[f]->status();
+    CHECK(std::string(s.carrier) == "udp");
+    CHECK(s.calibrationUs > 900 && s.calibrationUs < 1100);
+}
+
+TEST(timesync_one_clock_over_nowtp_and_udp) {
+    // The reference on both, with ESP-NOW sending from another address than
+    // its device id (its soft-AP's): one follower on each, both on its time.
+    CarrierRig rig;
+    FakeWire& udp = rig.wire("udp", 1);
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0, deviceMac(0x10)),
+           a = rig.add(TimeRole::Follow, 1234ull, 30e-6), b = rig.add(TimeRole::Follow, 99999ull, -25e-6);
+    rig.addRadio(ref);
+    udp.join(ref, *rig.ts[ref]);
+    rig.addRadio(a);
+    udp.join(b, *rig.ts[b]);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.allSynced(); }, 10000));
+    rig.net.run(30000);
+    CHECK(rig.carrier(a) == "nowtp");
+    CHECK(rig.carrier(b) == "udp");
+    CHECK(rig.ts[a]->status().reference == deviceMac(0x10));
+    CHECK(rig.ts[b]->status().reference == deviceMac(0x10));
+    CHECK(absValue(rig.error(a, ref)) < kHopUs);
+    CHECK(absValue(rig.error(b, ref)) < kHopUs);
+    const PeerInfo* p = rig.disc[a]->find(rig.net.mac(ref));
+    CHECK(p && p->deviceId == deviceMac(0x10) && p->timeReference);
+
+    // A follower on both, with the reference named the same on each: one
+    // reference, followed over the first carrier, then the other.
+    size_t c = rig.add(TimeRole::Candidate, 5555ull, 10e-6);
+    udp.join(c, *rig.ts[c]);
+    rig.addRadio(c);
+    rig.disc[c]->start(rig.net.now());
+    rig.ts[c]->start(rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.ts[c]->synced(); }, 10000));
+    rig.net.run(20000);
+    CHECK(rig.carrier(c) == "udp");
+    CHECK(rig.ts[c]->status().reference == deviceMac(0x10));
+    CHECK(!rig.ts[c]->isReference());
+    udp.unplugged[c] = true;
+    CHECK(rig.watch(c, ref, 20000) < kHopUs);
+    CHECK(rig.carrier(c) == "nowtp");
+}
+
+namespace {
+
+struct CountingGuard : CarrierGuard {
+    bool open = true;
+    int depth = 0;
+    int entered = 0;
+    bool enter() override {
+        if (!open) return false;
+        depth++;
+        entered++;
+        return true;
+    }
+    void leave() override { depth--; }
+};
+
+}  // namespace
+
+TEST(timesync_engine_carrier_queues_for_another_task) {
+    // The TimeSync of node f takes what ESP-NOW brings in its own tick().
+    CarrierRig rig;
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0), f = rig.add(TimeRole::Follow, 1234ull, 30e-6);
+    rig.addRadio(ref);
+    EngineTimeCarrier& c = rig.addRadio(f);
+    CountingGuard guard;
+    int wakes = 0;
+    CHECK(c.setQueued([&wakes] { wakes++; }));
+    c.setGuard(&guard);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.ts[f]->synced(); }, 10000));
+    rig.net.run(20000);
+    CHECK(absValue(rig.error(f, ref)) < kHopUs);
+    CHECK(rig.carrier(f) == "nowtp");
+    CHECK(wakes > 20);
+    CHECK(guard.entered > 20);
+    CHECK_EQ(guard.depth, 0);
+    CHECK_EQ(c.dropped(), 0u);
+
+    // Queued, then not delivered until the TimeSync ticks.
+    c.peerEvent(PeerEvent::Lost, *rig.disc[f]->find(rig.net.mac(ref)));
+    CHECK(c.pending());
+    Deadline d(rig.net.now());
+    rig.ts[f]->nextTick(d);
+    CHECK(d.set() && d.delay() == 0);
+
+    // Detached (the transport ended): its offers go, and nothing more is sent.
+    c.attach(nullptr, nullptr);
+    guard.open = false;
+    rig.ts[f]->tick(rig.net.now());
+    CHECK(!c.pending());
+    CHECK(std::string(rig.carrier(f)).empty());
+    CHECK(!c.reaches(rig.ids[ref]));
+    uint32_t token = 0;
+    const uint8_t ping[1] = {0};
+    CHECK(c.send(rig.ids[ref], ping, 1, &token) == Status::InvalidState);
+    CHECK(rig.ts[f]->synced());  // the estimate stays until it goes stale
+}
+
+TEST(timesync_network_time_reads_from_another_task) {
+    // Rounds update the estimate while another thread converts: every read
+    // sees one whole estimate (a torn one, mixing two rounds, would be off by
+    // the drift over the seconds between them). A smoke test: on the host,
+    // even an unguarded copy is rarely caught mid-write.
+    CarrierRig rig;
+    FakeWire& udp = rig.wire("udp");
+    size_t ref = rig.add(TimeRole::Reference, 8000000000ull, 0), f = rig.add(TimeRole::Follow, 1234ull, 40e-6);
+    udp.join(ref, *rig.ts[ref]);
+    udp.join(f, *rig.ts[f]);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.ts[f]->synced(); }, 5000));
+    uint64_t local = rig.net.node(f).clockUs(rig.net.now()) + 5000000;
+    std::atomic<bool> done{false};
+    std::atomic<uint32_t> reads{0}, torn{0};
+    TimeSync* t = rig.ts[f].get();
+    std::thread reader([&] {
+        while (!done.load()) {
+            // Two calls: compared only when no round changed the estimate between them.
+            uint64_t n = t->toNetwork(local);
+            int64_t back = static_cast<int64_t>(t->toLocal(n) - local);
+            if (t->toNetwork(local) == n && (back > 2 || back < -2)) torn++;
+            if (!t->isReference() && t->role() != TimeRole::Follow) torn++;
+            reads++;
+        }
+    });
+    rig.net.run(60000);
+    done = true;
+    reader.join();
+    CHECK_EQ(torn.load(), 0u);
+    CHECK(reads.load() > 1000u);
+    CHECK(absValue(rig.error(f, ref)) < kHopUs);
+}
+
+TEST(discovery_announces_a_device_id) {
+    // A node sending from another address (its soft-AP's) names its device.
+    DiscoveryRig rig;
+    size_t a = rig.add("alpha"), b = rig.add("beta");
+    rig.nodes[a]->setDeviceId(deviceMac(0x42));
+    rig.nodes[a]->start(rig.net.now());
+    rig.nodes[b]->start(rig.net.now());
+    rig.run(100);
+    const PeerInfo* p = rig.nodes[b]->find(rig.net.mac(a));
+    CHECK(p && p->deviceId == deviceMac(0x42));
+    CHECK(rig.nodes[b]->findDevice(deviceMac(0x42)) == p);
+    CHECK(p && p->maxMessageSize != 0);  // read before it
+    const PeerInfo* q = rig.nodes[a]->find(rig.net.mac(b));
+    CHECK(q && q->deviceId == rig.net.mac(b));  // none said: its address
+    CHECK(rig.nodes[a]->findDevice(rig.net.mac(b)) == q);
+    // Back on its own address: an update, named by it again.
+    rig.nodes[a]->setDeviceId(Mac());
+    rig.run(3000);
+    p = rig.nodes[b]->find(rig.net.mac(a));
+    CHECK(p && p->deviceId == rig.net.mac(a));
+    CHECK(rig.nodes[b]->findDevice(deviceMac(0x42)) == nullptr);
+    CHECK(rig.count(b, PeerEvent::Updated) >= 1u);
+}
+
+// ---------------------------------------------------------------------------
 // Streams
 
 namespace {

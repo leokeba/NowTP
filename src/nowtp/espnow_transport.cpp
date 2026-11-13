@@ -398,6 +398,30 @@ private:
     EspNowTransport& t_;
 };
 
+// Brackets a TimeSync's calls into the ESP-NOW carrier from its own task
+// (serveTimeSync()): the lock while the engine is there, nothing once end()
+// took it down (which waits for calls under way).
+class EspNowTransport::TimeGuard : public CarrierGuard {
+public:
+    explicit TimeGuard(EspNowTransport& t) : t_(t) {}
+    bool enter() override {
+        t_.timeUsers_++;
+        if (!t_.timeAttached_.load()) {
+            t_.timeUsers_--;
+            return false;
+        }
+        t_.lock();
+        return true;
+    }
+    void leave() override {
+        t_.unlock();  // what core sent goes out: the NowTP task is woken
+        t_.timeUsers_--;
+    }
+
+private:
+    EspNowTransport& t_;
+};
+
 EspNowTransport::EspNowTransport() {}
 
 EspNowTransport::~EspNowTransport() {
@@ -511,7 +535,7 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
                                             destroyService<Diagnostics>);
         diagnostics_->setDiscovery(discovery_.get());
     }
-    if (kTimeSync && config_.enableTimeSync) {
+    if (kTimeSync && config_.enableTimeSync && !externalTime_) {
         timeSync_ = Service<TimeSync>(new TimeSync(*engine_, [] { return static_cast<uint64_t>(esp_timer_get_time()); },
                                                    config_.timeSync, localMac()),
                                       destroyService<TimeSync>);
@@ -575,8 +599,18 @@ Status EspNowTransport::begin(const EspNowConfig& config) {
     if (kSecurity) security_->start();  // first, so that every announcement is authenticated
     if (kDiagnostics && diagnostics_) diagnostics_->start();
     if (kTimeSync && timeSync_) timeSync_->start(nowMs());
+    if (kTimeSync && externalTime_) {
+        lock();
+        timeCarrier_->setDiscovery(discovery_.get());
+        timeCarrier_->attach(engine_.get(), externalTime_);
+        timeAttached_ = true;
+        unlock();
+    }
     if (kStreams && streams_) streams_->start();
-    if (discovery_) discovery_->start(nowMs());
+    if (discovery_) {
+        discovery_->setDeviceId(announcedDeviceId());
+        discovery_->start(nowMs());
+    }
     if (follower_) follower_->start(nowMs());
     if (config_.runTask) {
         BaseType_t ok = xTaskCreatePinnedToCore(taskEntry, "nowtp", config_.taskStackSize, this,
@@ -602,6 +636,7 @@ void EspNowTransport::end() {
     if (follower_) follower_->stop();
     if (kTimeSync && timeSync_) timeSync_->stop();
     unlock();
+    detachTimeCarrier();
     if (discovery_) {
         // Say goodbye so peers drop us at once, and give the frame time to go out.
         lock();
@@ -634,6 +669,7 @@ void EspNowTransport::end() {
 }
 
 void EspNowTransport::cleanup() {
+    detachTimeCarrier();  // before the engine goes
     if (espNowInitialized_) {
         esp_now_unregister_recv_cb();
         esp_now_unregister_send_cb();
@@ -1230,6 +1266,7 @@ void EspNowTransport::followInterface() {
     Mac self = localMac();
     if (kSecurity && security_) security_->setLocalMac(self);
     if (kTimeSync && timeSync_) timeSync_->setLocalMac(self);
+    if (discovery_) discovery_->setDeviceId(announcedDeviceId());
     ESP_LOGI(kTag, "Wi-Fi mode changed: ESP-NOW now uses the %s interface, as %02x:%02x:%02x:%02x:%02x:%02x",
              want == WIFI_IF_AP ? "AP" : "STA", self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3],
              self.bytes[4], self.bytes[5]);
@@ -1470,6 +1507,7 @@ void EspNowTransport::handlePeerEvent(PeerEvent event, const PeerInfo& peer) {
     // Runs in the NowTP task with the lock held.
     if (follower_) follower_->onPeerEvent(event, peer, nowMs());
     if (kTimeSync && timeSync_) timeSync_->onPeerEvent(event, peer, nowMs());
+    if (kTimeSync && timeCarrier_ && timeAttached_) timeCarrier_->peerEvent(event, peer);
     // Check new peers hear us; failures feed the one-way detection and fallback.
     if (event == PeerEvent::Found) monitor_->found(peer.mac, nowMs());
     // Its slot in ESP-NOW's peer table, if we added it, goes back to the pool.
@@ -1844,20 +1882,75 @@ Status EspNowTransport::pair(uint32_t timeoutMs, Mac* member) {
 // ---------------------------------------------------------------------------
 // Network time
 
+Status EspNowTransport::serveTimeSync(TimeSync* core, std::function<void()> wake) {
+    if (!kTimeSync || started_) return Status::InvalidState;
+    if (!core) {
+        externalTime_ = nullptr;
+        return Status::Ok;
+    }
+    if (!timeCarrier_) {
+        timeCarrier_ = Service<EngineTimeCarrier>(new EngineTimeCarrier(), destroyService<EngineTimeCarrier>);
+        timeGuard_.reset(new TimeGuard(*this));
+    }
+    if (!timeCarrier_->setQueued(std::move(wake))) return Status::NoMemory;
+    timeCarrier_->setGuard(timeGuard_.get());
+    timeCarrier_->setClock([] { return nowMs(); });
+    timeCarrier_->setDeviceIds(true);
+    Status st = core->addCarrier(*timeCarrier_);
+    if (st != Status::Ok) return st;
+    externalTime_ = core;
+    return Status::Ok;
+}
+
+// The engine is about to go: the carrier lets go of it, once no call from
+// the TimeSync's task is under way. Its offers go with its next poll().
+void EspNowTransport::detachTimeCarrier() {
+    if (!kTimeSync || !timeAttached_.exchange(false)) return;
+    while (timeUsers_.load() != 0) vTaskDelay(1);
+    lock();
+    timeCarrier_->attach(nullptr, nullptr);
+    timeCarrier_->setDiscovery(nullptr);
+    unlock();
+}
+
+Mac EspNowTransport::announcedDeviceId() const {
+    if (interface_ == WIFI_IF_STA) return Mac();
+    Mac sta;
+    if (esp_wifi_get_mac(WIFI_IF_STA, sta.bytes) != ESP_OK) {
+        // Not readable in this mode: the soft-AP's MAC is the station's + 1.
+        sta = localMac();
+        for (int i = 5; i >= 0 && sta.bytes[i]-- == 0; --i) {
+        }
+    }
+    return sta == localMac() ? Mac() : sta;
+}
+
 uint64_t EspNowTransport::networkTimeUs() const {
     uint64_t local = static_cast<uint64_t>(esp_timer_get_time());
+    if (kTimeSync && externalTime_) return externalTime_->toNetwork(local);
     if (!started_ || !kTimeSync || !timeSync_) return local;
     Locked locked(*this, false);
     return timeSync_->toNetwork(local);
 }
 
 int64_t EspNowTransport::localTimeUs(uint64_t networkUs) const {
+    if (kTimeSync && externalTime_) return static_cast<int64_t>(externalTime_->toLocal(networkUs));
     if (!started_ || !kTimeSync || !timeSync_) return static_cast<int64_t>(networkUs);
     Locked locked(*this, false);
     return static_cast<int64_t>(timeSync_->toLocal(networkUs));
 }
 
 TimeSyncStatus EspNowTransport::timeSyncStatus() const {
+    if (kTimeSync && externalTime_) {
+        // What any task may read; the rest is core's (its status()).
+        TimeSyncStatus s;
+        s.role = externalTime_->role();
+        s.synced = externalTime_->synced();
+        s.isReference = externalTime_->isReference();
+        uint64_t local = static_cast<uint64_t>(esp_timer_get_time());
+        s.offsetUs = static_cast<int64_t>(externalTime_->toNetwork(local) - local);
+        return s;
+    }
     if (!started_ || !kTimeSync || !timeSync_) {
         TimeSyncStatus s;
         s.role = !config_.enableTimeSync     ? TimeRole::Off
@@ -1870,7 +1963,7 @@ TimeSyncStatus EspNowTransport::timeSyncStatus() const {
 }
 
 Status EspNowTransport::setTimeRole(TimeRole role) {
-    if (!kTimeSync || !config_.enableTimeSync) return Status::InvalidState;
+    if (!kTimeSync || !config_.enableTimeSync || externalTime_) return Status::InvalidState;
     if (!started_) {
         config_.timeSync.role = role;
         config_.timeSync.reference = false;
@@ -1898,7 +1991,7 @@ Status EspNowTransport::clearTimeReference() {
 }
 
 Status EspNowTransport::setTimeSyncInterval(uint32_t ms) {
-    if (!kTimeSync || !config_.enableTimeSync) return Status::InvalidState;
+    if (!kTimeSync || !config_.enableTimeSync || externalTime_) return Status::InvalidState;
     if (!started_) {
         config_.timeSync.intervalMs = ms;
         return Status::Ok;
