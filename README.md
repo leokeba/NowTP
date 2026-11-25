@@ -244,6 +244,10 @@ ESP-NOW only reaches nodes on the same channel. A node connected to an access po
 - **Noticing changes.** NowTP notices its own channel changing, for example when the access point decides, and tells the application through `onChannelChange()`.
 - **Roaming.** A station that roams, or follows its access point to another channel, can't warn the nodes it leaves: by the time NowTP learns of it, the station has left. So NowTP tells peers what it can at once. When the station disconnects, NowTP announces on the old channel that the node is no longer an anchor, and followers start searching after `channel.searchAfterMs`, without first waiting `discovery.peerTimeoutMs` to lose it. When the station connects on the new channel, NowTP announces the node there right away, where searching followers find it. An application that knows where its station is going should call `announceChannelChange(ch)` first, so that followers move at once.
 - **What doesn't trigger a search.** Networks without anchors never search on their own: losing a peer that is just switched off doesn't make the others wander. `searchChannels()` starts a search by hand. `channel.follow = false` turns following off.
+- **Busiest channel.** By default a search stops on the first channel where an anchor answers, so a stray anchor on a low channel (a board running its own soft-AP, on channel 1 by default) can capture it. With `channel.pick = ChannelPick::Busiest`, a search *sweeps*: it listens on every channel, then settles on the one where the most nodes answered (ties: more anchors, then the current channel, then `channel.preferred`, then the lowest). A node that settled where no anchor answered stays as long as it hears any node there. With `channel.findAnchor`, it also sweeps right after boot, unless `channel.preferred` is set.
+- **Preferred channel.** `channel.preferred` (0: none) is where a node starts, and the first channel a search tries. An application can save the channel from `onChannelChange()` and pass it in after a restart. With `findAnchor`, a node that hears what it looks for there (an anchor, or with Busiest any node) stays without searching.
+- **Sweeps on demand.** `sweepChannels()` starts a sweep and returns at once; `sweepingChannels()` is true while it runs (`channel.dwellMs` per channel, about 3.3 s for channels 1–13, during which the node may miss frames on its own channel). `channelSweep()` returns a copy of what the last sweep heard, filling while it runs: each node's MAC, name, RSSI, channel and whether it is an anchor (at most 32 nodes), with a sequence number, `running`/`complete` flags and the channel it settled on. `ChannelSweep::count(ch)` counts the nodes on a channel. The report takes 1.3 KB, allocated at the first sweep (at construction with Busiest) and kept.
+- **Pinning.** `pinChannel(ch)` moves to `ch` without telling peers and stays there: no following, no searching. `sweepChannels()` still works and comes back to the pinned channel. `followChannels()` follows and searches as configured again; `pinnedChannel()` is 0 meanwhile.
 
 ### Security and pairing
 
@@ -454,6 +458,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 | `enableDiscovery`, `discovery`, `negotiateFrameSize` | false, –, true | Discovery (see above) |
 | `channel.follow`, `channel.findAnchor`, `channel.anchor` | true, false, false | Channel following (see above) |
 | `channel.searchAfterMs`, `channel.dwellMs`, `channel.retryMs`, `channel.channels` | 2000, 250, 15000, 1–13 | Channel search timing |
+| `channel.pick`, `channel.preferred` | `First`, 0 | Where a search settles, and the channel to start on and try first (see above) |
 | `security.key`, `security.requireAuthentication`, `security.pairingCode`, `persistSecurityKey` | none, true, "", true | Security (see above) |
 | `enableTimeSync`, `timeSync.role`, `timeSync.intervalMs`, `timeSync.takeoverAfterMs`, `timeSync.calibrationIntervalMs` | true, Follow, 5000, 5000, 10000 | Network time (see above) |
 | `enableStreams` | true | Streams (see above) |
@@ -533,7 +538,7 @@ The tests use a simulated network with configurable loss in three places: on air
 - **Crypto.** Test vectors from the RFCs.
 - **Security.** Tampering, replays across reboots, and forged acks.
 - **Pairing.** Both sides run in their own threads, scheduled deterministically.
-- **Channels.** Following moves, and searching for a roaming anchor.
+- **Channels.** Following moves, searching for a roaming anchor, sweeps that pick the busiest channel, a preferred channel, and pinning.
 - **Network time.** Accuracy and drift.
 - **Streams.** Transfers under loss.
 - **Short heaps.** The engine, security and discovery run at every heap size from 0 to 24 KB above what they hold, in 512-byte steps. [test/heap_limit.h](test/heap_limit.h) gives the tests a heap with a size: past it, `operator new` aborts, as it does on ESP-IDF, and NowTP's `malloc()` returns null. The tests then check that traffic recovers and that no memory is left behind. `NOWTP_HEAP_SWEEP=1 ./build/nowtp_tests [filter]` runs every test at several heap sizes and prints each place where NowTP's `operator new` would have aborted.

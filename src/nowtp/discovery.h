@@ -126,6 +126,12 @@ public:
 
     /// A copy of the peers tracked.
     std::vector<PeerInfo> peers() const;
+    /// Calls `f(const PeerInfo&)` for each peer tracked, without copying. `f`
+    /// must not change discovery.
+    template <typename F>
+    void forEachPeer(F f) const {
+        for (size_t i = 0; i < peers_.size(); ++i) f(peers_[i]);
+    }
     const PeerInfo* find(const Mac& mac) const;
     /// The peer whose device id is `id` (see PeerInfo::deviceId).
     const PeerInfo* findDevice(const Mac& id) const;

@@ -3417,6 +3417,165 @@ TEST(channel_follower_pauses_while_suspended) {
     (void)master;
 }
 
+TEST(channel_busiest_sweeps_at_boot_and_settles_where_most_nodes_are) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    // A stray anchor on channel 1, where the node starts, and three nodes
+    // without anchors on channel 6.
+    size_t stray = rig.add(1, true);
+    size_t a = rig.add(6, false), b = rig.add(6, false), c = rig.add(6, false);
+    size_t node = rig.add(1, false, cc);
+    rig.start();
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->sweeping(); }, 100));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 6);
+    CHECK_EQ(rig.moves[node], 1);
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK_EQ(s.sequence, 1u);
+    CHECK(s.complete && !s.running);
+    CHECK_EQ(s.channel, 6);
+    CHECK_EQ(s.count(6), 3u);
+    CHECK_EQ(s.count(6, true), 0u);
+    CHECK_EQ(s.count(1), 1u);
+    CHECK_EQ(s.count(1, true), 1u);
+    CHECK_EQ(s.nodes.size(), 4u);
+    bool named = false;
+    for (const SweptNode& n : s.nodes) {
+        if (n.mac == rig.net.mac(stray)) named = std::string(n.name) == "n" + std::to_string(stray) && n.anchor;
+    }
+    CHECK(named);
+    // No anchor here, but nodes: it stays, and doesn't sweep again.
+    rig.net.run(40000);
+    CHECK_EQ(rig.chan(node), 6);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 1u);
+    CHECK(rig.disc[a]->find(rig.net.mac(node)) != nullptr);
+    // Once they all go, it looks again.
+    rig.net.node(a).online = rig.net.node(b).online = rig.net.node(c).online = false;
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->lastSweep().sequence == 2; }, 20000));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 1);  // where the stray is
+}
+
+TEST(channel_busiest_prefers_anchors_then_the_current_channel) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.pick = ChannelPick::Busiest;
+    rig.add(3, true);
+    size_t free8 = rig.add(8, false);
+    rig.add(8, true);
+    rig.add(10, false);
+    rig.add(10, false);
+    size_t node = rig.add(10, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    // 10 and 8 tie on nodes (2 each, not counting us); 8 has an anchor.
+    CHECK(rig.fol[node]->search(rig.net.now()) == Status::Ok);
+    CHECK(rig.fol[node]->sweeping());
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 8);
+    CHECK_EQ(rig.fol[node]->lastSweep().count(8), 2u);
+    // Now 8 and 10 tie on nodes, and 8 and 3 on anchors: stay.
+    rig.net.node(free8).online = false;
+    rig.net.run(3000);
+    size_t late = rig.add(3, false);
+    rig.disc[late]->start(rig.net.now());
+    rig.fol[late]->start(rig.net.now());
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.fol[node]->lastSweep().count(3), 2u);
+    CHECK_EQ(rig.fol[node]->lastSweep().count(8), 1u);
+    CHECK_EQ(rig.chan(node), 3);
+}
+
+TEST(channel_preferred_channel_is_kept_when_nodes_answer) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    cc.preferred = 6;
+    rig.add(1, true);
+    rig.add(6, false);
+    size_t node = rig.add(1, false, cc);
+    rig.start();
+    CHECK_EQ(rig.chan(node), 6);
+    rig.net.run(30000);
+    CHECK_EQ(rig.chan(node), 6);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);
+}
+
+TEST(channel_preferred_channel_searched_first) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.preferred = 9;
+    size_t low = rig.add(2, true), master = rig.add(9, true);
+    size_t node = rig.add(9, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    // The master moves to 4, the node follows, then the master goes back
+    // silently: the search tries channel 9 first, before the anchor on 2.
+    CHECK(rig.disc[master]->announceMove(4, rig.net.now()));
+    rig.net.run(20);
+    rig.net.node(master).radio.chan = 4;
+    rig.fol[master]->onChannelChanged(4, rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.chan(node) == 4; }, 1000));
+    rig.net.run(1000);
+    rig.net.node(master).radio.chan = 9;
+    rig.fol[master]->onChannelChanged(9, rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->searching(); }, 10000));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 9);
+    (void)low;
+}
+
+TEST(channel_pinned_node_neither_follows_nor_searches) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), node = rig.add(1, false);
+    rig.add(9, false);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->pin(4, rig.net.now()) == Status::Ok);
+    CHECK_EQ(rig.chan(node), 4);
+    CHECK_EQ(rig.fol[node]->pinned(), 4);
+    rig.net.run(20000);  // no anchor here: it would search
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.chan(node), 4);
+    // A sweep comes back to the pinned channel.
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 4);
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK(s.complete);
+    CHECK_EQ(s.channel, 4);
+    CHECK_EQ(s.count(1, true), 1u);
+    CHECK_EQ(s.count(9), 1u);
+    CHECK_EQ(rig.moves[node], 0);
+    // Pinned on the master's channel, it ignores its moves.
+    CHECK(rig.fol[node]->pin(1, rig.net.now()) == Status::Ok);
+    rig.net.run(1000);
+    CHECK(rig.disc[master]->announceMove(6, rig.net.now()));
+    rig.net.run(20);
+    rig.net.node(master).radio.chan = 6;
+    rig.fol[master]->onChannelChanged(6, rig.net.now());
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 1);
+    // Following again, it searches and finds the master.
+    rig.fol[node]->unpin(rig.net.now());
+    CHECK_EQ(rig.fol[node]->pinned(), 0);
+    CHECK(rig.net.runUntil([&] { return rig.chan(node) == 6 && !rig.fol[node]->searching(); }, 20000));
+}
+
+TEST(channel_sweep_fails_where_an_access_point_fixes_the_channel) {
+    FollowRig rig;
+    size_t node = rig.add(1, true);
+    rig.start();
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::InvalidState);
+    CHECK(rig.fol[node]->pin(3, rig.net.now()) == Status::InvalidState);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);
+}
+
 TEST(discovery_reads_announcements_without_extension) {
     // A NowTP 0.4 announcement: no channel extension.
     std::vector<uint8_t> p = {1, 0, 0xFA, 0, 3, 'a', 'b', 'c', 1, 9};

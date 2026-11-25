@@ -1821,6 +1821,65 @@ Status EspNowTransport::searchChannels() {
     return follower_->search(nowMs());
 }
 
+Status EspNowTransport::sweepChannels() {
+    if (!started_ || !follower_) return Status::InvalidState;
+    Locked locked(*this);
+    return follower_->sweep(nowMs());
+}
+
+bool EspNowTransport::searchingChannels() const {
+    if (!started_ || !follower_) return false;
+    Locked locked(*this, false);
+    return follower_->searching();
+}
+
+bool EspNowTransport::sweepingChannels() const {
+    if (!started_ || !follower_) return false;
+    Locked locked(*this, false);
+    return follower_->sweeping();
+}
+
+ChannelSweep EspNowTransport::channelSweep() const {
+    ChannelSweep out;
+    if (!started_ || !follower_) return out;
+    Locked locked(*this, false);
+    const ChannelSweep& last = follower_->lastSweep();
+    if (heap::fits(last.nodes.size() * sizeof(SweptNode))) {
+        out = last;
+    } else {
+        out.sequence = last.sequence;
+        out.startedMs = last.startedMs;
+        out.finishedMs = last.finishedMs;
+        out.running = last.running;
+        out.complete = last.complete;
+        out.channel = last.channel;
+    }
+    return out;
+}
+
+Status EspNowTransport::pinChannel(uint8_t ch) {
+    if (!started_ || !follower_) return Status::InvalidState;
+    if (ch > 14) return Status::InvalidArgument;
+    Locked locked(*this);
+    uint32_t now = nowMs();
+    Status st = follower_->pin(ch, now);
+    if (st == Status::Ok) discovery_->setChannelInfo(radio_.channel, config_.channel.anchor || channelFixed(), now);
+    return st;
+}
+
+Status EspNowTransport::followChannels() {
+    if (!started_ || !follower_) return Status::InvalidState;
+    Locked locked(*this);
+    follower_->unpin(nowMs());
+    return Status::Ok;
+}
+
+uint8_t EspNowTransport::pinnedChannel() const {
+    if (!started_ || !follower_) return 0;
+    Locked locked(*this, false);
+    return follower_->pinned();
+}
+
 void EspNowTransport::onChannelChange(std::function<void(uint8_t channel)> handler) {
     if (started_) lock();
     channelHandler_.set(std::move(handler));

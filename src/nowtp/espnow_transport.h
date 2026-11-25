@@ -298,8 +298,31 @@ public:
     /// starting a soft-AP there. Peers that follow move at once. Without it,
     /// they learn of a roam only once the station has left (see ChannelConfig).
     Status announceChannelChange(uint8_t channel);
-    /// Searches the other channels for peers now (normally automatic).
+    /// Searches the other channels for peers now (normally automatic; see
+    /// ChannelConfig::pick). Returns at once.
     Status searchChannels();
+    /// Listens on every channel in turn (channel.dwellMs each: about 3.3 s for
+    /// 1-13), recording the nodes that answer, then settles on the busiest
+    /// channel, or comes back to the pinned one. Returns at once; frames on
+    /// our own channel may be missed meanwhile. Fails with InvalidState when
+    /// an access point fixes our channel or discovery is off, NoMemory if the
+    /// report (1.3 KB, kept) can't be allocated.
+    Status sweepChannels();
+    /// A search or sweep is running.
+    bool searchingChannels() const;
+    bool sweepingChannels() const;
+    /// A copy of what the last sweep heard (see ChannelSweep): the one running,
+    /// filling as it goes, else the last one. Without nodes if the heap is short.
+    ChannelSweep channelSweep() const;
+    /// Moves to `channel` without telling peers, and stays there: no following
+    /// and no searching until followChannels(). sweepChannels() comes back to
+    /// it. Fails with InvalidState when an access point fixes our channel or
+    /// discovery is off.
+    Status pinChannel(uint8_t channel);
+    /// Follows and searches again as configured (EspNowConfig::channel).
+    Status followChannels();
+    /// The pinned channel; 0 when following.
+    uint8_t pinnedChannel() const;
     /// Called in the NowTP task whenever our channel changed: we followed a
     /// peer, or the access point we depend on moved.
     void onChannelChange(std::function<void(uint8_t channel)> handler);

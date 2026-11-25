@@ -9,6 +9,18 @@
 
 namespace nowtp {
 
+/// How a search picks the channel to settle on.
+enum class ChannelPick : uint8_t {
+    /// Stop on the first channel where an anchor answers (any node, for
+    /// ChannelFollower::search()).
+    First,
+    /// Listen on every channel, then settle on the one where the most nodes
+    /// answered. Ties go to the channel with more anchors, then the current
+    /// channel, then `ChannelConfig::preferred`, then the lowest. A node that
+    /// settled where no anchor answered stays while it hears any node there.
+    Busiest,
+};
+
 struct ChannelConfig {
     /// Follow peers that announce a move to another channel, and search the
     /// other channels when every anchor peer has gone silent. An anchor is a
@@ -32,6 +44,43 @@ struct ChannelConfig {
     uint32_t retryMs = 15000;
     /// Channels to search; empty searches 1-13.
     std::vector<uint8_t> channels;
+    /// How a search picks its channel. Busiest also sweeps every channel at
+    /// start() when findAnchor is set and `preferred` is 0.
+    ChannelPick pick = ChannelPick::First;
+    /// Channel to start on and to search first (0: none), e.g. the last one
+    /// used, saved by the application. With findAnchor, a node that hears what
+    /// it looks for there (an anchor, or with Busiest any node) stays without
+    /// searching.
+    uint8_t preferred = 0;
+};
+
+/// A node heard during a sweep (see ChannelSweep).
+struct SweptNode {
+    Mac mac;
+    /// The channel it states; the one it was heard on if it does not say.
+    uint8_t channel;
+    bool anchor;
+    int8_t rssi;  ///< dBm, preferably as heard on its own channel.
+    char name[Discovery::kMaxName + 1];  ///< Null-terminated.
+};
+
+/// What the last sweep heard on each channel. A sweep listens on every
+/// channel: search() with ChannelPick::Busiest, sweep(), and the boot sweep.
+/// It sees at most DiscoveryConfig::maxPeers nodes at once (lost ones make
+/// room after 1.5 announcement intervals) and keeps kMaxNodes.
+struct ChannelSweep {
+    static constexpr size_t kMaxNodes = 32;
+    uint32_t sequence = 0;    ///< Sweeps begun so far; 0: none yet.
+    uint32_t startedMs = 0;
+    uint32_t finishedMs = 0;  ///< When it ended (0 while running).
+    bool running = false;     ///< `nodes` fills as it goes.
+    bool complete = false;    ///< Every channel was visited (false: interrupted).
+    /// The channel it settled on or returned to; 0 while running or if interrupted.
+    uint8_t channel = 0;
+    std::vector<SweptNode> nodes;
+
+    /// Nodes heard on `channel` (only anchors, with `anchorsOnly`).
+    size_t count(uint8_t channel, bool anchorsOnly = false) const;
 };
 
 /// Keeps a node on the same channel as its peers.
@@ -71,10 +120,27 @@ public:
     /// Our channel changed outside the follower (a roaming station, the application).
     void onChannelChanged(uint8_t channel, uint32_t nowMs);
 
-    /// Searches the channels now for any peer. Fails with InvalidState when an
-    /// access point fixes our channel.
+    /// Searches the channels now for any peer (see ChannelConfig::pick). Fails
+    /// with InvalidState when an access point fixes our channel.
     Status search(uint32_t nowMs);
+    /// Listens on every channel, recording what answers (see lastSweep()), then
+    /// settles on the busiest channel (ChannelPick::Busiest), or returns to
+    /// the pinned one. Fails with InvalidState when an access point fixes our
+    /// channel, with NoMemory if the report can't be allocated.
+    Status sweep(uint32_t nowMs);
     bool searching() const { return searching_; }
+    /// A search that visits every channel is running.
+    bool sweeping() const { return searching_ && full_; }
+    const ChannelSweep& lastSweep() const { return sweep_; }
+
+    /// Moves to `channel` (quietly: peers are not told) and stays there:
+    /// no following, no searching, until unpin(). sweep() still works and
+    /// comes back. 0 unpins. Fails with InvalidState when an access point
+    /// fixes our channel.
+    Status pin(uint8_t channel, uint32_t nowMs);
+    void unpin(uint32_t nowMs);
+    /// The pinned channel; 0 when following.
+    uint8_t pinned() const { return pinned_; }
 
     /// Called after the follower moved the radio to another channel.
     void onChannelChange(ChannelHandler handler) { handler_.set(std::move(handler)); }
@@ -87,10 +153,17 @@ private:
 
     bool free() const;
     bool anchorPresent() const;
+    bool nodeHere() const;
+    bool settled() const;
+    bool reserveSweep();
     void track(const PeerInfo& peer);
-    void beginSearch(bool anyPeer, uint32_t now);
+    void beginSearch(bool anyPeer, bool full, uint32_t now);
     void step(uint32_t now);
+    void record(uint8_t channel, uint32_t since);
+    uint8_t busiest() const;
     void endSearch(bool found, uint32_t now);
+    void endSweep(uint32_t now);
+    void abortSweep();
     void moveTo(uint8_t channel, uint32_t now);
 
     Discovery& discovery_;
@@ -105,8 +178,14 @@ private:
     uint32_t okSince_ = 0;  // last time an anchor was present (or none was needed)
     uint32_t nextSearchAt_ = 0;
 
+    uint8_t pinned_ = 0;
+    bool sweepDue_ = false;  // the boot sweep
+
     bool searching_ = false;
     bool searchAny_ = false;
+    bool full_ = false;  // a sweep: every channel, recorded
+    uint32_t stepStart_ = 0;
+    ChannelSweep sweep_;
     std::vector<uint8_t> plan_;
     size_t step_ = 0;
     uint32_t stepEnd_ = 0;
