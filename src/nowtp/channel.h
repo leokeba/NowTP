@@ -26,6 +26,14 @@ struct ChannelConfig {
     /// other channels when every anchor peer has gone silent. An anchor is a
     /// node whose channel is fixed: by the access point its station is
     /// connected to, by its own soft-AP, or by `anchor` below.
+    ///
+    /// Who is followed: the leader, if the application set one
+    /// (ChannelFollower::setLeader()), and no one else. Otherwise, with
+    /// ChannelPick::First, an anchor that announces a move from our channel,
+    /// or states another channel (heard from an adjacent one); until an anchor
+    /// is known, any peer's move. With ChannelPick::Busiest, only the last
+    /// node on our channel, when it announces a move: nodes heard from other
+    /// channels never move it, sweeps decide.
     bool follow = true;
     /// Also search when no anchor has been seen at all yet: for nodes that
     /// must find a master whose access point may be on any channel, e.g.
@@ -87,8 +95,9 @@ struct ChannelSweep {
 ///
 /// A node that is free to choose its channel (no access point fixes it)
 /// follows the others: it switches when a peer announces a move
-/// (Discovery::announceMove()), and when every anchor it knew has gone silent,
-/// for example because the master's station roamed to an access point on
+/// (Discovery::announceMove(); ChannelConfig::follow says whose), and when
+/// every anchor it knew has gone silent, for example because the master's
+/// station roamed to an access point on
 /// another channel, it searches the other channels with discovery queries
 /// until an anchor answers. A search makes the node deaf on its own channel
 /// for up to dwellMs per channel.
@@ -142,21 +151,31 @@ public:
     /// The pinned channel; 0 when following.
     uint8_t pinned() const { return pinned_; }
 
+    /// Follows `peer` (its MAC or device id), e.g. the node the user is
+    /// interacting with, and no one else: its announced moves, and the channel
+    /// it states, from now on (at the next tick() if it states another one
+    /// already). It keeps us where it is (no search while it answers), and a
+    /// sweep that hears it settles on its channel. Pinning still wins.
+    void setLeader(const Mac& peer, uint32_t nowMs);
+    /// Follows as ChannelConfig::follow says again.
+    void clearLeader();
+    /// The leader, if `hasLeader()`.
+    const Mac& leader() const { return leader_; }
+    bool hasLeader() const { return hasLeader_; }
+
     /// Called after the follower moved the radio to another channel.
     void onChannelChange(ChannelHandler handler) { handler_.set(std::move(handler)); }
 
 private:
-    struct Tracked {
-        Mac mac;
-        bool anchor;
-    };
-
     bool free() const;
+    bool here(const PeerInfo& peer) const;
+    bool leads(const PeerInfo& peer) const;
+    const PeerInfo* findLeader() const;
     bool anchorPresent() const;
     bool nodeHere() const;
     bool settled() const;
     bool reserveSweep();
-    void track(const PeerInfo& peer);
+    void joinLeader(uint32_t now);
     void beginSearch(bool anyPeer, bool full, uint32_t now);
     void step(uint32_t now);
     void record(uint8_t channel, uint32_t since);
@@ -164,14 +183,12 @@ private:
     void endSearch(bool found, uint32_t now);
     void endSweep(uint32_t now);
     void abortSweep();
-    void moveTo(uint8_t channel, uint32_t now);
+    bool moveTo(uint8_t channel, uint32_t now);
 
     Discovery& discovery_;
     RadioControl& radio_;
     ChannelConfig config_;
     Callback<void(uint8_t)> handler_;
-    static constexpr size_t kMaxAnchors = 8;  // anchors tracked
-    std::vector<Tracked> peers_;  // anchors heard
     bool running_ = false;
     bool suspended_ = false;
     bool hadAnchor_ = false;
@@ -179,6 +196,10 @@ private:
     uint32_t nextSearchAt_ = 0;
 
     uint8_t pinned_ = 0;
+    bool hasLeader_ = false;
+    Mac leader_ = Mac();
+    bool joinDue_ = false;  // go where the leader is, at the next tick()
+    uint32_t joinAt_ = 0;
     bool sweepDue_ = false;  // the boot sweep
 
     bool searching_ = false;

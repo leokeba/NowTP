@@ -323,6 +323,17 @@ public:
     Status followChannels();
     /// The pinned channel; 0 when following.
     uint8_t pinnedChannel() const;
+    /// Follows `peer` (its MAC or device id) from channel to channel, and no
+    /// one else: e.g. the node the user is interacting with. Its announced
+    /// moves are followed, and the channel it states, at once if it already
+    /// states another one; other peers' moves are ignored. While it answers we
+    /// don't search, and a sweep that hears it settles on its channel. A
+    /// pinned channel still wins. Fails with InvalidState when discovery is off.
+    Status followPeer(const Mac& peer);
+    /// Stops following one peer: back to EspNowConfig::channel's rules.
+    Status unfollowPeer();
+    /// The peer followed (followPeer()); all zeros when none.
+    Mac followedPeer() const;
     /// Called in the NowTP task whenever our channel changed: we followed a
     /// peer, or the access point we depend on moved.
     void onChannelChange(std::function<void(uint8_t channel)> handler);

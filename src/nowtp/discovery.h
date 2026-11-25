@@ -56,7 +56,9 @@ enum class PeerEvent : uint8_t {
 };
 
 using PeerHandler = std::function<void(PeerEvent, const PeerInfo&)>;
-/// A peer announced that it is moving to another channel.
+/// A peer announced that it is moving to `channel`. Called after its Lost
+/// event, with the peer as it was before: `PeerInfo::channel` and
+/// `otherChannel` say where it left from.
 using MoveHandler = std::function<void(const PeerInfo&, uint8_t channel)>;
 
 struct DiscoveryConfig {
@@ -114,6 +116,10 @@ public:
     void setMetadata(const uint8_t* data, size_t len, uint32_t nowMs);
     /// What this node announces about its radio; announced right away when it changes.
     void setChannelInfo(uint8_t channel, bool anchor, uint32_t nowMs);
+    /// We switched to `channel` ourselves (ChannelFollower): announces it at
+    /// once, asking who is there, rather than the channel we left until the
+    /// owner's next setChannelInfo(). The anchor flag stays as it was.
+    void arrived(uint8_t channel, uint32_t nowMs);
     void setTimeReference(bool reference, uint32_t nowMs);
     /// What this node announces about network time (see TimeSync), with the
     /// next announcement.

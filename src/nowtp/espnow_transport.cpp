@@ -1880,6 +1880,26 @@ uint8_t EspNowTransport::pinnedChannel() const {
     return follower_->pinned();
 }
 
+Status EspNowTransport::followPeer(const Mac& peer) {
+    if (!started_ || !follower_) return Status::InvalidState;
+    Locked locked(*this);
+    follower_->setLeader(peer, nowMs());
+    return Status::Ok;
+}
+
+Status EspNowTransport::unfollowPeer() {
+    if (!started_ || !follower_) return Status::InvalidState;
+    Locked locked(*this);
+    follower_->clearLeader();
+    return Status::Ok;
+}
+
+Mac EspNowTransport::followedPeer() const {
+    if (!started_ || !follower_) return Mac();
+    Locked locked(*this, false);
+    return follower_->hasLeader() ? follower_->leader() : Mac();
+}
+
 void EspNowTransport::onChannelChange(std::function<void(uint8_t channel)> handler) {
     if (started_) lock();
     channelHandler_.set(std::move(handler));

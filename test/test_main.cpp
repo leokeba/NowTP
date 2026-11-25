@@ -3250,6 +3250,25 @@ struct FollowRig {
         }
     }
     uint8_t chan(size_t i) { return net.node(i).radio.chan; }
+    // Delivers `from`'s last frame (an announcement, or a goodbye after
+    // announceMove()) to `to` by hand: adjacent-channel leakage, which the
+    // simulation doesn't model (it only connects equal channels).
+    void leak(size_t from, size_t to) {
+        for (size_t i = net.log.size(); i-- > 0;) {
+            if (net.log[i].from != from) continue;
+            net.inject(to, net.mac(from), net.log[i].data);
+            return;
+        }
+        CHECK(false);
+    }
+    // A node with a locked channel that announces a move, then makes it.
+    void relocate(size_t i, uint8_t channel) {
+        CHECK(disc[i]->announceMove(channel, net.now()));
+        net.run(20);  // the notices go out on the old channel
+        net.node(i).radio.chan = channel;
+        disc[i]->setChannelInfo(channel, true, net.now());  // as the transport does, before telling the follower
+        fol[i]->onChannelChanged(channel, net.now());
+    }
 };
 
 }  // namespace
@@ -3574,6 +3593,187 @@ TEST(channel_sweep_fails_where_an_access_point_fixes_the_channel) {
     CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::InvalidState);
     CHECK(rig.fol[node]->pin(3, rig.net.now()) == Status::InvalidState);
     CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);
+}
+
+// Anchors of other installations on neighbouring channels, heard faintly,
+// must not toss a node around (seen on a remote in a house with anchors on
+// 8, 9, 10 and 11): only a sweep decides where a Busiest node goes.
+TEST(channel_busiest_ignores_nodes_heard_from_other_channels) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    cc.preferred = 8;
+    size_t home = rig.add(8, true);
+    size_t nine = rig.add(9, true), ten = rig.add(10, true), drifter = rig.add(9, false);
+    size_t node = rig.add(8, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.disc[node]->find(rig.net.mac(home)) != nullptr);
+    for (int round = 0; round < 10; ++round) {
+        rig.leak(nine, node);
+        rig.leak(ten, node);
+        rig.leak(drifter, node);
+        rig.net.run(1000);
+    }
+    const PeerInfo* faint = rig.disc[node]->find(rig.net.mac(ten));
+    CHECK(faint != nullptr && faint->channel == 10 && faint->anchor);
+    // Their moves aren't ours to follow either: they weren't on our channel.
+    rig.leak(nine, node);
+    rig.leak(drifter, node);
+    CHECK(rig.disc[nine]->announceMove(8, rig.net.now()));
+    CHECK(rig.disc[drifter]->announceMove(3, rig.net.now()));
+    rig.net.run(20);
+    rig.leak(nine, node);
+    rig.leak(drifter, node);
+    rig.net.run(5000);
+    CHECK_EQ(rig.chan(node), 8);
+    CHECK_EQ(rig.moves[node], 0);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);  // settled with the anchor here
+}
+
+// A First node that knows no anchor follows any peer's move, but only from
+// its own channel: Discovery tells the move handler where the mover was.
+TEST(channel_moves_heard_from_other_channels_are_ignored) {
+    FollowRig rig;
+    size_t stray = rig.add(6, false), neighbour = rig.add(5, false), node = rig.add(5, false);
+    std::vector<uint8_t> movedFrom;
+    rig.disc[node]->onPeerMoved([&](const PeerInfo& p, uint8_t ch) {
+        movedFrom.push_back(p.channel);
+        rig.fol[node]->onPeerMoved(p, ch, rig.net.now());
+    });
+    rig.start();
+    rig.net.run(1000);
+    rig.leak(stray, node);
+    CHECK(rig.disc[stray]->announceMove(9, rig.net.now()));
+    rig.net.run(20);
+    rig.leak(stray, node);
+    rig.net.run(100);
+    CHECK_EQ(movedFrom.size(), 1u);
+    CHECK_EQ(movedFrom[0], 6);
+    CHECK_EQ(rig.chan(node), 5);
+    // One from our channel is followed.
+    CHECK(rig.disc[neighbour]->announceMove(9, rig.net.now()));
+    rig.net.run(20);
+    CHECK_EQ(movedFrom.size(), 2u);
+    CHECK_EQ(movedFrom[1], 5);
+    CHECK_EQ(rig.chan(node), 9);
+}
+
+// Without a leader, a Busiest node follows a move only when the mover was
+// the last node on its channel.
+TEST(channel_busiest_follows_the_last_node_here) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    cc.preferred = 6;
+    size_t a = rig.add(6, true), b = rig.add(6, true), node = rig.add(6, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    rig.relocate(a, 3);
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 6);  // b is still here
+    CHECK_EQ(rig.moves[node], 0);
+    rig.relocate(b, 11);
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 11);
+    CHECK_EQ(rig.moves[node], 1);
+    CHECK(rig.disc[node]->find(rig.net.mac(b)) != nullptr);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);
+}
+
+// The leader set by the application, and only it, is followed: its moves
+// from anywhere, the channel it states, and sweeps go where it is.
+TEST(channel_leader_alone_is_followed) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    cc.preferred = 6;
+    size_t lead = rig.add(6, true), other = rig.add(6, true), node = rig.add(6, false, cc);
+    size_t crowd1 = rig.add(2, false), crowd2 = rig.add(2, false), crowd3 = rig.add(2, false);
+    (void)crowd1, (void)crowd2, (void)crowd3;
+    rig.start();
+    rig.net.run(1000);
+    rig.fol[node]->setLeader(rig.net.mac(lead), rig.net.now());
+    CHECK(rig.fol[node]->hasLeader());
+    rig.net.run(100);
+    CHECK_EQ(rig.chan(node), 6);  // it's here: nothing to do
+
+    // The leader moves while another node stays: followed.
+    rig.relocate(lead, 9);
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 9);
+    CHECK_EQ(rig.moves[node], 1);
+
+    // The leader goes silent; the last other node here leaves: not followed.
+    rig.relocate(other, 9);
+    rig.net.run(1000);
+    rig.net.node(lead).online = false;
+    rig.relocate(other, 4);
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 9);
+    rig.net.node(lead).online = true;
+    rig.net.run(1000);
+
+    // The leader turns up on another channel without notice, heard faintly:
+    // the channel it states is followed.
+    rig.net.node(lead).radio.chan = 10;
+    rig.fol[lead]->onChannelChanged(10, rig.net.now());
+    rig.net.run(600);
+    rig.leak(lead, node);
+    rig.net.run(10);
+    CHECK_EQ(rig.chan(node), 10);
+
+    // A sweep settles where the leader is, not on the busiest channel (2).
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.fol[node]->lastSweep().count(2), 3u);
+    CHECK_EQ(rig.chan(node), 10);
+
+    // Without a leader, the sweep goes to the crowd.
+    rig.fol[node]->clearLeader();
+    CHECK(!rig.fol[node]->hasLeader());
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 2);
+
+    // Setting a leader known on another channel goes there at the next tick.
+    rig.net.run(1000);
+    rig.leak(lead, node);
+    rig.net.run(10);
+    CHECK_EQ(rig.chan(node), 2);
+    rig.fol[node]->setLeader(rig.net.mac(lead), rig.net.now());
+    CHECK_EQ(rig.chan(node), 2);  // not from the caller
+    rig.net.run(10);
+    CHECK_EQ(rig.chan(node), 10);
+}
+
+// A leader that isn't an anchor keeps the node where it is: no search while
+// it answers, although the anchor it settled with has left.
+TEST(channel_leader_keeps_the_node_here) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    cc.preferred = 5;
+    ChannelConfig still;
+    still.follow = false;  // doesn't go looking for the anchor either
+    size_t anchor = rig.add(5, true), lead = rig.add(5, false, still), node = rig.add(5, false, cc);
+    rig.add(7, false);
+    rig.add(7, false);
+    rig.start();
+    rig.net.run(1000);
+    rig.fol[node]->setLeader(rig.net.mac(lead), rig.net.now());
+    rig.net.node(anchor).online = false;
+    rig.net.run(20000);
+    CHECK_EQ(rig.chan(node), 5);
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 0u);
+    // Without it, the node looks for its anchor again.
+    rig.fol[node]->clearLeader();
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->lastSweep().sequence == 1; }, 10000));
 }
 
 TEST(discovery_reads_announcements_without_extension) {

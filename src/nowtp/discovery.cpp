@@ -96,6 +96,14 @@ void Discovery::setChannelInfo(uint8_t channel, bool anchor, uint32_t now) {
     tick(now);
 }
 
+void Discovery::arrived(uint8_t channel, uint32_t now) {
+    if (channel != channel_) {
+        channel_ = channel;
+        for (PeerInfo& p : peers_) p.otherChannel = otherChannel(p.channel);
+    }
+    discover(now);
+}
+
 void Discovery::setTimeReference(bool reference, uint32_t now) {
     uint8_t flags =
         static_cast<uint8_t>(reference ? (extFlags_ | kExtTimeReference) : (extFlags_ & ~kExtTimeReference));
@@ -304,12 +312,20 @@ void Discovery::handle(const Message& m) {
             if (peers_[i].mac != m.src) continue;
             PeerInfo lost = std::move(peers_[i]);
             peers_.erase(i);
-            if ((a.flags & kMoving) && a.moveTo != 0) {
+            bool moving = (a.flags & kMoving) && a.moveTo != 0;
+            uint8_t was = lost.channel;
+            bool wasOther = lost.otherChannel;
+            if (moving) {
                 lost.channel = a.moveTo;  // where it went
                 lost.otherChannel = otherChannel(a.moveTo);
             }
             emit(PeerEvent::Lost, lost);
-            if ((a.flags & kMoving) && a.moveTo != 0 && moveHandler_) moveHandler_(lost, a.moveTo);
+            if (moving && moveHandler_) {
+                // The move handler gets it as it was: where it left from.
+                lost.channel = was;
+                lost.otherChannel = wasOther;
+                moveHandler_(lost, a.moveTo);
+            }
             break;
         }
         return;

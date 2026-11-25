@@ -16,7 +16,6 @@ inline bool reached(uint32_t now, uint32_t deadline) {
 
 }  // namespace
 
-constexpr size_t ChannelFollower::kMaxAnchors;
 constexpr size_t ChannelSweep::kMaxNodes;
 
 size_t ChannelSweep::count(uint8_t ch, bool anchorsOnly) const {
@@ -32,7 +31,6 @@ ChannelFollower::ChannelFollower(Discovery& discovery, RadioControl& radio, cons
     if (config_.dwellMs == 0) config_.dwellMs = 1;
     // Searching and tracking follow radio and peer events: nothing to allocate then.
     plan_.reserve((config_.channels.empty() ? 13 : config_.channels.size()) + 2);
-    peers_.reserve(kMaxAnchors);
     if (config_.pick == ChannelPick::Busiest) reserveSweep();
 }
 
@@ -51,7 +49,7 @@ void ChannelFollower::start(uint32_t now) {
     if (!free()) return;
     if (config_.preferred != 0 && config_.preferred != radio_.channel() &&
         radio_.setChannel(config_.preferred) == Status::Ok) {  // not allowed here: stay
-        discovery_.discover(now);
+        discovery_.arrived(config_.preferred, now);
     }
     // Only a sweep tells which channel is busiest; a preferred channel is
     // kept if it hears nodes (see settled()).
@@ -62,9 +60,10 @@ void ChannelFollower::stop() {
     running_ = false;
     if (searching_ && full_) abortSweep();
     searching_ = false;
-    peers_.clear();
     hadAnchor_ = false;
     pinned_ = 0;
+    hasLeader_ = false;
+    joinDue_ = false;
     sweepDue_ = false;
 }
 
@@ -72,25 +71,49 @@ bool ChannelFollower::free() const {
     return config_.follow && !config_.anchor && !radio_.channelFixed();
 }
 
-bool ChannelFollower::anchorPresent() const {
-    for (const Tracked& t : peers_) {
-        if (t.anchor) return true;
-    }
-    return false;
+// On our channel, as it says (one that does not say counts as here). Read
+// from Discovery's table, which knows each peer's stated channel: the radio's
+// channel is current at once, Discovery's otherChannel only once the owner
+// tells it.
+bool ChannelFollower::here(const PeerInfo& p) const {
+    return p.channel == 0 || p.channel == radio_.channel();
 }
 
-bool ChannelFollower::nodeHere() const {
+bool ChannelFollower::leads(const PeerInfo& p) const {
+    return hasLeader_ && (p.mac == leader_ || p.deviceId == leader_);
+}
+
+const PeerInfo* ChannelFollower::findLeader() const {
+    const PeerInfo* found = nullptr;
+    if (!hasLeader_) return found;
+    discovery_.forEachPeer([&](const PeerInfo& p) {
+        if (leads(p)) found = &p;
+    });
+    return found;
+}
+
+bool ChannelFollower::anchorPresent() const {
     bool any = false;
-    discovery_.forEachPeer([&any](const PeerInfo& p) {
-        if (!p.otherChannel) any = true;
+    discovery_.forEachPeer([&](const PeerInfo& p) {
+        if (p.anchor && here(p)) any = true;
     });
     return any;
 }
 
-// Where we are is fine: an anchor answers, or, after settling on the busiest
-// channel without one, any node does.
+bool ChannelFollower::nodeHere() const {
+    bool any = false;
+    discovery_.forEachPeer([&](const PeerInfo& p) {
+        if (here(p)) any = true;
+    });
+    return any;
+}
+
+// Where we are is fine: an anchor or the leader answers, or, after settling on
+// the busiest channel without an anchor, any node does.
 bool ChannelFollower::settled() const {
     if (anchorPresent()) return true;
+    const PeerInfo* leader = findLeader();
+    if (leader && here(*leader)) return true;
     return config_.pick == ChannelPick::Busiest && !hadAnchor_ && nodeHere();
 }
 
@@ -104,31 +127,14 @@ void ChannelFollower::setSuspended(bool suspended, uint32_t now) {
     okSince_ = now;  // whatever happened meanwhile, start counting afresh
 }
 
-// Only anchors matter, and a few at most: the list is reserved, never grown.
-void ChannelFollower::track(const PeerInfo& peer) {
-    for (size_t i = 0; i < peers_.size(); ++i) {
-        if (peers_[i].mac != peer.mac) continue;
-        if (!peer.anchor) peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
-        return;
-    }
-    if (!peer.anchor || peers_.size() >= kMaxAnchors) return;
-    Tracked t = {peer.mac, true};
-    peers_.push_back(t);
-}
-
 void ChannelFollower::onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_t now) {
     if (!running_) return;
     if (event == PeerEvent::Lost) {
         // Always processed, so a peer lost while suspended is not kept forever.
-        // Discovery has already dropped the peer: it counts as here if it was.
-        bool wasSettled = anchorPresent() || (config_.pick == ChannelPick::Busiest && !hadAnchor_ &&
-                                              (!peer.otherChannel || nodeHere()));
-        for (size_t i = 0; i < peers_.size(); ++i) {
-            if (peers_[i].mac == peer.mac) {
-                peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(i));
-                break;
-            }
-        }
+        // Discovery has already dropped the peer: it counts as here if it was
+        // (one that moved away says so to onPeerMoved()).
+        bool held = peer.anchor || leads(peer) || (config_.pick == ChannelPick::Busiest && !hadAnchor_);
+        bool wasSettled = settled() || (here(peer) && held);
         // Present until now, however long ago tick() last saw it.
         if (wasSettled && !settled()) okSince_ = now;
         return;
@@ -136,30 +142,82 @@ void ChannelFollower::onPeerEvent(PeerEvent event, const PeerInfo& peer, uint32_
     // Peers heard while deep discovery visits other channels do not live on
     // ours; a sweep sorts out what it heard when it ends.
     if (suspended_ || (searching_ && full_)) return;
-    track(peer);
-    if (!peer.anchor) {
-        if (searching_ && searchAny_) endSearch(true, now);
+    bool lead = leads(peer);
+    bool sought = peer.anchor || lead || (searching_ && searchAny_);  // what a search ends on
+    if (here(peer)) {
+        if (peer.anchor) {
+            hadAnchor_ = true;
+            okSince_ = now;
+        }
+        if (searching_ && sought) endSearch(true, now);
         return;
     }
-    hadAnchor_ = true;
-    okSince_ = now;
-    if (pinned_ != 0) return;
-    // Strong signals leak into adjacent channels: trust the channel the anchor states.
-    if (free() && peer.channel != 0 && peer.channel != radio_.channel()) {
-        if (searching_) searching_ = false;
-        moveTo(peer.channel, now);
+    // It states another channel: it leaks in from an adjacent one (strong
+    // signals do), or it moved without notice. A search trusts the channel
+    // it states, and so does the leader's follower. Otherwise faint nodes
+    // would toss a node between installations on neighbouring channels: only
+    // First's followers, with no leader, go to an anchor heard that way.
+    if (!free() || pinned_ != 0 || peer.channel == 0) return;
+    bool go = searching_ ? sought : hasLeader_ ? lead : config_.pick == ChannelPick::First && peer.anchor;
+    if (!go) return;
+    bool wasSearching = searching_;
+    searching_ = false;
+    if (!moveTo(peer.channel, now)) {
+        searching_ = wasSearching;
         return;
     }
-    if (searching_) endSearch(true, now);
+    if (peer.anchor) hadAnchor_ = true;
 }
 
+// `peer` is as it was before the notice: its channel is the one it left.
 void ChannelFollower::onPeerMoved(const PeerInfo& peer, uint8_t channel, uint32_t now) {
-    if (!running_ || suspended_ || !free() || pinned_ != 0 || (searching_ && full_)) return;
-    // Once we know anchors, only they lead; until then any peer does.
-    if (hadAnchor_ && !peer.anchor) return;
+    if (!running_) return;
+    bool wasHere = here(peer);
+    if (wasHere) okSince_ = now;  // present until now
+    if (suspended_ || !free() || pinned_ != 0 || (searching_ && full_)) return;
     if (channel == radio_.channel()) return;
+    if (hasLeader_) {
+        if (!leads(peer)) return;  // the leader alone, from wherever it was
+    } else {
+        // A node heard from another channel is not ours to follow.
+        if (!wasHere) return;
+        if (config_.pick == ChannelPick::Busiest) {
+            // Only the last node here leads: we settled where the nodes are,
+            // and those still here keep us (Discovery has dropped the mover).
+            if (nodeHere()) return;
+        } else if (hadAnchor_ && !peer.anchor) {
+            return;  // once we know anchors, only they lead; until then any peer does
+        }
+    }
+    bool wasSearching = searching_;
     searching_ = false;
-    moveTo(channel, now);
+    if (!moveTo(channel, now)) searching_ = wasSearching;
+}
+
+void ChannelFollower::setLeader(const Mac& peer, uint32_t now) {
+    hasLeader_ = true;
+    leader_ = peer;
+    joinDue_ = running_;
+    joinAt_ = now;
+}
+
+void ChannelFollower::clearLeader() {
+    hasLeader_ = false;
+    leader_ = Mac();
+    joinDue_ = false;
+}
+
+// To the channel the leader states, if it is known to be elsewhere. A
+// running sweep goes there when it ends instead. From tick(): the channel
+// handler runs in the owner's task.
+void ChannelFollower::joinLeader(uint32_t now) {
+    if (suspended_ || !free() || pinned_ != 0 || (searching_ && full_)) return;
+    const PeerInfo* leader = findLeader();
+    if (!leader || here(*leader)) return;
+    uint8_t ch = leader->channel;
+    bool wasSearching = searching_;
+    searching_ = false;
+    if (!moveTo(ch, now)) searching_ = wasSearching;
 }
 
 void ChannelFollower::onChannelChanged(uint8_t channel, uint32_t now) {
@@ -172,11 +230,12 @@ void ChannelFollower::onChannelChanged(uint8_t channel, uint32_t now) {
     discovery_.discover(now);  // let peers on the new channel know us at once
 }
 
-void ChannelFollower::moveTo(uint8_t channel, uint32_t now) {
-    if (radio_.setChannel(channel) != Status::Ok) return;
+bool ChannelFollower::moveTo(uint8_t channel, uint32_t now) {
+    if (radio_.setChannel(channel) != Status::Ok) return false;
     okSince_ = now;
-    discovery_.discover(now);
+    discovery_.arrived(channel, now);
     if (handler_) handler_(channel);
+    return true;
 }
 
 Status ChannelFollower::search(uint32_t now) {
@@ -217,8 +276,7 @@ Status ChannelFollower::pin(uint8_t channel, uint32_t now) {
     if (channel != radio_.channel()) {
         Status st = radio_.setChannel(channel);
         if (st != Status::Ok) return st;
-        peers_.clear();  // the anchors we knew are elsewhere
-        discovery_.discover(now);
+        discovery_.arrived(channel, now);
     }
     pinned_ = channel;
     okSince_ = now;
@@ -226,9 +284,12 @@ Status ChannelFollower::pin(uint8_t channel, uint32_t now) {
 }
 
 void ChannelFollower::unpin(uint32_t now) {
+    if (pinned_ == 0) return;
     pinned_ = 0;
     okSince_ = now;  // search as configured, from now
     nextSearchAt_ = now;
+    joinDue_ = running_ && hasLeader_;
+    joinAt_ = now;
 }
 
 void ChannelFollower::beginSearch(bool anyPeer, bool full, uint32_t now) {
@@ -357,7 +418,13 @@ void ChannelFollower::endSweep(uint32_t now) {
     searching_ = false;
     full_ = false;
     okSince_ = now;
-    uint8_t target = pinned_ != 0 ? pinned_ : busiest();
+    uint8_t target = pinned_;
+    if (target == 0) {
+        // The leader, if the sweep heard it, else the busiest channel.
+        const PeerInfo* leader = findLeader();
+        if (leader && leader->channel != 0 && reached(leader->lastSeenMs, sweep_.startedMs)) target = leader->channel;
+    }
+    if (target == 0) target = busiest();
     if (target == 0) {
         target = origin_;  // nothing answered
         nextSearchAt_ = now + config_.retryMs;
@@ -367,18 +434,10 @@ void ChannelFollower::endSweep(uint32_t now) {
     sweep_.complete = true;
     sweep_.finishedMs = now;
     sweep_.channel = radio_.channel();
-    if (pinned_ == 0) {
-        // Discovery already knows the nodes here, so no Found event will name
-        // the anchors: take them from the sweep.
-        peers_.clear();
-        for (const SweptNode& s : sweep_.nodes) {
-            if (s.channel != target || !s.anchor || peers_.size() >= kMaxAnchors) continue;
-            Tracked t = {s.mac, true};
-            peers_.push_back(t);
-        }
-        hadAnchor_ = !peers_.empty();
-    }
-    discovery_.discover(now);  // we were away: tell the nodes here at once
+    // Discovery already knows the nodes here, so no Found event names the
+    // anchors: its table says whether there are any.
+    if (pinned_ == 0) hadAnchor_ = anchorPresent();
+    discovery_.arrived(radio_.channel(), now);  // we were away: tell the nodes here at once
     if (radio_.channel() != origin_ && handler_) handler_(radio_.channel());
 }
 
@@ -386,7 +445,9 @@ void ChannelFollower::endSearch(bool found, uint32_t now) {
     searching_ = false;
     okSince_ = now;
     if (found) {
-        if (radio_.channel() != origin_ && handler_) handler_(radio_.channel());
+        if (radio_.channel() == origin_) return;
+        discovery_.arrived(radio_.channel(), now);
+        if (handler_) handler_(radio_.channel());
         return;
     }
     if (radio_.channel() != origin_) radio_.setChannel(origin_);
@@ -395,6 +456,10 @@ void ChannelFollower::endSearch(bool found, uint32_t now) {
 
 void ChannelFollower::tick(uint32_t now) {
     if (!running_ || suspended_) return;
+    if (joinDue_) {
+        joinDue_ = false;
+        joinLeader(now);
+    }
     if (searching_) {
         if (reached(now, stepEnd_)) {
             if (full_) record(plan_[step_], stepStart_);
@@ -425,6 +490,7 @@ void ChannelFollower::tick(uint32_t now) {
 
 void ChannelFollower::nextTick(Deadline& d) const {
     if (!running_ || suspended_) return;
+    if (joinDue_) d.at(joinAt_);
     if (searching_) {
         d.at(stepEnd_);
         return;
