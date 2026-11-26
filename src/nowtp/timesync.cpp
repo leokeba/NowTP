@@ -851,6 +851,36 @@ int64_t median(int64_t* v, size_t n) {
     return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
+// A response's times are the responder's to choose. Two clocks further apart
+// than this (73,000 years) are impossible; bounding each difference keeps
+// the sums of two below, and the median of offsets, within int64_t.
+constexpr uint64_t kMaxSpanUs = static_cast<uint64_t>(1) << 61;
+
+// a - b, false when it is further from 0 than kMaxSpanUs.
+bool span(uint64_t a, uint64_t b, int64_t& out) {
+    if (a - b <= kMaxSpanUs) {
+        out = static_cast<int64_t>(a - b);
+        return true;
+    }
+    if (b - a <= kMaxSpanUs) {
+        out = -static_cast<int64_t>(b - a);
+        return true;
+    }
+    return false;
+}
+
+// An exchange's queue-time round trip, (t4 - t1) - (t3 - t2), and offset,
+// ((t2 - t1) + (t3 - t4)) / 2; false when its times are impossible.
+bool queueTimes(uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4, int64_t& rtt, int64_t& offset) {
+    int64_t total = 0, held = 0, there = 0, back = 0;
+    if (t4 < t1 || !span(t4, t1, total) || !span(t3, t2, held) || !span(t2, t1, there) || !span(t3, t4, back)) {
+        return false;
+    }
+    rtt = total - held;
+    offset = (there + back) / 2;
+    return true;
+}
+
 }  // namespace
 
 void TimeSync::endRound(uint32_t now) {
@@ -861,9 +891,8 @@ void TimeSync::endRound(uint32_t now) {
     uint8_t answered = 0;
     for (uint8_t i = 0; i < sent_; ++i) {
         const Exchange& e = exchanges_[i];
-        if (!e.answered) continue;
-        int64_t rtt = static_cast<int64_t>(e.t4 - e.t1) - static_cast<int64_t>(e.t3 - e.t2);
-        if (e.t4 < e.t1 || rtt < 0 || rtt > 1000000) continue;
+        int64_t rtt = 0, offset = 0;
+        if (!e.answered || !queueTimes(e.t1, e.t2, e.t3, e.t4, rtt, offset) || rtt < 0 || rtt > 1000000) continue;
         if (answered == 0 || static_cast<uint32_t>(rtt) < fastest) fastest = static_cast<uint32_t>(rtt);
         answered++;
     }
@@ -886,9 +915,11 @@ void TimeSync::endRound(uint32_t now) {
     // its send times): the median of their offsets.
     for (uint8_t i = 0; i < sent_; ++i) {
         const Exchange& e = exchanges_[i];
+        int64_t there = 0, back = 0;
         if (!e.answered || !e.sentUs || !e.answerSentUs) continue;
+        if (!span(e.t2, e.sentUs, there) || !span(e.answerSentUs, e.t4, back)) continue;
         if (n == 0) base = e.sentUs;
-        offsets[n++] = (static_cast<int64_t>(e.t2 - e.sentUs) + static_cast<int64_t>(e.answerSentUs - e.t4)) / 2;
+        offsets[n++] = (there + back) / 2;
         sumLocal += static_cast<int64_t>((e.sentUs + e.t4) / 2 - base);
     }
     if (acting_) {
@@ -909,11 +940,11 @@ void TimeSync::endRound(uint32_t now) {
         n = 0;
         for (uint8_t i = 0; i < sent_; ++i) {
             const Exchange& e = exchanges_[i];
-            if (!e.answered) continue;
-            int64_t rtt = static_cast<int64_t>(e.t4 - e.t1) - static_cast<int64_t>(e.t3 - e.t2);
-            if (e.t4 < e.t1 || rtt != static_cast<int64_t>(fastest)) continue;
+            int64_t rtt = 0, offset = 0;
+            if (!e.answered || !queueTimes(e.t1, e.t2, e.t3, e.t4, rtt, offset)) continue;
+            if (rtt != static_cast<int64_t>(fastest)) continue;
             base = e.t1 + static_cast<uint64_t>(rtt / 2);
-            offsets[0] = (static_cast<int64_t>(e.t2 - e.t1) + static_cast<int64_t>(e.t3 - e.t4)) / 2;
+            offsets[0] = offset;
             sumLocal = 0;
             n = 1;
             break;

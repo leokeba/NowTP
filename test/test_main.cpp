@@ -4095,6 +4095,91 @@ TEST(timesync_works_with_older_responders) {
 
 namespace {
 
+void putTime(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+uint64_t getTime(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | p[i];
+    return v;
+}
+
+}  // namespace
+
+// Found by fuzz_frames: a response's times are the responder's to choose,
+// and the round trip (t4 - t1) - (t3 - t2) overflowed int64_t with t3 - t2
+// at 2^63, as did the offset ((t2 - t1) + (t3 - t4)) / 2 with t2 and t3
+// 2^62 µs ahead. The first two exchanges of every round get such times here
+// (the second one looking the fastest); the others are honest, and the round
+// goes on without them.
+TEST(timesync_drops_exchanges_with_impossible_times) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 3000000000ull, 0), b = rig.add(false, 1000ull, 10e-6);
+    sim::Node* node = &rig.net.node(ref);
+    size_t hostile = 0;
+    rig.net.engine(ref).listen(kTimeSyncPort, [&rig, &hostile, node, ref](const Message& m) {
+        if (m.len < 11 || m.data[0] != 1) return;
+        uint8_t out[27];
+        memcpy(out, m.data, 11);
+        out[0] = 2;
+        uint64_t t2 = m.timestampUs, t3 = node->clockUs(rig.net.now());
+        if (m.data[2] == 0) {
+            t2 = 0;
+            t3 = 1ull << 63;
+            hostile++;
+        } else if (m.data[2] == 1) {
+            t2 = getTime(m.data + 3) + (3ull << 61);
+            t3 = t2 + 1500;  // held 1.5 ms: the shortest round trip
+            hostile++;
+        }
+        putTime(out + 11, t2);
+        putTime(out + 19, t3);
+        rig.net.engine(ref).send(m.src, kTimeSyncPort, out, sizeof(out), SendOptions(), CompletionHandler(),
+                                 rig.net.now());
+    });
+    rig.ts[b]->start(rig.net.now());
+    rig.disc[b]->start(rig.net.now());
+    rig.disc[ref]->start(rig.net.now());
+    CHECK(rig.net.runUntil([&] { return rig.ts[b]->synced(); }, 10000));
+    rig.net.run(20000);
+    CHECK(hostile > 5);
+    CHECK(absValue(rig.error(b, ref)) < kHopUs);
+}
+
+// The same with send times: the responder reports the send time of the
+// exchange itself, 2^63 - 1 µs past the request, and t2 2^62 µs past it, so
+// that the offset's two halves overflow int64_t when added. A responder
+// whose every stamped exchange is impossible is never followed.
+TEST(timesync_drops_stamped_exchanges_with_impossible_times) {
+    TimeRig rig;
+    size_t ref = rig.add(true, 3000000000ull, 0), b = rig.add(false, 1000ull, 0);
+    size_t hostile = 0;
+    rig.net.engine(ref).listen(kTimeSyncPort, [&rig, &hostile, ref](const Message& m) {
+        if (m.len < 11 || m.data[0] != 1) return;
+        uint8_t out[37];
+        memcpy(out, m.data, 11);
+        out[0] = 2;
+        uint64_t t1 = getTime(m.data + 3);
+        putTime(out + 11, t1 + (1ull << 62));
+        putTime(out + 19, t1 + (1ull << 62));
+        out[27] = m.data[1];  // this round,
+        out[28] = m.data[2];  // this exchange
+        putTime(out + 29, t1 + 0x7FFFFFFFFFFFFFFFull);
+        hostile++;
+        rig.net.engine(ref).send(m.src, kTimeSyncPort, out, sizeof(out), SendOptions(), CompletionHandler(),
+                                 rig.net.now());
+    });
+    rig.ts[b]->start(rig.net.now());
+    rig.disc[b]->start(rig.net.now());
+    rig.disc[ref]->start(rig.net.now());
+    rig.net.run(10000);
+    CHECK(hostile > 20);
+    CHECK(!rig.ts[b]->synced());
+}
+
+namespace {
+
 // Time requests arrive 2 ms after their "sent" report, responses at once: a
 // delay that depends on the direction, which send-time stamps can't see. A
 // follower's own rounds then put half of it into its estimate.
