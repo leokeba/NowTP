@@ -45,6 +45,10 @@ constexpr uint8_t kAppPort = 1;
 constexpr size_t kPeers = 4;          // three nodes that hear the target, one that doesn't
 constexpr uint32_t kMaxSimMs = 10000;  // per input: past the protocol timers but a stream's 30 s idle limit
 constexpr size_t kMaxOps = 256;
+// X25519 takes ~4 ms under the sanitizers, and each pairing message makes
+// the target (and the harness) compute one: a few per input are enough.
+constexpr size_t kMaxProcedures = 2;
+constexpr size_t kMaxPairingMessages = 6;
 
 // Security's message, ack and challenge keys, derived as it does.
 struct Keys {
@@ -116,6 +120,25 @@ void keystream(const PairKeys& k, uint8_t out[33]) {
     out[32] = block[0];
 }
 
+// The fake peers' X25519 key pairs, the same for every input: computed once
+// (X25519 takes ~4 ms under the sanitizers).
+struct KeyPair {
+    uint8_t priv[32], pub[32];
+};
+
+const KeyPair& keyPair(size_t peer) {
+    static KeyPair pairs[kPeers];
+    static bool done = false;
+    if (!done) {
+        for (size_t i = 0; i < kPeers; ++i) {
+            for (size_t b = 0; b < 32; ++b) pairs[i].priv[b] = static_cast<uint8_t>(0x40 + 7 * i + b);
+            crypto::x25519Base(pairs[i].pub, pairs[i].priv);
+        }
+        done = true;
+    }
+    return pairs[peer];
+}
+
 class Input {
 public:
     Input(const uint8_t* p, size_t n) : p_(p), n_(n) {}
@@ -183,9 +206,10 @@ public:
             p.node = net_.addNode();
             p.epoch = 0x1000u + static_cast<uint32_t>(i);
             p.nextId = static_cast<uint16_t>(0x100 * (i + 1));
-            for (size_t b = 0; b < 32; ++b) p.priv[b] = static_cast<uint8_t>(0x40 + 7 * i + b);
+            const KeyPair& kp = keyPair(i);
+            memcpy(p.priv, kp.priv, 32);
+            memcpy(p.pub, kp.pub, 32);
             for (size_t b = 0; b < 16; ++b) p.nonce[b] = static_cast<uint8_t>(0x90 + 5 * i + b);
-            crypto::x25519Base(p.pub, p.priv);
             peers_.push_back(p);
         }
         net_.node(peers_[kPeers - 1].node).online = false;  // the target's frames never reach it
@@ -552,7 +576,7 @@ private:
             }
             case 12: {  // a pairing window, or a pairing attempt (the peers carry on meanwhile)
                 uint8_t b = in_.u8();
-                if (inProcedure) break;
+                if (inProcedure || procedures_++ >= kMaxProcedures) break;
                 uint32_t timeout = 100u + 8u * (b & 0x7F);  // an honest pairing takes ~150 ms
                 // An application procedure, as the tests' Scheduler runs it: uncounted.
                 pairing_ = (b & 0x80) ? sec_->acceptPairing(timeout) : sec_->pair(timeout);
@@ -568,8 +592,12 @@ private:
                 net_.node(target_).link.busyReplies = in_.u8() % 8;
                 break;
             }
-            case 16: pairAsJoiner(p); break;
-            case 17: pairAsMember(p); break;
+            case 16:
+                if (pairingMessages_++ < kMaxPairingMessages) pairAsJoiner(p);
+                break;
+            case 17:
+                if (pairingMessages_++ < kMaxPairingMessages) pairAsMember(p);
+                break;
             case 15: {  // the target asks who is there, or moves
                 uint8_t b = in_.u8();
                 sim::Counted counted;
@@ -893,6 +921,7 @@ private:
     uint32_t rng_ = 12345;
     bool withKey_ = false;
     Status pairing_ = Status::InvalidState;  // the last pairing procedure's outcome
+    size_t procedures_ = 0, pairingMessages_ = 0;
     std::vector<Peer> peers_;
     std::vector<std::pair<size_t, std::vector<uint8_t>>> history_;
     std::unique_ptr<FrameSizes> sizes_;
