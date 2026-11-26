@@ -51,7 +51,7 @@ The whole message fits in one frame. There is no CRC, because the radio frame al
 Port and message ID repeat the values of the message being acknowledged. Status values:
 
 - `0` complete: the whole message was received, verified and delivered (or was already delivered earlier).
-- `1` missing: the payload lists missing fragment indices, 2 bytes each, in increasing order. The list may be cut short to fit one frame.
+- `1` missing: the payload lists missing fragment indices, 2 bytes each, in increasing order. The list may be cut short to fit one frame. An ack that no longer fits its destination's frame size when its turn to go comes (the peer's size shrank while it waited) is not sent: the sender's next probe gets one that fits.
 - `2` rejected: the receiver will never accept this message, because it has no handler on the port or the message is too large.
 - `3` busy: the receiver has no room to reassemble this message right now. The sender stops sending it, waits one to two and a half ack timeouts (spread by message ID), then probes (step 5 below). Receivers send it for the first fragment and for ack-requests of a message they refuse, and for a complete message (single-frame or reassembled) that the receiving application refused. Senders that predate this status ignore it and simply probe after their ack timeout.
 

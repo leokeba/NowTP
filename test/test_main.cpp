@@ -1365,6 +1365,65 @@ struct SizedLink : Link {
 
 }  // namespace
 
+// Found by fuzz_frames: an ack is sized for its destination when queued too,
+// and waits behind the frame in flight. A long "missing" list built for
+// 1470-byte frames then went out to a peer back to 250 (lost, or announced
+// again smaller), which can't receive it. Such an ack is dropped now; the
+// sender's next probe gets one of the current size.
+TEST(frame_size_shrinking_under_a_queued_ack) {
+    struct CheckedLink : SizedLink {
+        size_t tooLarge = 0;
+        std::vector<Mac> to;
+        Status sendFrame(const Mac& dst, const uint8_t* data, size_t len) override {
+            if (len > maxFrameSize(dst)) tooLarge++;
+            to.push_back(dst);
+            return SizedLink::sendFrame(dst, data, len);
+        }
+    };
+    CheckedLink link;
+    Engine e(link);
+    Inbox inbox;
+    e.listen(1, inbox.handler());
+    uint32_t now = sim::clockStart();
+    Mac other = {{0x02, 0, 0, 0, 0, 1}};
+    auto small = pattern(10);
+    CHECK(e.send(other, 1, small.data(), small.size(), SendOptions(), nullptr, now) == Status::Ok);  // in flight
+
+    // The last of 200 fragments, asking for an ack: 199 are missing.
+    auto lastFragment = [&] {
+        wire::Header h;
+        h.type = wire::Type::Fragment;
+        h.flags = wire::kFlagReliable | wire::kFlagAckRequest;
+        h.port = 1;
+        h.messageId = 77;
+        h.index = 199;
+        h.count = 200;
+        std::vector<uint8_t> f(wire::kFragmentHeaderSize + 10, 0xAB);
+        wire::encodeHeader(h, f.data());
+        return f;
+    };
+    auto f = lastFragment();
+    e.onFrameReceived(link.wide, f.data(), f.size(), now + 1);
+    CHECK_EQ(link.sent.size(), 1u);  // the ack waits behind the frame in flight
+
+    link.wideSize = 250;
+    e.onFrameSent(true, now + 2);
+    e.tick(now + 3);
+    CHECK_EQ(link.tooLarge, 0u);
+
+    // The sender's probe: an ack within 250 bytes, as many missing as fit.
+    e.onFrameReceived(link.wide, f.data(), f.size(), now + 200);
+    e.tick(now + 201);
+    CHECK_EQ(link.tooLarge, 0u);
+    CHECK(link.to.back() == link.wide);
+    const std::vector<uint8_t>& ack = link.sent.back();
+    wire::Header h;
+    size_t off = 0;
+    CHECK(wire::decodeHeader(ack.data(), ack.size(), h, off) && h.type == wire::Type::Ack && h.messageId == 77);
+    CHECK_EQ(ack[off], static_cast<uint8_t>(wire::AckStatus::Missing));
+    CHECK(ack.size() <= 250u && ack.size() >= 240u);
+}
+
 // A message is cut for its destination's frame size when queued, which may
 // shrink before it has all gone out (a peer lost, or announced again
 // smaller). A 1205-byte frame once went into a 250-byte buffer; then such

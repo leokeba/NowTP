@@ -198,6 +198,14 @@ void Engine::pump(uint32_t now) {
         // Control frames (acks) go first: they unblock the peer's sender.
         if (controlCount_ > 0) {
             Control& c = control(0);
+            if (c.len > link_.maxFrameSize(c.dst)) {
+                // Sized when queued, for a destination whose frames have
+                // shrunk since (see fitFrames()). Its sender asks again, and
+                // the ack it then gets fits.
+                popControl();
+                stats_.framesFailed++;
+                continue;
+            }
             inflight_ = InFlight();
             inflight_.active = true;
             inflight_.control = true;
