@@ -17,6 +17,23 @@ jobs:
           cmake --build build -j
           ctest --test-dir build --output-on-failure
 
+  # size_t is 32 bits on the ESP32: a wrap of `chunk + kDataHeader` or similar
+  # is invisible in a 64-bit host build, so run the same suite with -m32.
+  host-tests-32bit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the 32-bit toolchain (multilib)
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib libc6-dev-i386
+      - name: Build and run tests (ASan + UBSan, 32-bit size_t)
+        run: |
+          cmake -S . -B build-m32 -DCMAKE_CXX_FLAGS=-m32
+          cmake --build build-m32 -j
+          ctest --test-dir build-m32 --output-on-failure
+
   esp-idf:
     runs-on: ubuntu-latest
     strategy:
@@ -70,7 +87,7 @@ jobs:
   # since the last tag. The version files are stamped in a commit only the
   # tag points at; main never gets one.
   release:
-    needs: [host-tests, esp-idf, arduino]
+    needs: [host-tests, host-tests-32bit, esp-idf, arduino]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     concurrency:
       group: release
