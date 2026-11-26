@@ -37,8 +37,10 @@ if(NOWTP_BUILD_TESTS)
     set_target_properties(nowtp_tests PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
     target_compile_options(nowtp_tests PRIVATE -Wall -Wextra)
     if(NOWTP_SANITIZE)
+        # A UBSan report stops the run (by default it prints and carries on, and the test passes).
         foreach(t nowtp_core nowtp_tests)
-            target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+            target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+                                   -fno-omit-frame-pointer -g)
             target_link_options(${t} PRIVATE -fsanitize=address,undefined)
         endforeach()
     endif()
