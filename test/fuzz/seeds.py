@@ -86,9 +86,9 @@ def seeds():
     # Honest pairings, each way. Inside a procedure each operation runs at one
     # of its waits (a few ms); WAIT operations only let it run on.
     idle = bytes([WAIT, 0, 0]) * 12
-    s["pair_member"] = bytes([KEY, 0]) + bytes([PAIR, 0, 0x80 | 60]) + bytes([JOINER, 1, 0]) + idle + \
+    s["pair_member"] = bytes([KEY, 0]) + bytes([PAIR, 0, 0x80 | 100]) + bytes([JOINER, 1, 0]) + idle + \
         bytes([JOINER, 1, 1]) + idle + bytes([JOINER, 1, 2]) + idle + wait(10)
-    s["pair_joiner"] = bytes([0, 0]) + bytes([PAIR, 0, 60]) + idle + bytes([MEMBER, 2, 0]) + idle + \
+    s["pair_joiner"] = bytes([0, 0]) + bytes([PAIR, 0, 100]) + idle + bytes([MEMBER, 2, 0]) + idle + \
         bytes([MEMBER, 2, 1]) + idle + wait(50) + message(2, APP, bytes(20), how=0x02) + wait(5) + \
         bytes([CHALLENGE, 2, 0, 3]) + wait(5) + message(2, APP, bytes(20), how=0x02) + wait(20)
     # Diagnostics: a ping and a burst request.

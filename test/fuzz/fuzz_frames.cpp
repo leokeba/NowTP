@@ -553,7 +553,7 @@ private:
             case 12: {  // a pairing window, or a pairing attempt (the peers carry on meanwhile)
                 uint8_t b = in_.u8();
                 if (inProcedure) break;
-                uint32_t timeout = 200u + 20u * (b & 0x7F);
+                uint32_t timeout = 100u + 8u * (b & 0x7F);  // an honest pairing takes ~150 ms
                 // An application procedure, as the tests' Scheduler runs it: uncounted.
                 pairing_ = (b & 0x80) ? sec_->acceptPairing(timeout) : sec_->pair(timeout);
                 break;
