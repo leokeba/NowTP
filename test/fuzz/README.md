@@ -16,12 +16,13 @@ The target is one simulated node (`test/sim.h`) running the engine with discover
 - discovery announcements with every field chosen (frame size, name, metadata, channel, move, time roles, message limit, device id);
 - replays of recent frames, unchanged or with a byte flipped, from the same or another peer;
 - "reflections": the target's own latest frame on a port, with a few bytes changed, sent back by a peer (requests become answers: stream offers, pairing, diagnostics);
+- pairing, played honestly from either side: a joiner's request, proof and done message in the target's pairing window, or a member's offer and sealed installation key for the target's own pairing attempt (each with a tag the input may spoil);
 - the target's own actions: messages (reliable, latest-only, broadcast, with a deadline), streams, a pairing window or a pairing attempt (the peers' operations go on while it waits), discovery queries and channel moves, a radio that refuses frames for a while, a peer rebooting;
 - time passing.
 
-The peers seal and tag as `Security` does, with the key the harness holds, so authenticated traffic gets past the tag checks into the replay window, the ack binding and the services behind it. What isn't covered: a pairing that succeeds (it needs a joiner or member holding an X25519 key pair; the fuzzer only sends what it can forge), the blocking diagnostics procedures, and the ESP-NOW transport itself (platform code).
+The peers seal and tag as `Security` does, with the key the harness holds, so authenticated traffic gets past the tag checks into the replay window, the ack binding and the services behind it. What isn't covered: the blocking diagnostics procedures, and the ESP-NOW transport itself (platform code).
 
-`NOWTP_FUZZ_VERBOSE=1` prints, after each input, what it reached: frames and messages in, challenges and verified epochs, replays rejected, peers, time sync rounds, streams.
+`NOWTP_FUZZ_VERBOSE=1` prints, after each input, what it reached: frames and messages in, challenges and verified epochs, replays rejected, peers, time sync rounds, streams, the key and the last pairing's outcome.
 
 ## Running
 

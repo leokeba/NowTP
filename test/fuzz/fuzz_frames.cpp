@@ -66,6 +66,56 @@ const Keys& keys() {
     return k;
 }
 
+// Security's pairing derivations (security.cpp), for peers that pair with
+// the target honestly: session keys from the X25519 secret, the (empty)
+// pairing code and the transcript; tags; the key's keystream.
+struct PairKeys {
+    uint8_t transcript[32], confirm[32], encrypt[32];
+};
+
+void derivePairKeys(const uint8_t* dh, const Mac& joiner, const Mac& member, const uint8_t* joinerPub,
+                    const uint8_t* joinerNonce, const uint8_t* memberPub, const uint8_t* memberNonce, PairKeys& k) {
+    crypto::Sha256 t;
+    const char* tag = "NowTP pairing v1";
+    t.update(reinterpret_cast<const uint8_t*>(tag), strlen(tag));
+    t.update(joiner.bytes, 6);
+    t.update(member.bytes, 6);
+    t.update(joinerPub, 32);
+    t.update(joinerNonce, 16);
+    t.update(memberPub, 32);
+    t.update(memberNonce, 16);
+    t.finish(k.transcript);
+    uint8_t salt[32];
+    crypto::Sha256 c;
+    const char* saltTag = "NowTP pairing code";
+    c.update(reinterpret_cast<const uint8_t*>(saltTag), strlen(saltTag));
+    c.finish(salt);
+    uint8_t okm[64];
+    crypto::hkdf(salt, sizeof(salt), dh, 32, k.transcript, sizeof(k.transcript), okm, sizeof(okm));
+    memcpy(k.confirm, okm, 32);
+    memcpy(k.encrypt, okm + 32, 32);
+}
+
+void pairTag(const PairKeys& k, const char* what, const uint8_t* extra, size_t extraLen, uint8_t out[16]) {
+    crypto::HmacSha256 h(k.confirm, sizeof(k.confirm));
+    h.update(reinterpret_cast<const uint8_t*>(what), strlen(what));
+    h.update(k.transcript, sizeof(k.transcript));
+    if (extraLen) h.update(extra, extraLen);
+    uint8_t full[32];
+    h.finish(full);
+    memcpy(out, full, 16);
+}
+
+void keystream(const PairKeys& k, uint8_t out[33]) {
+    uint8_t block[32];
+    uint8_t counter = 1;
+    crypto::hmacSha256(k.encrypt, sizeof(k.encrypt), &counter, 1, block);
+    memcpy(out, block, 32);
+    counter = 2;
+    crypto::hmacSha256(k.encrypt, sizeof(k.encrypt), &counter, 1, block);
+    out[32] = block[0];
+}
+
 class Input {
 public:
     Input(const uint8_t* p, size_t n) : p_(p), n_(n) {}
@@ -96,6 +146,8 @@ struct Peer {
     uint32_t epoch;
     uint32_t seq = 0;
     uint16_t nextId;
+    // Its X25519 key pair and nonce, for pairing.
+    uint8_t priv[32], pub[32], nonce[16];
 };
 
 // The target's frames, as logged by the simulator.
@@ -131,6 +183,9 @@ public:
             p.node = net_.addNode();
             p.epoch = 0x1000u + static_cast<uint32_t>(i);
             p.nextId = static_cast<uint16_t>(0x100 * (i + 1));
+            for (size_t b = 0; b < 32; ++b) p.priv[b] = static_cast<uint8_t>(0x40 + 7 * i + b);
+            for (size_t b = 0; b < 16; ++b) p.nonce[b] = static_cast<uint8_t>(0x90 + 5 * i + b);
+            crypto::x25519Base(p.pub, p.priv);
             peers_.push_back(p);
         }
         net_.node(peers_[kPeers - 1].node).online = false;  // the target's frames never reach it
@@ -239,13 +294,13 @@ private:
         fprintf(stderr,
                 "fuzz_frames: %u ms, frames in %u invalid %u, messages in %u dropped %u refused %u auth-rejected %u, "
                 "reassembly refused %u | security: challenges %u answered %u verified %u replays %u forgeries %u | "
-                "peers %zu | time: synced %d reference %d rounds %u | streams in %zu out %zu\n",
+                "peers %zu | time: synced %d reference %d rounds %u | streams in %zu out %zu | key %d, pairing %s\n",
                 elapsed(), static_cast<unsigned>(st.framesReceived), static_cast<unsigned>(st.framesInvalid),
                 static_cast<unsigned>(st.messagesReceived), static_cast<unsigned>(st.messagesDropped),
                 static_cast<unsigned>(st.messagesRefused), static_cast<unsigned>(st.authRejected),
                 static_cast<unsigned>(st.reassemblyRefused), c.challengesSent, c.challengesAnswered, c.epochsVerified,
                 c.replaysRejected, c.forgeriesRejected, disc_->peers().size(), t.synced, t.isReference, t.rounds,
-                streams_->incoming(), streams_->outgoing());
+                streams_->incoming(), streams_->outgoing(), sec_->enabled(), toString(pairing_));
     }
 
     Engine& engine() { return net_.engine(target_); }
@@ -433,7 +488,7 @@ private:
     void op(bool inProcedure) {
         uint8_t code = in_.u8();
         Peer& p = peer(in_.u8());
-        switch (code % 16) {
+        switch (code % 18) {
             case 0: {  // a raw frame
                 put(p, in_.bytes(in_.u16() % (wire::kMaxFrameSize + 1)));
                 break;
@@ -500,11 +555,7 @@ private:
                 if (inProcedure) break;
                 uint32_t timeout = 200u + 20u * (b & 0x7F);
                 // An application procedure, as the tests' Scheduler runs it: uncounted.
-                if (b & 0x80) {
-                    sec_->acceptPairing(timeout);
-                } else {
-                    sec_->pair(timeout);
-                }
+                pairing_ = (b & 0x80) ? sec_->acceptPairing(timeout) : sec_->pair(timeout);
                 break;
             }
             case 13: {  // a peer reboots: new epoch, new message ids
@@ -517,6 +568,8 @@ private:
                 net_.node(target_).link.busyReplies = in_.u8() % 8;
                 break;
             }
+            case 16: pairAsJoiner(p); break;
+            case 17: pairAsMember(p); break;
             case 15: {  // the target asks who is there, or moves
                 uint8_t b = in_.u8();
                 sim::Counted counted;
@@ -729,6 +782,91 @@ private:
         message(p, port, d);
     }
 
+    void sendPairing(Peer& p, const uint8_t* msg, size_t len) {
+        wire::Header h;
+        h.port = kSecurityPort;
+        h.messageId = p.nextId++;
+        std::vector<uint8_t> f(msg, msg + len);
+        header(f, h);
+        put(p, f);
+    }
+
+    // A peer joining through the target's pairing window (acceptPairing()),
+    // as Security::pair() does: request, then the proof and the done
+    // message for the target's latest offer. The input may spoil a tag.
+    void pairAsJoiner(Peer& p) {
+        uint8_t how = in_.u8();
+        if ((how & 3) == 0) {
+            uint8_t request[49];
+            request[0] = 3;
+            memcpy(request + 1, p.pub, 32);
+            memcpy(request + 33, p.nonce, 16);
+            sendPairing(p, request, sizeof(request));
+            return;
+        }
+        if ((how & 3) == 3) {
+            uint8_t refused = 8;
+            sendPairing(p, &refused, 1);
+            return;
+        }
+        Sent s;
+        bool found = false;  // the target's latest offer, behind its key message perhaps
+        for (size_t skip = 0; !found && skip < 8 && lastSent(macOf(p), kSecurityPort, wire::Type::Single, s, skip);
+             ++skip) {
+            found = s.len >= 81 && s.payload[0] == 4;
+        }
+        if (!found) return;
+        uint8_t dh[32];
+        crypto::x25519(dh, p.priv, s.payload + 17);
+        PairKeys k;
+        derivePairKeys(dh, macOf(p), targetMac(), p.pub, s.payload + 1, s.payload + 17, s.payload + 49, k);
+        uint8_t msg[17];
+        msg[0] = (how & 3) == 1 ? 5 : 7;  // proof, or done
+        pairTag(k, msg[0] == 5 ? "proof" : "done", nullptr, 0, msg + 1);
+        if (how & 0x80) msg[1 + in_.u8() % 16] ^= 1;
+        sendPairing(p, msg, sizeof(msg));
+    }
+
+    // A member answering the target's pairing request (pair()), as
+    // Security::acceptPairing() does: an offer, then the installation key
+    // (the one the peers seal with, or another the input picks).
+    void pairAsMember(Peer& p) {
+        uint8_t how = in_.u8();
+        Sent s;
+        if (!lastSent(Mac::broadcast(), kSecurityPort, wire::Type::Single, s) || s.len < 49 || s.payload[0] != 3) {
+            return;
+        }
+        const uint8_t* joinerPub = s.payload + 1;
+        const uint8_t* joinerNonce = s.payload + 33;
+        uint8_t dh[32];
+        crypto::x25519(dh, p.priv, joinerPub);
+        PairKeys k;
+        derivePairKeys(dh, targetMac(), macOf(p), joinerPub, joinerNonce, p.pub, p.nonce, k);
+        if (!(how & 1)) {
+            uint8_t offer[81];
+            offer[0] = 4;
+            memcpy(offer + 1, joinerNonce, 16);
+            memcpy(offer + 17, p.pub, 32);
+            memcpy(offer + 49, p.nonce, 16);
+            pairTag(k, "offer", nullptr, 0, offer + 65);
+            if (how & 0x80) offer[65 + in_.u8() % 16] ^= 1;
+            sendPairing(p, offer, sizeof(offer));
+            return;
+        }
+        uint8_t plain[33] = {0};
+        plain[0] = sizeof(kKey);
+        memcpy(plain + 1, kKey, sizeof(kKey));
+        if (how & 0x02) plain[0] = in_.u8();  // a length out of range, perhaps
+        uint8_t stream[33];
+        keystream(k, stream);
+        uint8_t msg[50];
+        msg[0] = 6;
+        for (size_t i = 0; i < 33; ++i) msg[1 + i] = static_cast<uint8_t>(plain[i] ^ stream[i]);
+        pairTag(k, "key", msg + 1, 33, msg + 34);
+        if (how & 0x80) msg[34 + in_.u8() % 16] ^= 1;
+        sendPairing(p, msg, sizeof(msg));
+    }
+
     // The application on the target: takes a buffer now and then, refuses some.
     void app(const Message& m) {
         testing::HeapExempt own;
@@ -754,6 +892,7 @@ private:
     uint32_t start_ = net_.now();
     uint32_t rng_ = 12345;
     bool withKey_ = false;
+    Status pairing_ = Status::InvalidState;  // the last pairing procedure's outcome
     std::vector<Peer> peers_;
     std::vector<std::pair<size_t, std::vector<uint8_t>>> history_;
     std::unique_ptr<FrameSizes> sizes_;

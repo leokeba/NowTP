@@ -13,8 +13,8 @@ import struct
 import sys
 
 # Operation codes (Harness::op()).
-RAW, MESSAGE, WAIT, CHALLENGE, ACK, TIME, ANNOUNCE, REPLAY, REFLECT, SEND, STREAM, PAIR, REBOOT, BUSY, DISCOVER = (
-    0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+RAW, MESSAGE, WAIT, CHALLENGE, ACK, TIME, ANNOUNCE, REPLAY, REFLECT, SEND, STREAM, PAIR, REBOOT, BUSY, DISCOVER, \
+    JOINER, MEMBER = (0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
 # Port selectors of MESSAGE.
 APP, STREAMS, TIMESYNC, SECURITY, DIAG, DISCOVERY = range(6)
 # Mode bits.
@@ -83,6 +83,14 @@ def seeds():
     req = bytes([3]) + bytes(range(32)) + bytes(range(16))
     s["pairing"] = bytes([KEY, 0]) + bytes([PAIR, 0, 0x80 | 20]) + message(1, SECURITY, req) + wait(20) + \
         bytes([REFLECT, 1, 2, 1, 0, 4, 0x01, 0]) + wait(50) + bytes([PAIR, 0, 20]) + bytes([REFLECT, 1, 0x80 | 2, 0, 0x01, 0]) + wait(50)
+    # Honest pairings, each way. Inside a procedure each operation runs at one
+    # of its waits (a few ms); WAIT operations only let it run on.
+    idle = bytes([WAIT, 0, 0]) * 12
+    s["pair_member"] = bytes([KEY, 0]) + bytes([PAIR, 0, 0x80 | 60]) + bytes([JOINER, 1, 0]) + idle + \
+        bytes([JOINER, 1, 1]) + idle + bytes([JOINER, 1, 2]) + idle + wait(10)
+    s["pair_joiner"] = bytes([0, 0]) + bytes([PAIR, 0, 60]) + idle + bytes([MEMBER, 2, 0]) + idle + \
+        bytes([MEMBER, 2, 1]) + idle + wait(50) + message(2, APP, bytes(20), how=0x02) + wait(5) + \
+        bytes([CHALLENGE, 2, 0, 3]) + wait(5) + message(2, APP, bytes(20), how=0x02) + wait(20)
     # Diagnostics: a ping and a burst request.
     s["diag"] = bytes([0, 0]) + message(0, DIAG, bytes([8, 1, 0, 0])) + wait(20) + \
         message(0, DIAG, bytes([4, 2, 0, 0, 5, 2, 1, 40, 2, 40])) + wait(300)
