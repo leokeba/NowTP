@@ -16,6 +16,7 @@ project(nowtp CXX)
 
 option(NOWTP_BUILD_TESTS "Build host-side tests" ON)
 option(NOWTP_SANITIZE "Build tests with ASan/UBSan" ON)
+option(NOWTP_FUZZ "Build the libFuzzer harnesses in test/fuzz (clang)" OFF)
 
 # The core stays C++11 so it builds on Arduino-ESP32 2.x.
 add_library(nowtp_core src/nowtp/wire.cpp src/nowtp/engine.cpp src/nowtp/engine_tx.cpp src/nowtp/engine_rx.cpp src/nowtp/discovery.cpp src/nowtp/radio.cpp src/nowtp/diagnostics.cpp
@@ -50,4 +51,8 @@ if(NOWTP_BUILD_TESTS)
     set_tests_properties(nowtp_tests_late PROPERTIES ENVIRONMENT NOWTP_CLOCK_START=0x7FFFF000)
     add_test(NAME nowtp_tests_wrap COMMAND nowtp_tests)
     set_tests_properties(nowtp_tests_wrap PROPERTIES ENVIRONMENT "NOWTP_CLOCK_START=0xFFFFF000;NOWTP_SPARSE_TICKS=1")
+endif()
+
+if(NOWTP_FUZZ)
+    add_subdirectory(test/fuzz)
 endif()

@@ -331,6 +331,15 @@ public:
         nodes_[to]->engine.onFrameReceived(src, frame.data(), frame.size(), now_);
     }
 
+    /// Puts a hand-crafted frame on air from node `from` to node `to`: it
+    /// arrives at the next step like any frame (RSSI, local timestamp, the
+    /// node woken for sparse ticking), whatever the loss settings. `from` may
+    /// be offline (a sender whose own frames we don't model).
+    void deliver(size_t to, size_t from, const std::vector<uint8_t>& frame) {
+        Exempt air;
+        schedule(Event{now_ + 1, Event::Deliver, to, from, frame, true, rssi(from, to), Mac()});
+    }
+
     // The simulation's own memory isn't counted against a heap limit; what
     // NowTP takes while handling an event is.
     void step() {

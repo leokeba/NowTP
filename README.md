@@ -544,6 +544,8 @@ The tests use a simulated network with configurable loss in three places: on air
 - **Streams.** Transfers under loss.
 - **Short heaps.** The engine, security and discovery run at every heap size from 0 to 24 KB above what they hold, in 512-byte steps. [test/heap_limit.h](test/heap_limit.h) gives the tests a heap with a size: past it, `operator new` aborts, as it does on ESP-IDF, and NowTP's `malloc()` returns null. The tests then check that traffic recovers and that no memory is left behind. `NOWTP_HEAP_SWEEP=1 ./build/nowtp_tests [filter]` runs every test at several heap sizes and prints each place where NowTP's `operator new` would have aborted.
 
+[test/fuzz](test/fuzz) has a libFuzzer harness (clang, `-DNOWTP_FUZZ=ON`) for the receive path: one node with every service, fed frames, sealed messages, challenge answers, acks, time responses and announcements by fake peers.
+
 [test/hardware](test/hardware) is an ESP-IDF test firmware that needs only one board. It runs the engine on the chip and checks the ESP-NOW adapter: start and stop, frame counts, throughput, failure reporting, queue limits, cancellation, poll mode, and leaks across restarts. It prints `PASS`/`FAIL` lines on the serial console:
 
 ```sh
