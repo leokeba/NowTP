@@ -43,7 +43,7 @@ const uint8_t kKey[16] = {0x4e, 0x6f, 0x77, 0x54, 0x50, 0x20, 0x66, 0x75,
                           0x7a, 0x7a, 0x20, 0x6b, 0x65, 0x79, 0x21, 0x21};
 constexpr uint8_t kAppPort = 1;
 constexpr size_t kPeers = 4;          // three nodes that hear the target, one that doesn't
-constexpr uint32_t kMaxSimMs = 30000;  // per input
+constexpr uint32_t kMaxSimMs = 10000;  // per input: past the protocol timers but a stream's 30 s idle limit
 constexpr size_t kMaxOps = 256;
 
 // Security's message, ack and challenge keys, derived as it does.
