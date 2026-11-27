@@ -160,7 +160,7 @@ Status Streams::send(const Mac& dst, uint32_t size, StreamReader read, StreamDon
         options.window == 0) {
         return Status::InvalidArgument;
     }
-    if (options.chunkSize + kDataHeader > engine_.config().maxMessageSize) return Status::TooLarge;
+    if (uint64_t{options.chunkSize} + kDataHeader > engine_.config().maxMessageSize) return Status::TooLarge;
     if (out_.size() >= kMaxOutgoing) return Status::QueueFull;
 
     std::unique_ptr<Out> o(new Out());
@@ -441,7 +441,8 @@ void Streams::handle(const Message& m) {
             uint32_t chunk = getU32(d + 9);
             uint8_t window = d[14];
             size_t headerLen = m.len - kOfferFixed;
-            if (chunk == 0 || window == 0 || chunk + kDataHeader > engine_.config().maxMessageSize ||
+            // In 64 bits: on the ESP32 a 32-bit sum wraps for a chunk near 2^32.
+            if (chunk == 0 || window == 0 || uint64_t{chunk} + kDataHeader > engine_.config().maxMessageSize ||
                 static_cast<size_t>(window - 1) * chunk > kMaxHeldBytes || headerLen > kMaxHeader) {
                 control(m.src, kReject, id, kTooLarge, true);
                 return;

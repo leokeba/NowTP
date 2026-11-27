@@ -5239,6 +5239,63 @@ TEST(stream_validates_options) {
     CHECK(rig.st[a]->send(rig.net.mac(b), 10, reader, nullptr, header, 0) == Status::InvalidArgument);
 }
 
+// An offer whose chunk is near 2^32 is refused as too large on every
+// architecture: `chunk + kDataHeader` in a 32-bit size_t (the ESP32) wrapped to
+// a small sum and accepted it.
+TEST(stream_offer_chunk_near_2pow32) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    Received& r = rig.receiver();
+    rig.st[a]->onIncoming(collectInto(r));
+
+    const uint32_t id = 0x42;
+    std::vector<uint8_t> offer(15);
+    offer[0] = 1;  // kOffer
+    wire::putU32(offer.data() + 1, id);
+    wire::putU32(offer.data() + 5, 100);
+    wire::putU32(offer.data() + 9, 0xFFFFFFF7u);  // chunk: wraps with kDataHeader on 32-bit
+    offer[14] = 1;  // window
+
+    auto frameOf = [](uint16_t messageId, const std::vector<uint8_t>& payload) {
+        wire::Header h;
+        h.port = kStreamPort;
+        h.messageId = messageId;
+        std::vector<uint8_t> f(wire::kCommonHeaderSize + payload.size());
+        size_t off = wire::encodeHeader(h, f.data());
+        memcpy(f.data() + off, payload.data(), payload.size());
+        return f;
+    };
+    auto dataAt = [&](uint32_t offset, uint32_t n) {
+        std::vector<uint8_t> d(9 + n);
+        d[0] = 4;  // kData
+        wire::putU32(d.data() + 1, id);
+        wire::putU32(d.data() + 5, offset);
+        for (uint32_t i = 0; i < n; ++i) d[9 + i] = static_cast<uint8_t>(offset + i);
+        return d;
+    };
+    auto countFromA = [&](uint8_t type) {
+        int n = 0;
+        for (const sim::Frame& f : rig.net.log) {
+            if (f.from != a) continue;
+            wire::Header h;
+            size_t off;
+            if (!wire::decodeHeader(f.data.data(), f.data.size(), h, off)) continue;
+            if (h.port == kStreamPort && f.data[off] == type) n++;
+        }
+        return n;
+    };
+
+    rig.net.inject(a, rig.net.mac(b), frameOf(9, offer));
+    rig.net.run(2);
+
+    CHECK_EQ(rig.st[a]->incoming(), 0u);
+    CHECK_EQ(countFromA(3), 1);  // kReject
+    rig.net.inject(a, rig.net.mac(b), frameOf(10, dataAt(0, 10)));
+    rig.net.run(2);
+    CHECK_EQ(countFromA(7), 1);  // kAbort
+    CHECK(r.data.empty());
+}
+
 TEST(stream_over_secured_link) {
     SecureRig rig;
     size_t a = rig.add(testKey()), b = rig.add(testKey());
