@@ -82,12 +82,32 @@ jobs:
           libraries: |
             - source-path: ./
 
+  # A clang build of the libFuzzer harnesses (test/fuzz/README.md) and a
+  # short run of fuzz_frames on the hand-written seeds, so a harness that
+  # stops building, or a shallow crash, shows up on push.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the harnesses (clang, ASan + UBSan)
+        run: |
+          cmake -S . -B build \
+                -DNOWTP_FUZZ=ON -DNOWTP_BUILD_TESTS=OFF \
+                -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-O1
+          cmake --build build -j
+      - name: Fuzz for 60 s on the seeds
+        run: |
+          python3 test/fuzz/seeds.py build/seeds
+          mkdir -p build/corpus
+          ./build/test/fuzz/fuzz_frames -max_len=4096 -max_total_time=60 \
+                build/corpus build/seeds/frames
+
   # Every push to main that passes becomes a release vX.Y.Z: a patch bump,
   # or more with a "Release: minor" or "Release: major" trailer in a commit
   # since the last tag. The version files are stamped in a commit only the
   # tag points at; main never gets one.
   release:
-    needs: [host-tests, host-tests-32bit, esp-idf, arduino]
+    needs: [host-tests, host-tests-32bit, esp-idf, arduino, fuzz-smoke]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     concurrency:
       group: release

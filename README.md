@@ -505,7 +505,7 @@ A unicast frame to a peer that is off or out of range takes the driver about 100
 - **ESP-IDF:** 4.4 and later.
 - **Chips:** any ESP32-family chip with Wi-Fi.
 
-CI compiles the examples and test firmware for ESP32 and ESP32-C3 against ESP-IDF 4.4, 5.1, 5.4, 5.5 and the latest release, and against Arduino-ESP32 2.0.17 and 3.3.7. The core library is C++11.
+CI compiles the examples and test firmware for ESP32 and ESP32-C3 against ESP-IDF 4.4, 5.1, 5.4, 5.5 and the latest release, and against Arduino-ESP32 2.0.17 and 3.3.7. It also builds the libFuzzer harnesses with clang (ASan + UBSan) and runs `fuzz_frames` for 60 s on the hand-written seeds, so a harness that stops building, or a shallow crash, shows up on push. The core library is C++11.
 
 Tested on hardware with two ESP32-S3 boards and two ESP32 boards:
 - ESP-IDF 6.1 on all four
