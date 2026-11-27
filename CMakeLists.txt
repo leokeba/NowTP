@@ -32,7 +32,17 @@ if(NOWTP_BUILD_TESTS)
     target_compile_definitions(nowtp_core PUBLIC NOWTP_HEAP_HOOKS)
     enable_testing()
     find_package(Threads REQUIRED)
-    add_executable(nowtp_tests test/test_main.cpp)
+    add_executable(nowtp_tests
+        test/test_main.cpp
+        test/wire_tests.cpp
+        test/reliable_tests.cpp
+        test/engine_tests.cpp
+        test/discovery_tests.cpp
+        test/diagnostics_tests.cpp
+        test/security_tests.cpp
+        test/channel_tests.cpp
+        test/timesync_tests.cpp
+        test/misc_tests.cpp)
     target_link_libraries(nowtp_tests PRIVATE nowtp_core Threads::Threads ${CMAKE_DL_LIBS})
     set_target_properties(nowtp_tests PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
     target_compile_options(nowtp_tests PRIVATE -Wall -Wextra)
