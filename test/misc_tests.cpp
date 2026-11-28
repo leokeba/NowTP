@@ -282,6 +282,314 @@ TEST(stream_offer_chunk_near_2pow32) {
     CHECK(r.data.empty());
 }
 
+// The end message is a step like the chunks: it can fail (the receiver went
+// away, or stopped listening) and be retried until the sender gives up.
+TEST(stream_sender_gives_up_on_the_end) {
+    for (int variant = 0; variant < 2; ++variant) {
+        StreamRig rig;
+        size_t a = rig.add(), b = rig.add();
+        std::vector<uint8_t> data = pattern(4096, 7);
+        Received& r = rig.receiver();
+        rig.st[b]->onIncoming(collectInto(r));
+        Outcome& out = rig.outcome();
+        StreamOptions o;
+        o.chunkSize = 1024;
+        o.timeoutMs = 200;  // each failed end message reports quickly
+        o.progress = [&](uint32_t done, uint32_t) {
+            if (done != data.size()) return;  // everything acknowledged: the end goes out now
+            if (variant == 0) rig.net.node(b).online = false;  // it vanishes
+            else rig.st[b]->stop();  // or stops listening for streams
+        };
+        CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                              [&](uint32_t offset, uint8_t* buf, size_t n) {
+                                  memcpy(buf, data.data() + offset, n);
+                                  return true;
+                              },
+                              out.handler(), o, rig.net.now()) == Status::Ok);
+        CHECK(rig.net.runUntil([&] { return out.done; }, 30000));
+        auto countEnds = [&] {
+            int n = 0;
+            for (const sim::Frame& f : rig.net.log) {
+                if (f.from != a) continue;
+                wire::Header h;
+                size_t off;
+                if (!wire::decodeHeader(f.data.data(), f.data.size(), h, off)) continue;
+                if (h.port == kStreamPort && f.data[off] == 5) n++;  // kEnd
+            }
+            return n;
+        };
+        CHECK(r.data == data);
+        CHECK_EQ(rig.st[a]->outgoing(), 0u);
+        if (variant == 0) {
+            CHECK(out.status == Status::Timeout);
+            CHECK(countEnds() >= 5);  // one end message per attempt, each retried on air
+            CHECK(!r.done);
+            CHECK(rig.net.runUntil([&] { return r.done; }, 40000));  // the receiver's idle timeout
+            CHECK(r.status == Status::Timeout);
+        } else {
+            CHECK(out.status == Status::Rejected);
+            CHECK_EQ(countEnds(), 1);
+            CHECK(r.done);
+            CHECK(r.status == Status::Cancelled);
+        }
+        CHECK_EQ(rig.st[b]->incoming(), 0u);
+    }
+}
+
+// A repeat offer for a stream we already accepted gets another accept, not an
+// error: our first one may simply have been lost.
+TEST(stream_offer_again_for_an_accepted_stream) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    std::vector<uint8_t> data = pattern(16384, 9);
+    Received& r = rig.receiver();
+    rig.st[b]->onIncoming(collectInto(r));
+    Outcome& out = rig.outcome();
+    StreamOptions o;
+    uint32_t id = 0;
+    CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                          [&](uint32_t offset, uint8_t* buf, size_t n) {
+                              memcpy(buf, data.data() + offset, n);
+                              return true;
+                          },
+                          out.handler(), o, rig.net.now(), &id) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return r.data.size() > 0; }));
+
+    // The same offer again, from the same peer, as if our accept had been lost.
+    std::vector<uint8_t> offer(15);
+    offer[0] = 1;  // kOffer
+    wire::putU32(offer.data() + 1, id);
+    wire::putU32(offer.data() + 5, data.size());
+    wire::putU32(offer.data() + 9, o.chunkSize);
+    offer[14] = o.window;
+    wire::Header h;
+    h.port = kStreamPort;
+    h.messageId = 77;  // a's engine ids are far from this one here
+    std::vector<uint8_t> frame(wire::kCommonHeaderSize + offer.size());
+    size_t off = wire::encodeHeader(h, frame.data());
+    memcpy(frame.data() + off, offer.data(), offer.size());
+    rig.net.inject(b, rig.net.mac(a), frame);
+
+    CHECK(rig.net.runUntil([&] { return out.done && r.done; }, 30000));
+    CHECK(out.status == Status::Ok);
+    CHECK(r.status == Status::Ok);
+    CHECK(r.data == data);
+    int accepts = 0;
+    for (const sim::Frame& f : rig.net.log) {
+        if (f.from != b) continue;
+        wire::Header hh;
+        size_t off2;
+        if (!wire::decodeHeader(f.data.data(), f.data.size(), hh, off2)) continue;
+        if (hh.port == kStreamPort && f.data[off2] == 2) accepts++;  // kAccept
+    }
+    CHECK_EQ(accepts, 2);  // the original and the answer to the repeat
+    CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    CHECK_EQ(rig.st[b]->incoming(), 0u);
+}
+
+// A started receiver with no acceptor refuses the offer itself, as "refused",
+// not with the engine's "no listener" rejection.
+TEST(stream_offer_without_an_acceptor) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();  // b is started, but never onIncoming()
+    std::vector<uint8_t> data = pattern(1000);
+    Received& r = rig.receiver();
+    Outcome& out = rig.outcome();
+    rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                    [&](uint32_t offset, uint8_t* buf, size_t n) {
+                        memcpy(buf, data.data() + offset, n);
+                        return true;
+                    },
+                    out.handler(), StreamOptions(), rig.net.now());
+    CHECK(rig.net.runUntil([&] { return out.done; }));
+    CHECK(out.status == Status::Rejected);
+    CHECK(!r.done);
+    CHECK(r.data.empty());
+    int refused = 0;
+    for (const sim::Frame& f : rig.net.log) {
+        if (f.from != b) continue;
+        wire::Header h;
+        size_t off;
+        if (!wire::decodeHeader(f.data.data(), f.data.size(), h, off)) continue;
+        if (h.port == kStreamPort && f.data[off] == 3 && f.data[off + 5] == 0) refused++;  // kReject, kRefused
+    }
+    CHECK_EQ(refused, 1);
+    CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    CHECK_EQ(rig.st[b]->incoming(), 0u);
+}
+
+// A chunk that reaches the receiver while another task is still in its sink's
+// write is refused (Busy), so the sender can send it again; the stream goes on.
+TEST(stream_chunk_refused_while_the_sink_is_writing) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    // Wide enough links that a chunk is one whole frame, so a copy of it
+    // reaches the stream handler as a message rather than a lone fragment.
+    rig.net.node(a).link.mtu = 2048;
+    rig.net.node(b).link.mtu = 2048;
+    std::vector<uint8_t> data = pattern(16384, 11);
+    TestGate gate;
+    rig.net.engine(b).setCallbackGate(&gate);
+    Received& r = rig.receiver();
+    StreamAcceptor accept = collectInto(r);
+    uint32_t id = 0;
+    bool foundFrame = false;
+    rig.st[b]->onIncoming([&](const StreamInfo& info, StreamSink& sink) {
+        bool ok = accept(info, sink);
+        std::function<bool(uint32_t, const uint8_t*, size_t)> write = sink.write;
+        sink.write = [&, write](uint32_t offset, const uint8_t* d, size_t n) {
+            testing::HeapExempt app;
+            if (offset == 0 && !gate.meanwhile) {
+                gate.meanwhile = [&, offset] {
+                    // The chunk being written is in flight: its frame is the
+                    // newest data one from a. Deliver an exact copy of it now,
+                    // under a fresh message id (a same-id copy would be a
+                    // duplicate), while this write still runs.
+                    for (auto it = rig.net.log.rbegin(); it != rig.net.log.rend(); ++it) {
+                        if (it->from != a) continue;
+                        wire::Header h;
+                        size_t off;
+                        if (!wire::decodeHeader(it->data.data(), it->data.size(), h, off)) continue;
+                        if (h.port != kStreamPort || it->data[off] != 4) continue;  // kData
+                        if (wire::getU32(it->data.data() + off + 1) != id) continue;
+                        if (wire::getU32(it->data.data() + off + 5) != offset) continue;
+                        h.messageId = 77;  // unused by a
+                        std::vector<uint8_t> f(it->data.size());
+                        size_t noff = wire::encodeHeader(h, f.data());
+                        memcpy(f.data() + noff, it->data.data() + off, it->data.size() - off);
+                        rig.net.inject(b, rig.net.mac(a), f);
+                        foundFrame = true;
+                        break;
+                    }
+                };
+            }
+            return write(offset, d, n);
+        };
+        return ok;
+    });
+    Outcome& out = rig.outcome();
+    StreamOptions o;
+    o.chunkSize = 1024;  // with the wide links above, one chunk is one frame
+    CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                          [&](uint32_t offset, uint8_t* buf, size_t n) {
+                              memcpy(buf, data.data() + offset, n);
+                              return true;
+                          },
+                          out.handler(), o, rig.net.now(), &id) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return out.done && r.done; }, 30000));
+    CHECK(foundFrame);
+    CHECK(out.status == Status::Ok);
+    CHECK(r.status == Status::Ok);
+    CHECK(r.data == data);
+    CHECK(rig.net.engine(b).stats().messagesRefused >= 1);
+    CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    CHECK_EQ(rig.st[b]->incoming(), 0u);
+}
+
+// An end with bytes still missing is a failure, not an Ok: the receiver says
+// "incomplete" and the sender reports Rejected. Here the last chunk was lost
+// after its MAC ack, so the sender believed it delivered; confirming that one
+// by hand lets the transfer reach its end.
+TEST(stream_ends_with_bytes_missing) {
+    StreamRig rig;
+    size_t a = rig.add(), b = rig.add();
+    std::vector<uint8_t> data = pattern(4096, 13);
+    Received& r = rig.receiver();
+    rig.st[b]->onIncoming(collectInto(r));
+    StreamOptions o;
+    o.chunkSize = 1024;  // four chunks
+    uint16_t lostId = 0;  // the wire id of the last chunk, dropped after its MAC ack
+    rig.net.dropIf = [&](const sim::Frame& f) {
+        if (f.from != a) return false;
+        wire::Header h;
+        size_t off;
+        if (!wire::decodeHeader(f.data.data(), f.data.size(), h, off)) return false;
+        if (h.port != kStreamPort || f.data[off] != 4) return false;  // kData
+        if (wire::getU32(f.data.data() + off + 5) != data.size() - o.chunkSize) return false;
+        lostId = h.messageId;
+        return true;
+    };
+    Outcome& out = rig.outcome();
+    CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                          [&](uint32_t offset, uint8_t* buf, size_t n) {
+                              memcpy(buf, data.data() + offset, n);
+                              return true;
+                          },
+                          out.handler(), o, rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return r.data.size() == data.size() - o.chunkSize && lostId != 0; }, 5000));
+
+    wire::Header h;
+    h.type = wire::Type::Ack;
+    h.port = kStreamPort;
+    h.messageId = lostId;
+    std::vector<uint8_t> ack(wire::kCommonHeaderSize + 1);
+    size_t off = wire::encodeHeader(h, ack.data());
+    ack[off] = 0;  // Complete
+    rig.net.inject(a, rig.net.mac(b), ack);
+
+    CHECK(rig.net.runUntil([&] { return out.done && r.done; }, 30000));
+    CHECK(out.status == Status::Rejected);
+    CHECK(r.status == Status::Rejected);
+    CHECK_EQ(r.data.size(), data.size() - o.chunkSize);
+    int incomplete = 0, ends = 0;
+    for (const sim::Frame& f : rig.net.log) {
+        wire::Header hh;
+        size_t off2;
+        if (!wire::decodeHeader(f.data.data(), f.data.size(), hh, off2)) continue;
+        if (hh.port != kStreamPort) continue;
+        if (f.from == b && f.data[off2] == 6 && f.data[off2 + 5] == 2) incomplete++;  // kResult, kResultIncomplete
+        if (f.from == a && f.data[off2] == 5) ends++;  // kEnd
+    }
+    CHECK_EQ(incomplete, 1);
+    CHECK(ends >= 1);
+    CHECK_EQ(rig.st[a]->outgoing(), 0u);
+    CHECK_EQ(rig.st[b]->incoming(), 0u);
+}
+
+// A receiver whose heap can't hold a big window's reorder blocks refuses the
+// offer as busy, before it has told the sender anything else.
+TEST(stream_offer_refused_when_the_heap_cant_hold_its_blocks) {
+    size_t before = testing::heapUsed();
+    {
+        testing::HeapExempt test;
+        std::vector<uint8_t> data = pattern(20000, 13);
+        StreamRig rig;
+        size_t a = rig.add(), b = rig.add();
+        Received& r = rig.receiver();
+        rig.st[b]->onIncoming(collectInto(r));
+        Outcome& out = rig.outcome();
+        StreamOptions o;
+        o.chunkSize = 100;
+        o.window = 255;  // (window - 1) reorder blocks, more than the limit holds
+        {
+            testing::HeapLimit limit(1024);  // room for the offer's state, not its blocks
+            CHECK(rig.st[a]->send(rig.net.mac(b), static_cast<uint32_t>(data.size()),
+                                  [&](uint32_t offset, uint8_t* buf, size_t n) {
+                                      memcpy(buf, data.data() + offset, n);
+                                      return true;
+                                  },
+                                  out.handler(), o, rig.net.now()) == Status::Ok);
+            CHECK(rig.net.runUntil([&] { return out.done; }, 30000));
+        }
+        CHECK(out.status == Status::Rejected);
+        CHECK(!r.done);
+        CHECK(r.data.empty());
+        int busy = 0;
+        for (const sim::Frame& f : rig.net.log) {
+            if (f.from != b) continue;
+            wire::Header h;
+            size_t off;
+            if (!wire::decodeHeader(f.data.data(), f.data.size(), h, off)) continue;
+            if (h.port == kStreamPort && f.data[off] == 3 && f.data[off + 5] == 2) busy++;  // kReject, kBusy
+        }
+        CHECK_EQ(busy, 1);
+        rig.net.run(100);  // let the rest settle
+        CHECK_EQ(rig.st[a]->outgoing(), 0u);
+        CHECK_EQ(rig.st[b]->incoming(), 0u);
+    }
+    CHECK_EQ(testing::heapUsed(), before);
+}
+
 TEST(stream_over_secured_link) {
     SecureRig rig;
     size_t a = rig.add(testKey()), b = rig.add(testKey());
