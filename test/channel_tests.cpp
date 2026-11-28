@@ -495,3 +495,199 @@ TEST(channel_leader_keeps_the_node_here) {
     rig.fol[node]->clearLeader();
     CHECK(rig.net.runUntil([&] { return rig.fol[node]->lastSweep().sequence == 1; }, 10000));
 }
+
+// ---------------------------------------------------------------------------
+// Stopping, suspending and pinning in the middle of a sweep
+TEST(channel_stop_while_following) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), node = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.disc[node]->find(rig.net.mac(master)) != nullptr);
+    rig.fol[node]->stop();
+    // The master moves on; the stopped follower stays.
+    rig.relocate(master, 6);
+    rig.net.run(2000);
+    CHECK_EQ(rig.chan(node), 1);
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.moves[node], 0);
+    // The calls that would move the radio are refused.
+    CHECK(rig.fol[node]->search(rig.net.now()) == Status::InvalidState);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::InvalidState);
+    CHECK(rig.fol[node]->pin(4, rig.net.now()) == Status::InvalidState);
+}
+
+// Stopped in the middle of a sweep, the follower gives up where the radio
+// happens to be: the report is interrupted and nothing moves the radio back.
+TEST(channel_stop_mid_sweep) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.pick = ChannelPick::Busiest;
+    size_t node = rig.add(5, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.fol[node]->sweeping());
+    rig.net.run(600);  // the plan is 1, 2, 3, ...: the radio is on 3 now
+    CHECK_EQ(rig.chan(node), 3);
+    rig.fol[node]->stop();
+    CHECK(!rig.fol[node]->searching());
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK_EQ(s.sequence, 1u);
+    CHECK(!s.running && !s.complete);
+    CHECK_EQ(s.channel, 0);
+    // The radio stays where the sweep left it; nothing else moves it.
+    rig.net.run(5000);
+    CHECK_EQ(rig.chan(node), 3);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 1u);
+    CHECK(rig.fol[node]->search(rig.net.now()) == Status::InvalidState);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::InvalidState);
+    CHECK(rig.fol[node]->pin(4, rig.net.now()) == Status::InvalidState);
+}
+
+// Suspended in the middle of a sweep, the follower puts the radio back on
+// the channel it started from and marks the report interrupted; unsuspended,
+// sweeps run to the end again.
+TEST(channel_suspend_aborts_the_sweep_and_returns_home) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.pick = ChannelPick::Busiest;
+    size_t node = rig.add(5, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    rig.net.run(600);  // the radio is on 3 now
+    CHECK_EQ(rig.chan(node), 3);
+    rig.fol[node]->setSuspended(true, rig.net.now());
+    CHECK(rig.fol[node]->suspended());
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.chan(node), 5);  // back where the sweep started
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK_EQ(s.sequence, 1u);
+    CHECK(!s.running && !s.complete);
+    CHECK_EQ(s.channel, 0);
+    // Unsuspended: a new sweep runs to the end.
+    rig.fol[node]->setSuspended(false, rig.net.now());
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 5);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 2u);
+    CHECK(rig.fol[node]->lastSweep().complete);
+}
+
+// Pinned in the middle of a sweep, the follower aborts it and goes to the
+// pinned channel; the report is interrupted, and pin(0) unpins again.
+TEST(channel_pin_aborts_the_sweep_and_goes_to_the_pinned_channel) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.pick = ChannelPick::Busiest;
+    size_t node = rig.add(5, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    rig.net.run(600);  // the radio is on 3 now
+    CHECK_EQ(rig.chan(node), 3);
+    CHECK(rig.fol[node]->pin(9, rig.net.now()) == Status::Ok);
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.chan(node), 9);
+    CHECK_EQ(rig.fol[node]->pinned(), 9);
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK_EQ(s.sequence, 1u);
+    CHECK(!s.running && !s.complete);
+    // Pinned: it stays, and a sweep comes back to the pinned channel.
+    rig.net.run(3000);
+    CHECK_EQ(rig.chan(node), 9);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 9);
+    const ChannelSweep& s2 = rig.fol[node]->lastSweep();
+    CHECK(s2.complete && !s2.running);
+    CHECK_EQ(s2.channel, 9);
+    // pin(0) unpins; nothing moves the radio again.
+    CHECK(rig.fol[node]->pin(0, rig.net.now()) == Status::Ok);
+    CHECK_EQ(rig.fol[node]->pinned(), 0);
+    rig.net.run(1000);
+    CHECK_EQ(rig.chan(node), 9);
+}
+
+// search() is refused while pinned (the node stays put); a sweep still runs
+// and comes back to the pinned channel; after unpin, search() works again.
+TEST(channel_search_refused_while_pinned) {
+    FollowRig rig;
+    size_t master = rig.add(1, true), node = rig.add(1, false);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->pin(4, rig.net.now()) == Status::Ok);
+    CHECK_EQ(rig.chan(node), 4);
+    // Pinned: a search is refused, and the node stays.
+    CHECK(rig.fol[node]->search(rig.net.now()) == Status::InvalidState);
+    CHECK(!rig.fol[node]->searching());
+    CHECK_EQ(rig.chan(node), 4);
+    // A sweep is not refused: it comes back to the pinned channel.
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 4);
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK(s.complete);
+    CHECK_EQ(s.channel, 4);
+    CHECK_EQ(s.count(1, true), 1u);  // the anchor on 1, heard during the sweep
+    // Unpinned: search() works and finds the master.
+    rig.fol[node]->unpin(rig.net.now());
+    CHECK(rig.fol[node]->search(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 1);
+    CHECK(rig.disc[node]->find(rig.net.mac(master)) != nullptr);
+}
+
+// A sweep that ties the origin channel with another settles on the origin,
+// not on the lower channel.
+TEST(channel_busiest_tie_prefers_the_origin_channel) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.pick = ChannelPick::Busiest;
+    rig.add(5, false);
+    rig.add(7, false);
+    size_t node = rig.add(7, false, cc);
+    rig.start();
+    rig.net.run(1000);
+    CHECK(rig.fol[node]->sweep(rig.net.now()) == Status::Ok);
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    // 5 and 7 tie on one node each, and neither has an anchor: the origin (7)
+    // wins over the lower channel.
+    CHECK_EQ(rig.chan(node), 7);
+    CHECK_EQ(rig.moves[node], 0);
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK(s.complete && !s.running);
+    CHECK_EQ(s.channel, 7);
+    CHECK_EQ(s.count(5), 1u);
+    CHECK_EQ(s.count(7), 1u);
+    // It settles there: no anchor anywhere, but it does not sweep again.
+    rig.net.run(40000);
+    CHECK_EQ(rig.chan(node), 7);
+    CHECK_EQ(rig.fol[node]->lastSweep().sequence, 1u);
+}
+
+// A sweep that hears nothing on any channel comes back to where it started,
+// and looks again after the retry.
+TEST(channel_sweep_comes_home_when_nothing_answers) {
+    FollowRig rig;
+    ChannelConfig cc;
+    cc.findAnchor = true;
+    cc.pick = ChannelPick::Busiest;
+    size_t node = rig.add(2, false, cc);
+    rig.start();
+    // The boot sweep hears no one on any channel.
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->sweeping(); }, 100));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    const ChannelSweep& s = rig.fol[node]->lastSweep();
+    CHECK_EQ(s.sequence, 1u);
+    CHECK(s.complete && !s.running);
+    CHECK_EQ(s.channel, 2);
+    CHECK_EQ(s.nodes.size(), 0u);
+    CHECK_EQ(rig.chan(node), 2);
+    // And it looks again after the retry.
+    CHECK(rig.net.runUntil([&] { return rig.fol[node]->lastSweep().sequence == 2; }, 30000));
+    CHECK(rig.net.runUntil([&] { return !rig.fol[node]->searching(); }, 10000));
+    CHECK_EQ(rig.chan(node), 2);
+    CHECK_EQ(rig.moves[node], 0);
+}
